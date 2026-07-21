@@ -5274,15 +5274,20 @@ fn start_native_dictation(
     })
 }
 
-/// Produces a deliberately conservative live transcript. Each preview is a
-/// fresh decode of a growing/moving audio window, so its final words are
-/// provisional and can legitimately change. Showing only the common prefix
-/// of two consecutive snapshots keeps the overlay from replacing words that
-/// were already correct with a later hallucination.
+/// Produces a deliberately conservative live transcript. Whisper previews are
+/// independent decodes of a growing, then rolling, audio window. The tail is
+/// therefore provisional, but a word that has survived an overlap between two
+/// windows is old enough to make the overlay monotonic: it is never rewritten
+/// by a later, noisier snapshot. The actual final decode still replaces the
+/// overlay when recording stops.
 #[derive(Default)]
 struct WhisperPreviewStability {
-    previous_words: Vec<String>,
-    confirmed_words: Vec<String>,
+    /// The best chronological sequence assembled from preview windows. Its
+    /// suffix remains editable until a subsequent window overlaps it.
+    timeline_words: Vec<String>,
+    /// Prefix of `timeline_words` which has appeared in at least two aligned
+    /// windows and is consequently safe to show to the user.
+    confirmed_words: usize,
 }
 
 impl WhisperPreviewStability {
@@ -5294,22 +5299,56 @@ impl WhisperPreviewStability {
         if current_words.is_empty() {
             return None;
         }
-        if self.previous_words.is_empty() {
-            self.previous_words = current_words;
+        if self.timeline_words.is_empty() {
+            self.timeline_words = current_words;
             return None;
         }
-        let common_prefix = self
-            .previous_words
+
+        // The window initially grows from the same start, then rolls forward
+        // once it reaches eight seconds. Align the new snapshot's prefix to
+        // any point in the assembled timeline, rather than requiring an
+        // absolute common prefix. That lets "three four five" extend an
+        // earlier "one two three four" without retracting "one two".
+        let (start, overlap) = self
+            .timeline_words
             .iter()
-            .zip(&current_words)
-            .take_while(|(previous, current)| previous.eq_ignore_ascii_case(current))
-            .count();
-        self.confirmed_words.truncate(common_prefix);
-        if common_prefix > self.confirmed_words.len() {
-            self.confirmed_words = self.previous_words[..common_prefix].to_vec();
+            .enumerate()
+            .map(|(start, _)| {
+                let overlap = self.timeline_words[start..]
+                    .iter()
+                    .zip(&current_words)
+                    .take_while(|(previous, current)| previous.eq_ignore_ascii_case(current))
+                    .count();
+                (start, overlap)
+            })
+            .max_by_key(|(_, overlap)| *overlap)?;
+
+        // One generic word is not enough evidence that a rolling window has
+        // aligned ("the" and "I" are common). A one-word match at the start
+        // is still useful before anything has been confirmed: it lets an early
+        // correction replace only the provisional tail.
+        if overlap == 0 || (overlap == 1 && start != 0) {
+            return self.confirmed_text();
         }
-        self.previous_words = current_words;
-        (!self.confirmed_words.is_empty()).then(|| self.confirmed_words.join(" "))
+        let matched_end = start + overlap;
+
+        // A later snapshot is allowed to correct only the volatile tail. If
+        // it disagrees before a confirmed word, keep the overlay unchanged
+        // and wait for a better-aligned snapshot rather than visibly rewriting
+        // text that was already shown.
+        if matched_end < self.confirmed_words {
+            return self.confirmed_text();
+        }
+
+        self.timeline_words.truncate(matched_end);
+        self.timeline_words
+            .extend(current_words.into_iter().skip(overlap));
+        self.confirmed_words = self.confirmed_words.max(matched_end);
+        self.confirmed_text()
+    }
+
+    fn confirmed_text(&self) -> Option<String> {
+        (self.confirmed_words != 0).then(|| self.timeline_words[..self.confirmed_words].join(" "))
     }
 }
 
@@ -8301,7 +8340,7 @@ mod tests {
     }
 
     #[test]
-    fn live_preview_only_advances_when_words_repeat() {
+    fn live_preview_only_commits_words_that_repeat() {
         let mut preview = WhisperPreviewStability::default();
         assert_eq!(preview.observe("hello world"), None);
         assert_eq!(preview.observe("hello word"), Some("hello".into()));
@@ -8316,17 +8355,40 @@ mod tests {
     }
 
     #[test]
-    fn live_preview_restarts_cleanly_when_the_audio_window_moves() {
+    fn live_preview_keeps_confirmed_text_when_the_audio_window_moves() {
         let mut preview = WhisperPreviewStability::default();
         assert_eq!(preview.observe("one two three"), None);
         assert_eq!(
             preview.observe("one two three four"),
             Some("one two three".into())
         );
-        assert_eq!(preview.observe("three four five"), None);
+        assert_eq!(
+            preview.observe("three four five"),
+            Some("one two three four".into())
+        );
         assert_eq!(
             preview.observe("three four five six"),
-            Some("three four five".into())
+            Some("one two three four five".into())
+        );
+    }
+
+    #[test]
+    fn live_preview_never_rewrites_a_confirmed_word() {
+        let mut preview = WhisperPreviewStability::default();
+        assert_eq!(preview.observe("hello world again"), None);
+        assert_eq!(
+            preview.observe("hello world again today"),
+            Some("hello world again".into())
+        );
+        // "world" is confirmed, so a later weak hypothesis cannot turn it
+        // into "word" in the visible overlay.
+        assert_eq!(
+            preview.observe("hello word again today"),
+            Some("hello world again".into())
+        );
+        assert_eq!(
+            preview.observe("hello world again today tomorrow"),
+            Some("hello world again today".into())
         );
     }
 }
