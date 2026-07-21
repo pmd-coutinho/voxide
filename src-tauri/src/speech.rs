@@ -198,7 +198,7 @@ pub fn transcribe_whisper_with_options(
         custom_words,
         &options,
     )?;
-    if result.text.is_empty() {
+    if result.text.is_empty() && !options.is_preview() {
         return Err("The voice engine did not recognize any speech".into());
     }
     Ok(result)
@@ -441,10 +441,35 @@ enum SpeechBounds {
 /// transcription accuracy. Detection runs on the (normalized) probe signal;
 /// returns None when VAD itself is unavailable.
 fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBounds> {
-    const SAMPLES_PER_CENTISECOND: f32 = audio::WHISPER_SAMPLE_RATE as f32 / 100.0;
-    // Generous margin around the detected speech so edge trimming can never
-    // clip a first or last word.
+    let ranges = detect_speech_ranges(probe, vad_model_path, 2_000)?;
     const EDGE_MARGIN_SAMPLES: usize = (audio::WHISPER_SAMPLE_RATE / 2) as usize;
+    let bounds = ranges
+        .into_iter()
+        .fold(None::<(usize, usize)>, |bounds, (start, end)| {
+            Some(match bounds {
+                Some((first, last)) => (first.min(start), last.max(end)),
+                None => (start, end),
+            })
+        });
+    Some(match bounds {
+        Some((first, last)) => SpeechBounds::Range(
+            first.saturating_sub(EDGE_MARGIN_SAMPLES),
+            last.saturating_add(EDGE_MARGIN_SAMPLES).min(probe.len()),
+        ),
+        None => SpeechBounds::None,
+    })
+}
+
+/// Returns the individual VAD speech ranges. Final transcription keeps the
+/// original audio intact, but preview decoding removes long internal pauses:
+/// Whisper otherwise has an opportunity to turn those pauses into subtitle
+/// boilerplate such as "Thank you".
+fn detect_speech_ranges(
+    probe: &[f32],
+    vad_model_path: &Path,
+    minimum_silence_duration_ms: i32,
+) -> Option<Vec<(usize, usize)>> {
+    const SAMPLES_PER_CENTISECOND: f32 = audio::WHISPER_SAMPLE_RATE as f32 / 100.0;
     preload_vad(vad_model_path).ok()?;
     let cache = VAD_CONTEXT_CACHE.get_or_init(|| Mutex::new(None));
     let mut cached = cache.lock().ok()?;
@@ -457,28 +482,60 @@ fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBo
     let mut vad_params = WhisperVadParams::new();
     vad_params.set_threshold(0.35);
     vad_params.set_min_speech_duration(150);
-    vad_params.set_min_silence_duration(2_000);
+    vad_params.set_min_silence_duration(minimum_silence_duration_ms);
     vad_params.set_speech_pad(400);
     let segments = vad.segments_from_samples(vad_params, probe).ok()?;
-    let mut bounds: Option<(usize, usize)> = None;
+    let mut ranges = Vec::new();
     for index in 0..segments.num_segments() {
         let Some(segment) = segments.get_segment(index) else {
             continue;
         };
         let start = (segment.start * SAMPLES_PER_CENTISECOND) as usize;
         let end = (segment.end * SAMPLES_PER_CENTISECOND) as usize;
-        bounds = Some(match bounds {
-            Some((first, last)) => (first.min(start), last.max(end)),
-            None => (start, end),
-        });
+        if end > start {
+            ranges.push((start.min(probe.len()), end.min(probe.len())));
+        }
     }
-    Some(match bounds {
-        Some((first, last)) => SpeechBounds::Range(
-            first.saturating_sub(EDGE_MARGIN_SAMPLES),
-            last.saturating_add(EDGE_MARGIN_SAMPLES).min(probe.len()),
-        ),
-        None => SpeechBounds::None,
-    })
+    // VAD speech padding can make neighboring ranges overlap. Merge them so
+    // reconstructing preview audio never duplicates a word at a boundary.
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged
+            .last_mut()
+            .filter(|(_, previous_end)| start <= *previous_end)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    Some(merged)
+}
+
+fn preview_speech_only_samples(
+    samples: &[f32],
+    probe: &[f32],
+    vad_model_path: &Path,
+) -> Option<Vec<f32>> {
+    // A 650 ms gap marks a completed phrase for the preview. Keep a short
+    // separator after splicing segments so Whisper retains a natural word
+    // boundary without decoding multi-second room silence.
+    const PREVIEW_MIN_SILENCE_MS: i32 = 650;
+    const PREVIEW_GAP_SAMPLES: usize = (audio::WHISPER_SAMPLE_RATE / 8) as usize;
+    let ranges = detect_speech_ranges(probe, vad_model_path, PREVIEW_MIN_SILENCE_MS)?;
+    if ranges.is_empty() {
+        return Some(Vec::new());
+    }
+    let capacity = ranges.iter().map(|(start, end)| end - start).sum::<usize>()
+        + PREVIEW_GAP_SAMPLES.saturating_mul(ranges.len().saturating_sub(1));
+    let mut speech = Vec::with_capacity(capacity);
+    for (index, (start, end)) in ranges.into_iter().enumerate() {
+        if index != 0 {
+            speech.extend(std::iter::repeat_n(0.0, PREVIEW_GAP_SAMPLES));
+        }
+        speech.extend_from_slice(&samples[start..end]);
+    }
+    Some(speech)
 }
 
 fn transcribe_samples(
@@ -522,33 +579,50 @@ fn transcribe_samples(
         lock_wait_ms: lock_started.elapsed().as_millis() as u64,
         ..Default::default()
     };
-    // VAD gates both live snapshots and final audio. Without it, a growing
-    // preview buffer includes leading/trailing room noise that makes the
-    // decoder revise otherwise correct partial words into hallucinations.
-    // Detection runs on a peak-normalized probe copy, while Whisper decodes
-    // the original contiguous audio.
-    let mut edge_trimmed;
+    // VAD gates both live snapshots and final audio. Final decoding keeps its
+    // contiguous audio; preview decoding additionally removes long internal
+    // pauses, which are a common source of Whisper's live hallucinations.
+    // Detection runs on a peak-normalized probe copy.
+    let mut vad_prepared_samples: Vec<f32>;
     let mut samples = samples;
     if let Some(vad_model_path) = vad_model_path {
         let vad_started = Instant::now();
         let mut probe = samples.to_vec();
         normalize_peak(&mut probe);
-        let bounds = detect_speech_bounds(&probe, vad_model_path);
-        timings.vad_ms = vad_started.elapsed().as_millis() as u64;
-        match bounds {
-            Some(SpeechBounds::None) => {
-                return Ok(WhisperTranscription {
-                    text: String::new(),
-                    timings,
-                });
+        if options.is_preview() {
+            match preview_speech_only_samples(samples, &probe, vad_model_path) {
+                Some(speech) if speech.is_empty() => {
+                    timings.vad_ms = vad_started.elapsed().as_millis() as u64;
+                    return Ok(WhisperTranscription {
+                        text: String::new(),
+                        timings,
+                    });
+                }
+                Some(speech) => {
+                    vad_prepared_samples = speech;
+                    audio::pad_short_transcription_samples(&mut vad_prepared_samples);
+                    samples = &vad_prepared_samples;
+                }
+                None => {}
             }
-            Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
-                edge_trimmed = samples[start.min(samples.len())..end].to_vec();
-                audio::pad_short_transcription_samples(&mut edge_trimmed);
-                samples = &edge_trimmed;
+        } else {
+            match detect_speech_bounds(&probe, vad_model_path) {
+                Some(SpeechBounds::None) => {
+                    timings.vad_ms = vad_started.elapsed().as_millis() as u64;
+                    return Ok(WhisperTranscription {
+                        text: String::new(),
+                        timings,
+                    });
+                }
+                Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
+                    vad_prepared_samples = samples[start.min(samples.len())..end].to_vec();
+                    audio::pad_short_transcription_samples(&mut vad_prepared_samples);
+                    samples = &vad_prepared_samples;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        timings.vad_ms = vad_started.elapsed().as_millis() as u64;
     }
     let state_started = Instant::now();
     let state_cache = if options.is_preview() {
@@ -573,12 +647,13 @@ fn transcribe_samples(
         .as_mut()
         .expect("Whisper state cache is populated above");
     let sampling_strategy = if options.is_preview() {
-        // GPU preview is already sub-second. A tiny beam makes the partial
-        // text markedly less jumpy than greedy decoding, while CPU fallbacks
-        // keep greedy to avoid contention with the recording UI.
+        // CUDA reaches the same sub-second budget with Beam 5 on the short,
+        // VAD-spliced preview input. Matching the final decoder avoids the
+        // greedy/Beam-2 pause hallucinations seen in live dictation. CPU
+        // fallbacks keep greedy to avoid contending with the recording UI.
         if has_hardware_gpu_backend() {
             SamplingStrategy::BeamSearch {
-                beam_size: 2,
+                beam_size: 5,
                 patience: -1.0,
             }
         } else {

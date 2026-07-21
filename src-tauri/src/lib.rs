@@ -5370,6 +5370,16 @@ impl WhisperPreviewStability {
     fn visible_text(&self) -> Option<String> {
         (!self.timeline_words.is_empty()).then(|| self.timeline_words.join(" "))
     }
+
+    /// A VAD-empty preview means the rolling window has reached room silence.
+    /// Retain only words that survived an earlier overlap; a volatile tail at
+    /// this point is the most likely source of silence hallucinations.
+    fn observe_silence(&mut self) -> Option<String> {
+        if self.confirmed_words != 0 {
+            self.timeline_words.truncate(self.confirmed_words);
+        }
+        self.visible_text()
+    }
 }
 
 fn preview_words_match(previous: &str, current: &str) -> bool {
@@ -5462,10 +5472,24 @@ fn spawn_live_whisper_preview(
                         );
                     }
                 }
-                Ok(_) => debug_log::append(&format!(
-                    "Live Whisper preview was empty (audio_ms: {})",
-                    captured_duration_ms
-                )),
+                Ok(_) => {
+                    debug_log::append(&format!(
+                        "Live Whisper preview was VAD-empty (audio_ms: {})",
+                        captured_duration_ms
+                    ));
+                    if let Some(stable_text) = stability.observe_silence() {
+                        let capture_state = app.state::<NativeCaptureState>();
+                        if capture_state.preview_generation.load(Ordering::SeqCst)
+                            == preview_generation
+                        {
+                            emit_overlay(
+                                &app,
+                                "recording",
+                                tail_characters(&stable_text, preview_char_limit),
+                            );
+                        }
+                    }
+                }
                 Err(error) => debug_log::append(&format!(
                     "Live Whisper preview skipped (audio_ms: {}): {error}",
                     captured_duration_ms
@@ -8443,5 +8467,19 @@ mod tests {
             preview.observe("one two three test"),
             Some("one, two, three test".into())
         );
+    }
+
+    #[test]
+    fn live_preview_discards_an_unconfirmed_tail_after_silence() {
+        let mut preview = WhisperPreviewStability::default();
+        assert_eq!(
+            preview.observe("one two three"),
+            Some("one two three".into())
+        );
+        assert_eq!(
+            preview.observe("one two three thank you"),
+            Some("one two three thank you".into())
+        );
+        assert_eq!(preview.observe_silence(), Some("one two three".into()));
     }
 }
