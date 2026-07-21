@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Voxide",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 640,
+        "center": true,
+        "visible": false,
+        "decorations": false
+      },
+      {
+        "label": "overlay",
+        "title": "Voxide Dictation",
+        "width": 520,
+        "height": 132,
+        "center": true,
+        "visible": false,
+        "focus": false,
+        "focusable": false,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": true
+      }
+    ]
+  }
+}

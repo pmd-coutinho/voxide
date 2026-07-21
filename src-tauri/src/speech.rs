@@ -185,6 +185,8 @@ fn transcribe_samples(
     parameters.set_print_progress(false);
     parameters.set_print_realtime(false);
     parameters.set_print_timestamps(false);
+    // Dictation wants speech only — no "[sound of plastic crinkling]" tags.
+    parameters.set_suppress_nst(true);
     let vocabulary = custom_words
         .iter()
         .map(|word| word.trim())
@@ -201,10 +203,60 @@ fn transcribe_samples(
 
     let text = state
         .as_iter()
-        .map(|segment| segment.to_string())
+        .filter_map(|segment| clean_transcription_segment(&segment.to_string()))
         .collect::<Vec<_>>()
-        .join("")
-        .trim()
-        .to_owned();
+        .join(" ");
     Ok(text)
+}
+
+/// Strips Whisper's non-speech artifacts from a segment: noise annotations
+/// such as "[sound of plastic crinkling]" or "(water splashing)", music
+/// markers, and the dialogue dash it prepends to some utterances. Token-level
+/// suppression removes most of these; this catches the ones that slip
+/// through. Returns None when nothing speakable remains.
+fn clean_transcription_segment(segment: &str) -> Option<String> {
+    static ANNOTATION_PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = ANNOTATION_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)|♪[^♪]*♪|^\*[^*]+\*$")
+            .expect("annotation pattern is valid")
+    });
+    let without_annotations = pattern.replace_all(segment.trim(), " ");
+    let without_dash = without_annotations
+        .trim()
+        .trim_start_matches("- ")
+        .trim_start_matches('♪');
+    let cleaned = without_dash.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_transcription_segment;
+
+    #[test]
+    fn drops_pure_noise_annotations() {
+        assert_eq!(
+            clean_transcription_segment(" [sound of plastic crinkling]"),
+            None
+        );
+        assert_eq!(clean_transcription_segment("(water splashing)"), None);
+        assert_eq!(clean_transcription_segment(" ♪ upbeat music ♪"), None);
+        assert_eq!(clean_transcription_segment("*coughs*"), None);
+    }
+
+    #[test]
+    fn keeps_speech_and_removes_inline_artifacts() {
+        assert_eq!(
+            clean_transcription_segment("(water splashing) - All right."),
+            Some("All right.".into())
+        );
+        assert_eq!(
+            clean_transcription_segment(" Alright [door slams] let's continue."),
+            Some("Alright let's continue.".into())
+        );
+        assert_eq!(
+            clean_transcription_segment(" The quick brown fox."),
+            Some("The quick brown fox.".into())
+        );
+    }
 }
