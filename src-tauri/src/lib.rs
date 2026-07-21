@@ -4606,6 +4606,17 @@ struct OverlayUpdate {
     text: String,
 }
 
+/// Hides the dictation overlay when dropped. Held across the fallible span
+/// of stop_native_dictation so no error path can leave the overlay stuck on
+/// "Transcribing…"; the extra hide after a successful run is a no-op.
+struct OverlayHideOnDrop(AppHandle);
+
+impl Drop for OverlayHideOnDrop {
+    fn drop(&mut self) {
+        emit_overlay(&self.0, "hidden", "");
+    }
+}
+
 fn emit_overlay(app: &AppHandle, state: &str, text: impl Into<String>) {
     let _ = app.emit(
         "overlay-update",
@@ -5483,6 +5494,7 @@ async fn stop_native_dictation(
         .filter(|prompt| !prompt.is_empty())
         .map(str::to_owned);
     let is_prompt_test = prompt_test_mode.unwrap_or(false);
+    let _overlay_cleanup = OverlayHideOnDrop(app.clone());
     if settings.enable_streaming_preview {
         emit_overlay(&app, "processing", "Transcribing…");
     }
