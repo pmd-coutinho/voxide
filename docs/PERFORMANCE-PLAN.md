@@ -196,9 +196,10 @@ Add stage timing so every later change is measured, not guessed.
   busy (final pass never queues behind a preview start).
 - Preview decode params: Beam 2 on a GPU (greedy on CPU fallback) + shorter
   window (~8 s instead of 20 s), VAD gating, and an aligned rolling-window
-  timeline. Only words repeated by an overlapping snapshot are committed, and
-  committed overlay text never rewrites; before that confirmation, the latest
-  provisional hypothesis remains visible rather than leaving the overlay blank.
+  timeline. Only words repeated by an overlapping snapshot are committed;
+  committed overlay text never rewrites, while the current provisional tail
+  remains visible so the preview continues to progress. Matching ignores
+  punctuation-only changes such as `one,` versus `one`.
 - On stop, cancel any in-flight preview: wire the existing
   `preview_generation` bump to a scoped raw whisper-rs abort callback, so the
   final pass waits milliseconds, not a full preview decode.
@@ -311,9 +312,10 @@ Environment notes specific to this machine:
   for preview/final passes, and logs emitted, empty, and skipped preview
   outcomes. Previews are VAD-gated and their display only advances words that
   recur in aligned consecutive snapshots; once committed, an overlapping
-  rolling window cannot rewrite that text. Unaligned early hypotheses stay
-  visible as provisional feedback. The CUDA bench now verifies 1–8 s growing
-  snapshots (228–296 ms) and cancellation of a stale generation.
+  rolling window cannot rewrite that text. The current provisional tail stays
+  visible, including after a pause or punctuation-only revision. The CUDA bench
+  now verifies 1–8 s growing snapshots (228–296 ms) and cancellation of a
+  stale generation.
 - Status: Phases 0–5 complete for the local Whisper engine. Phase 6 remains a
   separate product integration: CUDA Whisper already reaches the raw decode
   target; Parakeet would now be pursued for VAD-segment streaming UX rather
