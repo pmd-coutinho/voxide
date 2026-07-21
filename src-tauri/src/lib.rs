@@ -5218,8 +5218,12 @@ fn spawn_live_whisper_preview(
     preview_char_limit: usize,
 ) {
     tauri::async_runtime::spawn(async move {
+        // Pace the preview by how long transcription actually takes on this
+        // machine: GPU inference refreshes several times per second while
+        // CPU inference backs off to its own cost instead of piling up.
+        let mut interval = Duration::from_millis(600);
         loop {
-            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            tokio::time::sleep(interval).await;
             let capture_state = app.state::<NativeCaptureState>();
             if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
                 return;
@@ -5242,12 +5246,17 @@ fn spawn_live_whisper_preview(
             let model_path = model_path.clone();
             let language = language.clone();
             let custom_words = custom_words.clone();
+            let transcription_started = Instant::now();
             let partial = tauri::async_runtime::spawn_blocking(move || {
                 speech::transcribe_whisper(samples, &model_path, &language, &custom_words)
             })
             .await
             .ok()
             .and_then(Result::ok);
+            interval = transcription_started.elapsed().mul_f32(1.5).clamp(
+                Duration::from_millis(250),
+                Duration::from_millis(2_500),
+            );
             if let Some(partial) = partial.filter(|partial| !partial.trim().is_empty()) {
                 let capture_state = app.state::<NativeCaptureState>();
                 if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation {
