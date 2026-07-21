@@ -299,12 +299,18 @@ Environment notes specific to this machine:
   4080 Laptop, `decode_bench` on an 8.0 s espeak WAV using large-v3-turbo
   measured `vad_ms: 48`, `state_ms: 4`, and `decode_ms: 421`; whisper.cpp
   confirmed `using CUDA0 backend`.
-- 2026-07-21: Phase 6 assessment: the venv now has ONNX Runtime GPU 1.27 and
-  cuDNN 9, and reports `CUDAExecutionProvider`. The official Linux sherpa-onnx
-  shared artifact ships a CPU-only `libonnxruntime.so`, so adding it directly
-  would not satisfy the planned CUDA Parakeet engine. It needs its own GPU
-  runtime packaging and VAD-segment state model, and is intentionally deferred
-  rather than shipping a misleading CPU-only engine.
+- 2026-07-21: Phase 6 landed. The CUDA feature now brings in sherpa-onnx
+  1.13.4's official **GPU** `cuda-12.x-cudnn-9.x` runtime and the
+  `parakeet-tdt-0.6b-v3-int8` model manager. A no-sudo setup helper stages the
+  runtime and CUDA 12/cuDNN 9 wheel libraries separately from Whisper's CUDA
+  13 toolkit; the final Linux binary embeds their RPATHs. Parakeet is exposed
+  in Voice Engine only in a CUDA build, has visible model-download progress
+  and removal, and is routed through dictation, file transcription, and the
+  loopback API. Its offline decoder is made live by shared Silero VAD: complete
+  utterances are committed exactly once, the active utterance remains
+  provisional, and stopping decodes only the final VAD tail. Runtime verified
+  on the RTX 4080 Laptop with the model's reference WAV: `Ask not what your
+  country can do for you. Ask what you can do for your country.`
 - 2026-07-21: Live preview regression fixed. The `whisper-rs` 0.16
   `set_abort_callback_safe` helper made every CUDA snapshot abort during
   encoder setup, while its errors were silently discarded. Voxide now uses a
@@ -317,7 +323,5 @@ Environment notes specific to this machine:
   strips long internal silence before decode to avoid repeated pause
   hallucinations. The CUDA bench now verifies 1–8 s growing snapshots
   (228–296 ms) and cancellation of a stale generation.
-- Status: Phases 0–5 complete for the local Whisper engine. Phase 6 remains a
-  separate product integration: CUDA Whisper already reaches the raw decode
-  target; Parakeet would now be pursued for VAD-segment streaming UX rather
-  than speed alone.
+- Status: Phases 0–6 are complete. CUDA Whisper reaches the raw-decode target;
+  CUDA Parakeet is now the VAD-segmented local streaming option on Linux x64.

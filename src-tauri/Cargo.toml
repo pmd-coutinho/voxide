@@ -26,7 +26,11 @@ default = []
 # skipping whisper-rs 0.16's `vulkan` helper module, which does not compile
 # against the whisper.cpp version its own sys crate bundles.
 vulkan = ["whisper-rs-sys/vulkan"]
-cuda = ["whisper-rs/cuda"]
+# Parakeet uses sherpa-onnx's CUDA execution provider.  Keeping it behind the
+# CUDA build means portable builds do not acquire a second, platform-specific
+# native runtime.
+parakeet = ["dep:sherpa-onnx"]
+cuda = ["whisper-rs/cuda", "parakeet"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
@@ -37,6 +41,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 axum = "0.8.9"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control", "image-data"] }
 base64 = "0.22.1"
+bzip2 = "0.5.2"
 cpal = "0.17.1"
 directories = "6.0.0"
 enigo = { version = "0.3.0", default-features = false, features = ["wayland", "x11rb"] }
@@ -46,6 +51,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 regex = "1.13.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"], optional = true }
 symphonia = { version = "0.5.4", default-features = false, features = ["all"] }
 tauri = { version = "2.11.1", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-dialog = "2.4.0"
@@ -56,6 +62,7 @@ tauri-plugin-opener = "2.5.3"
 tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2.4.1"
 thiserror = "2.0.17"
+tar = "0.4.44"
 tokio = { version = "1.53.0", features = ["fs", "io-util", "net", "process", "sync", "time"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 whisper-rs = "0.16.0"

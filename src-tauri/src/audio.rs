@@ -176,6 +176,20 @@ impl AudioCapture {
         })
     }
 
+    /// Returns the complete capture so an incremental recognizer can keep a
+    /// stable absolute sample cursor. Unlike `finish`, this does not stop the
+    /// microphone stream.
+    pub fn snapshot_all(&self) -> Result<CapturedAudio, String> {
+        let samples = self.snapshot_samples()?;
+        let frame_count = samples.len() as u64 / self.channels.max(1) as u64;
+        Ok(CapturedAudio {
+            samples,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            duration_ms: frame_count.saturating_mul(1_000) / self.sample_rate.max(1) as u64,
+        })
+    }
+
     fn snapshot_samples(&self) -> Result<Vec<f32>, String> {
         self.samples
             .lock()

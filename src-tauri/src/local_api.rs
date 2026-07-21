@@ -21,10 +21,10 @@ use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
 
 use crate::{
-    active_recognition_vocabulary, audio, media, normalize_custom_words,
-    post_process_dictation_outcome, provider, provider_api_key, selected_provider, speech,
-    transcribe_apple_media_file, valid_whisper_model_file, whisper_model_path, AppState,
-    CustomWordEntry, DictionaryEntry, VoiceEngine,
+    active_recognition_vocabulary, audio, media, normalize_custom_words, parakeet,
+    parakeet_model_path, post_process_dictation_outcome, provider, provider_api_key,
+    selected_provider, speech, transcribe_apple_media_file, valid_whisper_model_file,
+    whisper_model_path, AppState, CustomWordEntry, DictionaryEntry, VoiceEngine,
 };
 
 const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
@@ -762,6 +762,61 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                 }
             }
             .map(|(text, sample_count)| (text, sample_count, "Whisper".to_owned()))
+        }
+        VoiceEngine::Parakeet => {
+            if !parakeet::is_compiled() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Parakeet is available in Voxide's CUDA build",
+                );
+            }
+            let model_path = match parakeet_model_path(&state) {
+                Ok(path) => path,
+                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            };
+            if !parakeet::model_is_installed(&model_path) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "The Parakeet model is missing. Download it before using local API inference.",
+                );
+            }
+            let result = match path {
+                Some(path) => {
+                    let path = std::path::PathBuf::from(path);
+                    tauri::async_runtime::spawn_blocking(move || {
+                        parakeet::transcribe_media_file(&path, &model_path, None).map(
+                            |(text, duration_ms)| {
+                                let sample_count = duration_ms
+                                    .saturating_mul(16)
+                                    .try_into()
+                                    .unwrap_or(usize::MAX);
+                                (text, sample_count)
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|error| format!("Parakeet task failed: {error}"))
+                    .and_then(|result| result)
+                }
+                None => {
+                    let (samples, sample_count) = match raw_audio_path
+                        .as_deref()
+                        .ok_or_else(|| "Missing audio path or audioBase64".to_owned())
+                        .and_then(decode_request_media_samples)
+                    {
+                        Ok(samples) => samples,
+                        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+                    };
+                    tauri::async_runtime::spawn_blocking(move || {
+                        parakeet::transcribe_samples(&samples, &model_path)
+                            .map(|text| (text, sample_count))
+                    })
+                    .await
+                    .map_err(|error| format!("Parakeet task failed: {error}"))
+                    .and_then(|result| result)
+                }
+            };
+            result.map(|(text, sample_count)| (text, sample_count, "Parakeet".to_owned()))
         }
         VoiceEngine::Cloud => {
             let profile = match state.database.lock() {

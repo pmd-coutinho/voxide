@@ -10,7 +10,7 @@
   </p>
 </div>
 
-Voxide is a cross-platform desktop dictation app. Speech is transcribed locally with Whisper (or the engine of your choice), optionally cleaned up by an AI provider you configure, and inserted directly into the active application — on Linux, macOS, and Windows.
+Voxide is a cross-platform desktop dictation app. Speech is transcribed locally with Whisper or, in the Linux NVIDIA CUDA build, Parakeet TDT; it can then be optionally cleaned up by an AI provider you configure and inserted directly into the active application.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
@@ -19,9 +19,9 @@ Voxide is a cross-platform desktop dictation app. Speech is transcribed locally 
 
 ## Features
 
-- **Local-first transcription** — bundled Whisper engine with downloadable models from Tiny to Large v3 Turbo; no audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
+- **Local-first transcription** — downloadable Whisper models from Tiny to Large v3 Turbo, plus Parakeet TDT 0.6B v3 INT8 on Linux/NVIDIA CUDA builds. No audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
 - **Global dictation from any app** — press your hotkey, speak, and the result is typed into whatever has focus, without stealing it. Toggle, hold-to-record, and automatic activation modes; a compact overlay shows the live transcription and microphone level while you speak.
-- **Conservative live preview** — CUDA preview uses final-quality beam search over VAD speech spans, avoiding long pause hallucinations. Confirmed words stay fixed while only the newest tail remains provisional; the final transcript is always re-decoded from the complete recording.
+- **Conservative live preview** — Whisper CUDA uses beam search over VAD speech spans. Parakeet commits completed VAD phrases and shows only the active phrase as provisional. Both avoid long-pause hallucinations, while the final result finishes the remaining tail.
 - **Speech in, speech out — nothing else** — a voice-activity gate rejects silence and noise before decoding, so Whisper's infamous hallucinations ("Thank you for watching!") never reach your text, and noise annotations like `[door slams]` are stripped from what does.
 - **AI enhancement (optional)** — post-process transcriptions with any OpenAI-compatible or Anthropic-style provider. Per-mode providers, reusable prompt profiles, per-profile model routing, and per-application prompt overrides.
 - **Modes beyond dictation** — *Rewrite* transforms selected text in place, *Command* plans shell actions from speech with review-before-execute for destructive commands, and *File Transcription* handles audio/video files in 20-minute chunks.
@@ -33,7 +33,7 @@ Voxide is a cross-platform desktop dictation app. Speech is transcribed locally 
 ## How a dictation flows
 
 ```
-hotkey ──► capture mic ──► VAD gate ──► Whisper (GPU/CPU, warm model) ──► filters ──► typed into your app
+hotkey ──► capture mic ──► VAD gate ──► Whisper or Parakeet (warm local model) ──► filters ──► typed into your app
                               │
                               └── no speech? nothing is typed, ever
 ```
@@ -88,6 +88,20 @@ npm exec tauri build -- --no-bundle --features cuda
 ```
 
 On hybrid laptops Voxide automatically prefers the discrete GPU over the integrated one; set `VOXIDE_GPU_DEVICE=<n>` to override the choice.
+
+#### Parakeet on Linux/NVIDIA CUDA
+
+The `cuda` feature also enables the local **Parakeet TDT 0.6B v3 INT8** engine. It uses the official sherpa-onnx CUDA 12/cuDNN 9 shared runtime; this is separate from the CUDA toolkit used to compile Whisper. On a Linux x86_64 build host, set it up once without sudo:
+
+```sh
+./scripts/setup-parakeet-cuda-runtime.sh
+export SHERPA_ONNX_LIB_DIR="$HOME/.local/share/voxide-parakeet/runtime/lib"
+export PARAKEET_CUDA_LIB_DIRS="$HOME/.local/share/voxide-parakeet/cuda-libs"
+```
+
+Then use the normal CUDA build command above. `PARAKEET_CUDA_LIB_DIRS` is embedded into the Linux binary so compositor keybindings do not need an `LD_LIBRARY_PATH`. In Voxide, select **Parakeet** under **Voice Engine** and download the model (about 500 MB). The model is stored under the app's local data directory, can be removed from the same screen, and is used for dictation, file transcription, and the loopback API.
+
+Parakeet's sherpa-onnx implementation is offline rather than token-streaming. Voxide therefore turns its VAD utterances into live updates: fully separated phrases are final in the preview, and only the active phrase is revised. It is transcribe-only; use Whisper where translation is required.
 
 ## Global shortcuts on Wayland
 

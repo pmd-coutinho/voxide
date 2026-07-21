@@ -33,6 +33,7 @@ mod debug_log;
 mod formatting;
 mod local_api;
 mod media;
+mod parakeet;
 mod permissions;
 #[cfg(target_os = "linux")]
 mod portal_hotkeys;
@@ -1296,6 +1297,16 @@ struct NativeCaptureState {
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
     preview_generation: Arc<AtomicU64>,
+    parakeet_live: Mutex<ParakeetLiveState>,
+}
+
+/// State shared by Parakeet's VAD-segmented preview and the final decode.
+/// `committed_until` is a 16 kHz sample offset in the complete capture.
+#[derive(Debug, Clone, Default)]
+struct ParakeetLiveState {
+    generation: u64,
+    committed_until: usize,
+    committed_text: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1778,6 +1789,15 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
             let model_path = whisper_model_path(&settings, &state)?;
             if !valid_whisper_model_file(&model_path) {
                 return Err("Download the selected Whisper model before completing setup".into());
+            }
+        }
+        VoiceEngine::Parakeet => {
+            if !parakeet::is_compiled() {
+                return Err("Parakeet is available in Voxide's CUDA build".into());
+            }
+            let model_path = parakeet_model_path(&state)?;
+            if !parakeet::model_is_installed(&model_path) {
+                return Err("Download the Parakeet model before completing setup".into());
             }
         }
         VoiceEngine::Cloud => {
@@ -2434,6 +2454,21 @@ async fn transcribe_file(
             })
             .await
             .map_err(|error| format!("File transcription task failed: {error}"))??
+        }
+        VoiceEngine::Parakeet => {
+            if !parakeet::is_compiled() {
+                return Err("Parakeet is available in Voxide's CUDA build".into());
+            }
+            let model_path = parakeet_model_path(&state)?;
+            if !parakeet::model_is_installed(&model_path) {
+                return Err("The Parakeet model is missing. Download it before transcribing a file.".into());
+            }
+            let media_path = path.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                parakeet::transcribe_media_file(&media_path, &model_path, Some(progress))
+            })
+            .await
+            .map_err(|error| format!("Parakeet file transcription task failed: {error}"))??
         }
         VoiceEngine::Cloud => {
             let profile = {
@@ -4738,6 +4773,12 @@ struct VoiceModelStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct VoiceEngineAvailability {
+    parakeet: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AccessibilityPermissionStatus {
     /// Only macOS exposes a portable process-level accessibility trust check.
     supported: bool,
@@ -4904,6 +4945,10 @@ fn whisper_model_path(settings: &Settings, state: &AppState) -> Result<PathBuf, 
         .join(whisper_model_filename(&settings.selected_model)?))
 }
 
+fn parakeet_model_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(parakeet::model_directory(&state.models_directory()?))
+}
+
 /// Decodes common desktop media formats into short WAV-sized Speech.framework
 /// requests. Apple documents an approximately one-minute recognition limit,
 /// so long files are chunked before they reach the native API.
@@ -4977,11 +5022,30 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
                 path: path.display().to_string(),
             })
         }
-        VoiceEngine::Parakeet | VoiceEngine::Nemotron => Ok(VoiceModelStatus {
-            id: format!("{:?}", settings.selected_voice_engine),
+        VoiceEngine::Parakeet => {
+            let path = parakeet_model_path(&state)?;
+            Ok(VoiceModelStatus {
+                id: parakeet::MODEL_ID.into(),
+                installed: parakeet::is_compiled() && parakeet::model_is_installed(&path),
+                path: if parakeet::is_compiled() {
+                    path.display().to_string()
+                } else {
+                    "Parakeet is included in the CUDA build".into()
+                },
+            })
+        }
+        VoiceEngine::Nemotron => Ok(VoiceModelStatus {
+            id: "Nemotron".into(),
             installed: false,
             path: "This engine is not available in the portable runtime yet".into(),
         }),
+    }
+}
+
+#[tauri::command]
+fn voice_engine_availability() -> VoiceEngineAvailability {
+    VoiceEngineAvailability {
+        parakeet: parakeet::is_compiled(),
     }
 }
 
@@ -5004,6 +5068,24 @@ fn delete_whisper_model(
         .map_err(|error| format!("Could not remove the Whisper model: {error}"))?;
     Ok(VoiceModelStatus {
         id: model_id,
+        installed: false,
+        path: path.display().to_string(),
+    })
+}
+
+#[tauri::command]
+fn delete_parakeet_model(state: State<'_, AppState>) -> Result<VoiceModelStatus, String> {
+    let path = parakeet_model_path(&state)?;
+    if !path.exists() {
+        return Err("The downloaded Parakeet model is not installed".into());
+    }
+    if !path.is_dir() {
+        return Err("The Parakeet model path is not a directory".into());
+    }
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Could not remove the Parakeet model: {error}"))?;
+    Ok(VoiceModelStatus {
+        id: parakeet::MODEL_ID.into(),
         installed: false,
         path: path.display().to_string(),
     })
@@ -5125,6 +5207,162 @@ async fn download_whisper_model(
     })
 }
 
+fn validate_parakeet_archive(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    downloaded_bytes: u64,
+) -> Result<(), String> {
+    if downloaded_bytes < 50 * 1024 * 1024 {
+        return Err("The Parakeet download was unexpectedly small".into());
+    }
+    if expected_bytes.is_some_and(|expected| expected != downloaded_bytes) {
+        return Err("The Parakeet download was incomplete".into());
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not verify the Parakeet download: {error}"))?;
+    if !metadata.is_file() || metadata.len() != downloaded_bytes {
+        return Err("The Parakeet download was not saved as a complete regular file".into());
+    }
+    let mut prefix = [0_u8; 3];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .map_err(|error| format!("Could not inspect the Parakeet download: {error}"))?;
+    if &prefix != b"BZh" {
+        return Err("The Parakeet download is not a bzip2 model archive".into());
+    }
+    Ok(())
+}
+
+fn install_parakeet_archive(
+    archive_path: &Path,
+    models_directory: &Path,
+) -> Result<PathBuf, String> {
+    let staging = models_directory.join(format!(".parakeet-install-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("Could not prepare the Parakeet installation: {error}"))?;
+    let install_result = (|| {
+        let archive = fs::File::open(archive_path)
+            .map_err(|error| format!("Could not open the Parakeet archive: {error}"))?;
+        let decoder = bzip2::read::BzDecoder::new(archive);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|error| format!("Could not read the Parakeet archive: {error}"))?
+        {
+            entry
+                .map_err(|error| format!("Could not read a Parakeet archive entry: {error}"))?
+                .unpack_in(&staging)
+                .map_err(|error| {
+                    format!("Could not extract the Parakeet archive safely: {error}")
+                })?;
+        }
+        let extracted = staging.join(parakeet::archive_root());
+        if !parakeet::model_is_installed(&extracted) {
+            return Err(parakeet::installation_error(&extracted));
+        }
+        let destination = parakeet::model_directory(models_directory);
+        if destination.exists() {
+            fs::remove_dir_all(&destination).map_err(|error| {
+                format!("Could not replace the existing Parakeet model: {error}")
+            })?;
+        }
+        fs::rename(&extracted, &destination)
+            .map_err(|error| format!("Could not install the Parakeet model: {error}"))?;
+        Ok(destination)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    install_result
+}
+
+#[tauri::command]
+async fn download_parakeet_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    if !parakeet::is_compiled() {
+        return Err(
+            "Parakeet is included in the CUDA build. Install a CUDA build of Voxide first.".into(),
+        );
+    }
+    let directory = state.models_directory()?;
+    let archive_name = format!("{}.tar.bz2", parakeet::MODEL_ID);
+    let temporary = directory.join(format!("{archive_name}.download"));
+    let response = reqwest::get(parakeet::MODEL_ARCHIVE_URL)
+        .await
+        .map_err(|error| format!("Could not download the Parakeet model: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not download the Parakeet model: HTTP {}",
+            response.status()
+        ));
+    }
+    if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+        return Err("Could not download the Parakeet model: the server returned HTML or XML instead of model data.".into());
+    }
+    let total_bytes = response.content_length();
+    let download_result = async {
+        let mut downloaded_bytes = 0_u64;
+        let mut stream = response.bytes_stream();
+        let mut output = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|error| format!("Could not create the Parakeet download: {error}"))?;
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| format!("The Parakeet download was interrupted: {error}"))?;
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(|error| format!("Could not save the Parakeet download: {error}"))?;
+            downloaded_bytes += chunk.len() as u64;
+            let _ = app.emit(
+                "model-download-progress",
+                ModelDownloadProgress {
+                    id: parakeet::MODEL_ID.into(),
+                    downloaded_bytes,
+                    total_bytes,
+                },
+            );
+        }
+        output
+            .flush()
+            .await
+            .map_err(|error| format!("Could not finalize the Parakeet download: {error}"))?;
+        Ok::<u64, String>(downloaded_bytes)
+    }
+    .await;
+    let downloaded_bytes = match download_result {
+        Ok(downloaded_bytes) => downloaded_bytes,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_parakeet_archive(&temporary, total_bytes, downloaded_bytes) {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    let install_directory = directory.clone();
+    let install_archive = temporary.clone();
+    let destination = tauri::async_runtime::spawn_blocking(move || {
+        install_parakeet_archive(&install_archive, &install_directory)
+    })
+    .await
+    .map_err(|error| format!("Parakeet installation task failed: {error}"))?;
+    let _ = tokio::fs::remove_file(&temporary).await;
+    let destination = destination?;
+    state.update(|database| {
+        database.settings.selected_voice_engine = VoiceEngine::Parakeet;
+        database.settings.selected_model = parakeet::MODEL_ID.into();
+        database.settings.local_model_path = None;
+    })?;
+    Ok(VoiceModelStatus {
+        id: parakeet::MODEL_ID.into(),
+        installed: true,
+        path: destination.display().to_string(),
+    })
+}
+
 #[tauri::command]
 fn start_native_dictation(
     app: AppHandle,
@@ -5215,6 +5453,16 @@ fn start_native_dictation(
         .preview_generation
         .fetch_add(1, Ordering::SeqCst)
         + 1;
+    if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
+        *capture_state
+            .parakeet_live
+            .lock()
+            .map_err(|_| "Parakeet live state lock was poisoned".to_string())? =
+            ParakeetLiveState {
+                generation: preview_generation,
+                ..Default::default()
+            };
+    }
     let preview_cancellation = Arc::clone(&capture_state.preview_generation);
     if settings.enable_streaming_preview {
         emit_overlay(&app, "recording", "Listening…");
@@ -5232,6 +5480,22 @@ fn start_native_dictation(
                     vad_model_path(&state),
                     settings.language.clone(),
                     custom_words.clone(),
+                    settings.transcription_preview_char_limit,
+                );
+            }
+        }
+    }
+    if settings.enable_streaming_preview
+        && matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet)
+        && parakeet::is_compiled()
+    {
+        if let Ok(model_path) = parakeet_model_path(&state) {
+            if parakeet::model_is_installed(&model_path) {
+                spawn_live_parakeet_preview(
+                    app.clone(),
+                    preview_generation,
+                    model_path,
+                    vad_model_path(&state),
                     settings.transcription_preview_char_limit,
                 );
             }
@@ -5499,6 +5763,147 @@ fn spawn_live_whisper_preview(
     });
 }
 
+/// Parakeet's TDT model is offline, so live dictation is built from completed
+/// VAD utterances. Earlier phrases become immutable as soon as the following
+/// utterance begins; only the current phrase is decoded again as a
+/// provisional tail. This avoids the rolling-window revisions and silence
+/// hallucinations common in pseudo-streaming ASR previews.
+fn spawn_live_parakeet_preview(
+    app: AppHandle,
+    preview_generation: u64,
+    model_path: PathBuf,
+    vad_model: Option<PathBuf>,
+    preview_char_limit: usize,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(interval).await;
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let captured = capture_state.capture.lock().ok().and_then(|capture| {
+                capture
+                    .as_ref()
+                    .and_then(|capture| capture.snapshot_all().ok())
+            });
+            let Some(captured) = captured else {
+                return;
+            };
+            if captured.duration_ms < 500 {
+                continue;
+            }
+            let samples = match audio::mono_resample_for_whisper(captured) {
+                Ok(samples) => samples,
+                Err(error) => {
+                    debug_log::append(&format!(
+                        "Live Parakeet preview could not resample audio: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let mut live = match capture_state.parakeet_live.lock() {
+                Ok(live) if live.generation == preview_generation => live.clone(),
+                _ => return,
+            };
+            let started = Instant::now();
+            let ranges = vad_model
+                .as_deref()
+                .and_then(|model| speech::live_speech_ranges(&samples, model))
+                .unwrap_or_else(|| {
+                    // The small VAD asset may still be downloading at startup.
+                    // Keep a useful, explicitly provisional preview rather
+                    // than going silent; completed phrase commits resume once
+                    // the VAD is present.
+                    (!samples.is_empty())
+                        .then_some((live.committed_until.min(samples.len()), samples.len()))
+                        .into_iter()
+                        .collect()
+                });
+            let mut committed = live.committed_text.clone();
+            let completed_count = ranges.len().saturating_sub(1);
+            for &(start, end) in &ranges[..completed_count] {
+                let start = start.max(live.committed_until).min(samples.len());
+                let end = end.min(samples.len());
+                if end <= start {
+                    continue;
+                }
+                let phrase = samples[start..end].to_vec();
+                let model_path = model_path.clone();
+                match tauri::async_runtime::spawn_blocking(move || {
+                    parakeet::transcribe_samples(&phrase, &model_path)
+                })
+                .await
+                .map_err(|error| format!("preview task failed: {error}"))
+                .and_then(|result| result)
+                {
+                    Ok(text) if !text.is_empty() => committed.push(text),
+                    Ok(_) => {}
+                    Err(error) => {
+                        debug_log::append(&format!("Live Parakeet phrase skipped: {error}"))
+                    }
+                }
+                // Advance even when the model returns no text. Otherwise a
+                // single noise-only VAD segment would be decoded on every
+                // preview tick forever.
+                live.committed_until = live.committed_until.max(end);
+            }
+            let provisional = ranges.last().and_then(|(start, end)| {
+                let start = (*start).max(live.committed_until).min(samples.len());
+                let end = (*end).min(samples.len());
+                (end > start).then(|| (start, end))
+            });
+            let provisional = if let Some((start, end)) = provisional {
+                let phrase = samples[start..end].to_vec();
+                let model_path = model_path.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    parakeet::transcribe_samples(&phrase, &model_path)
+                })
+                .await
+                .map_err(|error| format!("preview task failed: {error}"))
+                .and_then(|result| result)
+                .ok()
+                .filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            interval = started
+                .elapsed()
+                .mul_f32(1.25)
+                .clamp(Duration::from_millis(300), Duration::from_millis(2_000));
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let mut stored = match capture_state.parakeet_live.lock() {
+                Ok(stored) if stored.generation == preview_generation => stored,
+                _ => return,
+            };
+            live.committed_text = committed;
+            *stored = live.clone();
+            let mut visible = live.committed_text;
+            if let Some(provisional) = provisional {
+                visible.push(provisional);
+            }
+            if !visible.is_empty() {
+                let text = visible.join(" ");
+                debug_log::append(&format!(
+                    "Live Parakeet preview emitted (audio_ms: {}, committed_until: {})",
+                    (samples.len() as u64).saturating_mul(1_000)
+                        / audio::WHISPER_SAMPLE_RATE as u64,
+                    live.committed_until
+                ));
+                emit_overlay(
+                    &app,
+                    "recording",
+                    tail_characters(&text, preview_char_limit),
+                );
+            }
+        }
+    });
+}
+
 fn spawn_live_cloud_preview(
     app: AppHandle,
     preview_generation: u64,
@@ -5614,6 +6019,41 @@ fn spawn_live_apple_speech_preview(
     });
 }
 
+/// Finishes only the audio that was not already committed by the Parakeet
+/// preview. When VAD is ready, decode each remaining utterance independently;
+/// this keeps a long stop-pause from being interpreted as speech. If VAD is
+/// unavailable (for example during its first background download), the model
+/// still receives the contiguous tail so a dictation never loses its ending.
+fn transcribe_parakeet_final_tail(
+    samples: &[f32],
+    model_path: &Path,
+    vad_model: Option<&Path>,
+) -> Result<String, String> {
+    if samples.is_empty() {
+        return Ok(String::new());
+    }
+    let Some(ranges) = vad_model.and_then(|model| speech::live_speech_ranges(samples, model))
+    else {
+        return parakeet::transcribe_samples(samples, model_path);
+    };
+    if ranges.is_empty() {
+        return Ok(String::new());
+    }
+    let mut phrases = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let start = start.min(samples.len());
+        let end = end.min(samples.len());
+        if end <= start {
+            continue;
+        }
+        let text = parakeet::transcribe_samples(&samples[start..end], model_path)?;
+        if !text.is_empty() {
+            phrases.push(text);
+        }
+    }
+    Ok(phrases.join(" "))
+}
+
 #[tauri::command]
 async fn stop_native_dictation(
     app: AppHandle,
@@ -5624,7 +6064,7 @@ async fn stop_native_dictation(
     prompt_test_mode: Option<bool>,
     prompt_test_prompt: Option<String>,
 ) -> Result<NativeTranscriptionResult, String> {
-    capture_state
+    let stopped_preview_generation = capture_state
         .preview_generation
         .fetch_add(1, Ordering::SeqCst);
     let capture = capture_state
@@ -5637,6 +6077,11 @@ async fn stop_native_dictation(
         .context
         .lock()
         .map_err(|_| "Dictation context lock was poisoned".to_string())?
+        .clone();
+    let parakeet_live = capture_state
+        .parakeet_live
+        .lock()
+        .map_err(|_| "Parakeet live state lock was poisoned".to_string())?
         .clone();
     update_tray_status(&app, TrayVisualState::Processing);
     let _reset_tray = ResetTrayWhenDropped { app: app.clone() };
@@ -5710,6 +6155,38 @@ async fn stop_native_dictation(
                 .map_err(|error| format!("Voice engine task failed: {error}"))??
                 ;
             (result.text, Some(result.timings))
+        }
+        VoiceEngine::Parakeet => {
+            if !parakeet::is_compiled() {
+                return Err("Parakeet is available in Voxide's CUDA build".into());
+            }
+            let model_path = parakeet_model_path(&state)?;
+            if !parakeet::model_is_installed(&model_path) {
+                return Err("The Parakeet model is missing. Download it before recording.".into());
+            }
+            let vad_model = vad_model_path(&state);
+            let text = tauri::async_runtime::spawn_blocking(move || {
+                if parakeet_live.generation == stopped_preview_generation
+                    && parakeet_live.committed_until > 0
+                {
+                    let mut phrases = parakeet_live.committed_text;
+                    let tail_start = parakeet_live.committed_until.min(samples.len());
+                    let tail = transcribe_parakeet_final_tail(
+                        &samples[tail_start..],
+                        &model_path,
+                        vad_model.as_deref(),
+                    )?;
+                    if !tail.is_empty() {
+                        phrases.push(tail);
+                    }
+                    Ok(phrases.join(" "))
+                } else {
+                    parakeet::transcribe_samples(&samples, &model_path)
+                }
+            })
+            .await
+            .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
+            (text, None)
         }
         VoiceEngine::Cloud => {
             let profile = {
@@ -6904,32 +7381,51 @@ pub fn run() {
                 else {
                     return;
                 };
-                if !matches!(settings.selected_voice_engine, VoiceEngine::Whisper) {
-                    return;
-                }
-                ensure_vad_model(&state).await;
-                let vad = vad_model_path(&state);
-                let model = match whisper_model_path(&settings, &state) {
-                    Ok(path) if path.is_file() => path,
-                    _ => return,
-                };
-                let _ = tauri::async_runtime::spawn_blocking(move || {
-                    if let Some(vad) = vad {
-                        match speech::preload_vad(&vad) {
-                            Ok(()) => debug_log::append("Whisper VAD model preloaded"),
-                            Err(error) => {
-                                debug_log::append(&format!("Whisper VAD preload failed: {error}"))
+                match settings.selected_voice_engine {
+                    VoiceEngine::Whisper => {
+                        ensure_vad_model(&state).await;
+                        let vad = vad_model_path(&state);
+                        let model = match whisper_model_path(&settings, &state) {
+                            Ok(path) if path.is_file() => path,
+                            _ => return,
+                        };
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            if let Some(vad) = vad {
+                                match speech::preload_vad(&vad) {
+                                    Ok(()) => debug_log::append("Whisper VAD model preloaded"),
+                                    Err(error) => debug_log::append(&format!(
+                                        "Whisper VAD preload failed: {error}"
+                                    )),
+                                }
                             }
-                        }
+                            match speech::preload_whisper(&model) {
+                                Ok(()) => debug_log::append("Whisper model preloaded"),
+                                Err(error) => {
+                                    debug_log::append(&format!("Whisper preload failed: {error}"))
+                                }
+                            }
+                        })
+                        .await;
                     }
-                    match speech::preload_whisper(&model) {
-                        Ok(()) => debug_log::append("Whisper model preloaded"),
-                        Err(error) => {
-                            debug_log::append(&format!("Whisper preload failed: {error}"))
-                        }
+                    VoiceEngine::Parakeet if parakeet::is_compiled() => {
+                        ensure_vad_model(&state).await;
+                        let model = match parakeet_model_path(&state) {
+                            Ok(path) if parakeet::model_is_installed(&path) => path,
+                            _ => return,
+                        };
+                        let _ =
+                            tauri::async_runtime::spawn_blocking(move || {
+                                match parakeet::preload(&model) {
+                                    Ok(()) => debug_log::append("Parakeet CUDA model preloaded"),
+                                    Err(error) => debug_log::append(&format!(
+                                        "Parakeet preload failed: {error}"
+                                    )),
+                                }
+                            })
+                            .await;
                     }
-                })
-                .await;
+                    _ => {}
+                }
             });
             let capture_prewarm_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -7024,11 +7520,14 @@ pub fn run() {
             replace_selected_text,
             usage_stats,
             voice_model_status,
+            voice_engine_availability,
             delete_whisper_model,
+            delete_parakeet_model,
             audio_input_devices,
             accessibility_permission_status,
             open_accessibility_settings,
             download_whisper_model,
+            download_parakeet_model,
             start_native_dictation,
             stop_native_dictation,
             cancel_native_dictation,

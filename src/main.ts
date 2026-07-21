@@ -233,6 +233,10 @@ interface VoiceModelStatus {
   path: string;
 }
 
+interface VoiceEngineAvailability {
+  parakeet: boolean;
+}
+
 interface ModelDownloadProgress {
   id: string;
   downloadedBytes: number;
@@ -438,6 +442,7 @@ let currentView = "welcome";
 let recording = false;
 let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
+let voiceEngineAvailability: VoiceEngineAvailability = { parakeet: false };
 let modelDownloadProgress: ModelDownloadProgress | undefined;
 let audioDevices: string[] = [];
 let providers: AiProviderView[] = [];
@@ -693,23 +698,25 @@ function renderWelcome(): void {
 function renderVoiceEngine(): void {
   const engines: [Settings["selectedVoiceEngine"], string, string, boolean][] = [
     ["whisper", "Whisper", "Local models with broad language support", true],
-    ["parakeet", "Parakeet", "Apple Silicon-only runtime — portable implementation pending", false],
+    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with VAD-segmented live preview", voiceEngineAvailability.parakeet],
     ["nemotron", "Nemotron Speech", "Apple Silicon-only runtime — portable implementation pending", false],
     ["appleSpeech", "System speech", "Use the operating system speech service", true],
     ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", true],
   ];
   const selectedEngine = database.settings.selectedVoiceEngine;
   const isWhisper = selectedEngine === "whisper";
+  const isParakeet = selectedEngine === "parakeet";
   const isCloud = selectedEngine === "cloud";
   const isAppleSpeech = selectedEngine === "appleSpeech";
   const status = modelStatus?.installed
     ? `<span class="status done">Installed</span>`
-    : `<span class="status pending">Not installed</span>`;
-  const downloading = isWhisper && modelDownloadProgress?.id === database.settings.selectedModel ? modelDownloadProgress : undefined;
+    : `<span class="status pending">${isParakeet && !voiceEngineAvailability.parakeet ? "CUDA build required" : "Not installed"}</span>`;
+  const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v3-int8" : "";
+  const downloading = downloadId && modelDownloadProgress?.id === downloadId ? modelDownloadProgress : undefined;
   const downloadDetail = downloading
     ? `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
     : "";
-  const canDeleteDownloadedModel = isWhisper && !database.settings.localModelPath && modelStatus?.installed;
+  const canDeleteDownloadedModel = (isWhisper && !database.settings.localModelPath || isParakeet) && modelStatus?.installed;
   const selectedInputDeviceUnavailable = Boolean(
     database.settings.selectedInputDevice && !audioDevices.includes(database.settings.selectedInputDevice),
   );
@@ -718,13 +725,17 @@ function renderVoiceEngine(): void {
     ? `<label>Selected Whisper model<select id="selected-model"><option value="tiny" ${database.settings.selectedModel === "tiny" ? "selected" : ""}>Tiny — multilingual, fastest</option><option value="base" ${database.settings.selectedModel === "base" ? "selected" : ""}>Base — multilingual, default</option><option value="small" ${database.settings.selectedModel === "small" ? "selected" : ""}>Small — multilingual, higher accuracy</option><option value="medium" ${database.settings.selectedModel === "medium" ? "selected" : ""}>Medium — multilingual</option><option value="large-v3-turbo" ${database.settings.selectedModel === "large-v3-turbo" ? "selected" : ""}>Large v3 Turbo — multilingual</option><option value="large-v3-turbo-q5_0" ${database.settings.selectedModel === "large-v3-turbo-q5_0" ? "selected" : ""}>Large v3 Turbo Q5 — smaller local fallback</option><option value="large-v3-turbo-q8_0" ${database.settings.selectedModel === "large-v3-turbo-q8_0" ? "selected" : ""}>Large v3 Turbo Q8 — smaller local fallback</option><option value="large-v3" ${database.settings.selectedModel === "large-v3" ? "selected" : ""}>Large v3 — multilingual</option><optgroup label="Legacy English-only Whisper models"><option value="tiny.en" ${database.settings.selectedModel === "tiny.en" ? "selected" : ""}>Tiny English</option><option value="base.en" ${database.settings.selectedModel === "base.en" ? "selected" : ""}>Base English</option><option value="small.en" ${database.settings.selectedModel === "small.en" ? "selected" : ""}>Small English</option><option value="medium.en" ${database.settings.selectedModel === "medium.en" ? "selected" : ""}>Medium English</option></optgroup></select></label>
       <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
-    : isCloud
+    : isParakeet
+      ? `<p class="muted">Parakeet TDT 0.6B v3 (INT8) runs locally through the CUDA build. Its live preview commits completed VAD phrases and keeps only the active phrase provisional. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      : isCloud
       ? `<label>Cloud transcription model<input id="cloud-transcription-model" value="${escapeHtml(database.settings.cloudTranscriptionModel)}" placeholder="gpt-4o-mini-transcribe"></label><p class="muted">Uses the enabled OpenAI-compatible AI provider and its stored API key.</p>`
       : isAppleSpeech
         ? `<label>Apple Speech locale<input id="apple-speech-locale" value="${escapeHtml(database.settings.appleSpeechLocale)}" placeholder="en-US"><small>Use a supported BCP-47 locale such as en-US, pt-PT, or es-ES.</small></label><p class="muted">macOS Speech Recognition transcribes final results using the operating-system service. macOS asks for Speech Recognition permission when it is first used. This engine is unavailable on Windows and Linux.</p>`
         : `<p class="muted">This engine is listed for migration compatibility but is not yet available in the portable runtime. Select Whisper, System speech on macOS, or a compatible cloud API.</p>`;
-  const whisperActions = isWhisper
+  const modelActions = isWhisper
     ? `<button data-action="download-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download selected model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
+    : isParakeet && voiceEngineAvailability.parakeet
+      ? `<button data-action="download-parakeet-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Parakeet model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-parakeet-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
     : "";
   renderShell(`
     ${pageTitle("Voice Engine", "Choose the transcription runtime used for dictation.")}
@@ -734,7 +745,7 @@ function renderVoiceEngine(): void {
       ${engineConfiguration}
       ${isAppleSpeech ? "" : `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"></label>`}
       <label>Microphone input<select id="input-device">${deviceOptions}</select></label>
-      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${whisperActions}</div>
+      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
     </section>`);
@@ -1101,6 +1112,10 @@ async function refreshStats(): Promise<void> {
 
 async function refreshModelStatus(): Promise<void> {
   modelStatus = await invoke<VoiceModelStatus>("voice_model_status");
+}
+
+async function refreshVoiceEngineAvailability(): Promise<void> {
+  voiceEngineAvailability = await invoke<VoiceEngineAvailability>("voice_engine_availability");
 }
 
 async function refreshAudioDevices(): Promise<void> {
@@ -2402,6 +2417,35 @@ async function handleAction(element: HTMLElement): Promise<void> {
       }
       break;
     }
+    case "download-parakeet-model": {
+      showNotice("Downloading Parakeet TDT 0.6B. This is about 500 MB and may take a few minutes.");
+      modelDownloadProgress = { id: "parakeet-tdt-0.6b-v3-int8", downloadedBytes: 0 };
+      render();
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("download_parakeet_model");
+        database.settings.selectedVoiceEngine = "parakeet";
+        database.settings.selectedModel = "parakeet-tdt-0.6b-v3-int8";
+        database.settings.localModelPath = undefined;
+        showNotice("Parakeet is ready for local CUDA dictation.");
+      } catch (error) {
+        showNotice(`Could not download Parakeet: ${String(error)}`);
+      } finally {
+        modelDownloadProgress = undefined;
+        render();
+      }
+      break;
+    }
+    case "delete-parakeet-model": {
+      if (!window.confirm("Remove the downloaded Parakeet model? You can download it again later.")) break;
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("delete_parakeet_model");
+        showNotice("Parakeet was removed.");
+        render();
+      } catch (error) {
+        showNotice(`Could not remove Parakeet: ${String(error)}`);
+      }
+      break;
+    }
     case "add-prompt-shortcut": {
       const profile = database.promptProfiles.find((candidate) => candidate.mode === "dictate");
       if (!profile) { showNotice("Create a Dictate prompt profile first."); break; }
@@ -2780,6 +2824,7 @@ async function initialize(): Promise<void> {
   database = await invoke<AppDatabase>("bootstrap");
   commandState.chatId = database.activeCommandChatId;
   await refreshStats();
+  await refreshVoiceEngineAvailability();
   await refreshModelStatus();
   await refreshAudioDevices().catch(() => { audioDevices = []; });
   await refreshProviders();

@@ -512,6 +512,15 @@ fn detect_speech_ranges(
     Some(merged)
 }
 
+/// Segments a 16 kHz capture into padded utterances for an engine which can
+/// decode phrases independently. The probe is normalized exactly as Whisper's
+/// VAD path is, so quiet microphones do not make Parakeet's live cursor stick.
+pub fn live_speech_ranges(samples: &[f32], vad_model_path: &Path) -> Option<Vec<(usize, usize)>> {
+    let mut probe = samples.to_vec();
+    normalize_peak(&mut probe);
+    detect_speech_ranges(&probe, vad_model_path, 650)
+}
+
 fn preview_speech_only_samples(
     samples: &[f32],
     probe: &[f32],
