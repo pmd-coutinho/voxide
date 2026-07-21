@@ -180,6 +180,20 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     Ok(context)
 }
 
+/// Amplifies quiet recordings to a healthy peak. Applied before VAD and
+/// decoding; capped so near-silence is not blown up into full-scale noise.
+fn normalize_peak(samples: &mut [f32]) {
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |maximum, sample| maximum.max(sample.abs()));
+    if peak > 1e-4 && peak < 0.5 {
+        let gain = (0.9 / peak).min(30.0);
+        for sample in samples.iter_mut() {
+            *sample *= gain;
+        }
+    }
+}
+
 /// Runs Silero voice-activity detection and keeps only the speech audio,
 /// mirroring `whisper_full`'s own VAD preprocessing — which whisper-rs's
 /// state-based API bypasses entirely. Returns None when VAD is unavailable
@@ -191,9 +205,14 @@ fn speech_only_samples(samples: &[f32], vad_model_path: &Path) -> Option<Vec<f32
     let mut context_params = WhisperVadContextParams::new();
     context_params.set_use_gpu(false);
     let mut vad = WhisperVadContext::new(model, context_params).ok()?;
-    let segments = vad
-        .segments_from_samples(WhisperVadParams::new(), samples)
-        .ok()?;
+    // whisper.cpp's VAD defaults (100 ms silence splits, 30 ms padding) chop
+    // words at segment boundaries. Match faster-whisper's dictation-friendly
+    // tuning instead: an utterance with normal pauses stays one generously
+    // padded segment, while pure silence still yields none.
+    let mut vad_params = WhisperVadParams::new();
+    vad_params.set_min_silence_duration(2_000);
+    vad_params.set_speech_pad(400);
+    let segments = vad.segments_from_samples(vad_params, samples).ok()?;
     // Match whisper_full's reconstruction: extend every non-final segment by
     // the overlap window and join segments with 0.1 s of silence.
     let overlap_samples = (0.1 * audio::WHISPER_SAMPLE_RATE as f32) as usize;
@@ -232,20 +251,23 @@ fn transcribe_samples(
     let _inference = INFERENCE_LOCK
         .lock()
         .map_err(|_| "Whisper inference lock was poisoned".to_string())?;
+    // Quiet microphones (built-in DMIC arrays) record speech at levels that
+    // starve both the voice-activity model and Whisper itself; bring the
+    // peak up before analysis.
+    let mut audio_samples = samples.to_vec();
+    normalize_peak(&mut audio_samples);
     // Strip non-speech audio before decoding: silence and noise are what
     // Whisper hallucinates subtitle boilerplate on.
-    let mut filtered_speech;
-    let mut samples = samples;
     if let Some(vad_model_path) = vad_model_path {
-        if let Some(speech) = speech_only_samples(samples, vad_model_path) {
+        if let Some(mut speech) = speech_only_samples(&audio_samples, vad_model_path) {
             if speech.is_empty() {
                 return Ok(String::new());
             }
-            filtered_speech = speech;
-            audio::pad_short_transcription_samples(&mut filtered_speech);
-            samples = &filtered_speech;
+            audio::pad_short_transcription_samples(&mut speech);
+            audio_samples = speech;
         }
     }
+    let samples = &audio_samples[..];
     let mut state = context
         .create_state()
         .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
@@ -338,6 +360,55 @@ fn clean_transcription_segment(segment: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::clean_transcription_segment;
+
+    /// Debugs VAD behavior on a real recording. Point VOXIDE_TEST_WAV at a
+    /// 16 kHz mono WAV and run:
+    ///   VOXIDE_TEST_WAV=... cargo test vad_debug -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn vad_debug_on_real_recording() {
+        use whisper_rs::{WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
+        let wav = std::env::var("VOXIDE_TEST_WAV").expect("set VOXIDE_TEST_WAV");
+        let home = std::env::var("HOME").expect("HOME is set");
+        let models = std::path::PathBuf::from(home).join(".local/share/voxide/models");
+        let mut reader = hound::WavReader::open(&wav).expect("wav opens");
+        let spec = reader.spec();
+        println!("wav: {spec:?}");
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .map(|sample| sample.unwrap() as f32 / i16::MAX as f32)
+                .collect(),
+            hound::SampleFormat::Float => {
+                reader.samples::<f32>().map(|sample| sample.unwrap()).collect()
+            }
+        };
+        println!("samples: {} ({:.2}s)", samples.len(), samples.len() as f32 / 16_000.0);
+        let vad_path = models.join("ggml-silero-v5.1.2.bin");
+        let mut context_params = WhisperVadContextParams::new();
+        context_params.set_use_gpu(false);
+        let mut vad = WhisperVadContext::new(vad_path.to_str().unwrap(), context_params)
+            .expect("vad context");
+        let segments = vad
+            .segments_from_samples(WhisperVadParams::new(), &samples)
+            .expect("vad segments");
+        println!("vad segments: {}", segments.num_segments());
+        for index in 0..segments.num_segments() {
+            let segment = segments.get_segment(index).unwrap();
+            println!("  segment {index}: start={} end={}", segment.start, segment.end);
+        }
+        let filtered = super::speech_only_samples(&samples, &vad_path);
+        println!(
+            "filtered samples: {:?}",
+            filtered.as_ref().map(|filtered| filtered.len())
+        );
+        let model = models.join("ggml-small.bin");
+        let with_vad =
+            super::transcribe_whisper(samples.clone(), &model, Some(&vad_path), "en", &[]);
+        let without_vad = super::transcribe_whisper(samples, &model, None, "en", &[]);
+        println!("with vad: {with_vad:?}");
+        println!("without vad: {without_vad:?}");
+    }
 
     /// Reproduces the silence-hallucination report ("Thanks for watching!")
     /// against the real local models. Run manually:
