@@ -5274,6 +5274,45 @@ fn start_native_dictation(
     })
 }
 
+/// Produces a deliberately conservative live transcript. Each preview is a
+/// fresh decode of a growing/moving audio window, so its final words are
+/// provisional and can legitimately change. Showing only the common prefix
+/// of two consecutive snapshots keeps the overlay from replacing words that
+/// were already correct with a later hallucination.
+#[derive(Default)]
+struct WhisperPreviewStability {
+    previous_words: Vec<String>,
+    confirmed_words: Vec<String>,
+}
+
+impl WhisperPreviewStability {
+    fn observe(&mut self, candidate: &str) -> Option<String> {
+        let current_words = candidate
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if current_words.is_empty() {
+            return None;
+        }
+        if self.previous_words.is_empty() {
+            self.previous_words = current_words;
+            return None;
+        }
+        let common_prefix = self
+            .previous_words
+            .iter()
+            .zip(&current_words)
+            .take_while(|(previous, current)| previous.eq_ignore_ascii_case(current))
+            .count();
+        self.confirmed_words.truncate(common_prefix);
+        if common_prefix > self.confirmed_words.len() {
+            self.confirmed_words = self.previous_words[..common_prefix].to_vec();
+        }
+        self.previous_words = current_words;
+        (!self.confirmed_words.is_empty()).then(|| self.confirmed_words.join(" "))
+    }
+}
+
 fn spawn_live_whisper_preview(
     app: AppHandle,
     preview_generation: u64,
@@ -5289,6 +5328,7 @@ fn spawn_live_whisper_preview(
         // machine: GPU inference refreshes several times per second while
         // CPU inference backs off to its own cost instead of piling up.
         let mut interval = Duration::from_millis(600);
+        let mut stability = WhisperPreviewStability::default();
         loop {
             tokio::time::sleep(interval).await;
             let capture_state = app.state::<NativeCaptureState>();
@@ -5336,6 +5376,13 @@ fn spawn_live_whisper_preview(
                 .clamp(Duration::from_millis(250), Duration::from_millis(2_500));
             match preview_result {
                 Ok(result) if !result.text.trim().is_empty() => {
+                    let Some(stable_text) = stability.observe(&result.text) else {
+                        debug_log::append(&format!(
+                            "Live Whisper preview is waiting for confirmation (audio_ms: {})",
+                            captured_duration_ms
+                        ));
+                        continue;
+                    };
                     let capture_state = app.state::<NativeCaptureState>();
                     if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation
                     {
@@ -5346,7 +5393,7 @@ fn spawn_live_whisper_preview(
                         emit_overlay(
                             &app,
                             "recording",
-                            tail_characters(&result.text, preview_char_limit),
+                            tail_characters(&stable_text, preview_char_limit),
                         );
                     }
                 }
@@ -8251,5 +8298,35 @@ mod tests {
         assert_eq!(audio_name, "audio/2026-07-20T12-34-56Z_00000123.wav");
         assert!(archive.by_name(audio_name).is_ok());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_preview_only_advances_when_words_repeat() {
+        let mut preview = WhisperPreviewStability::default();
+        assert_eq!(preview.observe("hello world"), None);
+        assert_eq!(preview.observe("hello word"), Some("hello".into()));
+        assert_eq!(
+            preview.observe("hello word again"),
+            Some("hello word".into())
+        );
+        assert_eq!(
+            preview.observe("hello word again today"),
+            Some("hello word again".into())
+        );
+    }
+
+    #[test]
+    fn live_preview_restarts_cleanly_when_the_audio_window_moves() {
+        let mut preview = WhisperPreviewStability::default();
+        assert_eq!(preview.observe("one two three"), None);
+        assert_eq!(
+            preview.observe("one two three four"),
+            Some("one two three".into())
+        );
+        assert_eq!(preview.observe("three four five"), None);
+        assert_eq!(
+            preview.observe("three four five six"),
+            Some("three four five".into())
+        );
     }
 }

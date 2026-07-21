@@ -522,38 +522,32 @@ fn transcribe_samples(
         lock_wait_ms: lock_started.elapsed().as_millis() as u64,
         ..Default::default()
     };
-    // VAD is a quality gate for the completed recording. It is intentionally
-    // not applied to a live snapshot: while someone is still talking, the
-    // VAD's conservative silence rules can reject the only partial segment
-    // and leave the overlay permanently at "Listening…". Whisper's own
-    // no-speech threshold remains enabled below for preview snapshots.
-    //
-    // Final audio is handled as before: VAD decides whether speech exists and
-    // where its outer edges are. Detection runs on a peak-normalized probe
-    // copy, while Whisper decodes the original contiguous audio.
+    // VAD gates both live snapshots and final audio. Without it, a growing
+    // preview buffer includes leading/trailing room noise that makes the
+    // decoder revise otherwise correct partial words into hallucinations.
+    // Detection runs on a peak-normalized probe copy, while Whisper decodes
+    // the original contiguous audio.
     let mut edge_trimmed;
     let mut samples = samples;
-    if !options.is_preview() {
-        if let Some(vad_model_path) = vad_model_path {
-            let vad_started = Instant::now();
-            let mut probe = samples.to_vec();
-            normalize_peak(&mut probe);
-            let bounds = detect_speech_bounds(&probe, vad_model_path);
-            timings.vad_ms = vad_started.elapsed().as_millis() as u64;
-            match bounds {
-                Some(SpeechBounds::None) => {
-                    return Ok(WhisperTranscription {
-                        text: String::new(),
-                        timings,
-                    });
-                }
-                Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
-                    edge_trimmed = samples[start.min(samples.len())..end].to_vec();
-                    audio::pad_short_transcription_samples(&mut edge_trimmed);
-                    samples = &edge_trimmed;
-                }
-                _ => {}
+    if let Some(vad_model_path) = vad_model_path {
+        let vad_started = Instant::now();
+        let mut probe = samples.to_vec();
+        normalize_peak(&mut probe);
+        let bounds = detect_speech_bounds(&probe, vad_model_path);
+        timings.vad_ms = vad_started.elapsed().as_millis() as u64;
+        match bounds {
+            Some(SpeechBounds::None) => {
+                return Ok(WhisperTranscription {
+                    text: String::new(),
+                    timings,
+                });
             }
+            Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
+                edge_trimmed = samples[start.min(samples.len())..end].to_vec();
+                audio::pad_short_transcription_samples(&mut edge_trimmed);
+                samples = &edge_trimmed;
+            }
+            _ => {}
         }
     }
     let state_started = Instant::now();
@@ -579,7 +573,17 @@ fn transcribe_samples(
         .as_mut()
         .expect("Whisper state cache is populated above");
     let sampling_strategy = if options.is_preview() {
-        SamplingStrategy::Greedy { best_of: 1 }
+        // GPU preview is already sub-second. A tiny beam makes the partial
+        // text markedly less jumpy than greedy decoding, while CPU fallbacks
+        // keep greedy to avoid contention with the recording UI.
+        if has_hardware_gpu_backend() {
+            SamplingStrategy::BeamSearch {
+                beam_size: 2,
+                patience: -1.0,
+            }
+        } else {
+            SamplingStrategy::Greedy { best_of: 1 }
+        }
     } else {
         match options.beam_size {
             BeamSize::Auto if has_hardware_gpu_backend() => SamplingStrategy::BeamSearch {

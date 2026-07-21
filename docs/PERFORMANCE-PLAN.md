@@ -194,8 +194,10 @@ Add stage timing so every later change is measured, not guessed.
 
 - Preview ticks take `INFERENCE_LOCK` with `try_lock` and skip the tick when
   busy (final pass never queues behind a preview start).
-- Preview decode params: greedy + shorter window (~8 s instead of 20 s);
-  thread a "quality/cheap" flag through `transcribe_whisper` → `FullParams`.
+- Preview decode params: Beam 2 on a GPU (greedy on CPU fallback) + shorter
+  window (~8 s instead of 20 s), VAD gating, and a consecutive-hypothesis
+  common-prefix display so provisional words do not rewrite stable overlay
+  text.
 - On stop, cancel any in-flight preview: wire the existing
   `preview_generation` bump to a scoped raw whisper-rs abort callback, so the
   final pass waits milliseconds, not a full preview decode.
@@ -280,8 +282,10 @@ Environment notes specific to this machine:
   timing summary to `voxide.log`; the selected GPU is logged as a requested
   backend; and `decode_bench_on_real_wav` is available as an ignored test.
 - 2026-07-21: Phases 2–5 landed for the current Whisper path. Previews use an
-  8-second greedy window, skip while the inference lane is occupied, and abort
-  when stop invalidates their generation. VAD and Whisper state are cached;
+  8-second VAD-gated window, Beam 2 on GPU (greedy on CPU fallback), skip
+  while the inference lane is occupied, and abort when stop invalidates their
+  generation. The overlay only advances words confirmed by consecutive
+  snapshots. VAD and Whisper state are cached;
   CPU fallback uses physical-core decoding; clipboard restoration is detached;
   pactl sources have a short TTL cache and capture devices are prewarmed. The
   Voice Engine screen now exposes Auto/Greedy/Beam 2/Beam 5 and q5/q8
@@ -304,8 +308,9 @@ Environment notes specific to this machine:
   encoder setup, while its errors were silently discarded. Voxide now uses a
   scoped raw callback backed by the preview generation, isolated warm state
   for preview/final passes, and logs emitted, empty, and skipped preview
-  outcomes. The CUDA bench now verifies 1–8 s growing snapshots (241–293 ms)
-  and cancellation of a stale generation.
+  outcomes. Previews are VAD-gated and their display only advances words that
+  recur in consecutive snapshots. The CUDA bench now verifies 1–8 s growing
+  snapshots (228–296 ms) and cancellation of a stale generation.
 - Status: Phases 0–5 complete for the local Whisper engine. Phase 6 remains a
   separate product integration: CUDA Whisper already reaches the raw decode
   target; Parakeet would now be pursued for VAD-segment streaming UX rather
