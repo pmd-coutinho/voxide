@@ -194,51 +194,53 @@ fn normalize_peak(samples: &mut [f32]) {
     }
 }
 
-/// Runs Silero voice-activity detection and keeps only the speech audio,
-/// mirroring `whisper_full`'s own VAD preprocessing — which whisper-rs's
-/// state-based API bypasses entirely. Returns None when VAD is unavailable
-/// (the caller transcribes unfiltered) and an empty buffer when the audio
-/// contains no speech at all.
-fn speech_only_samples(samples: &[f32], vad_model_path: &Path) -> Option<Vec<f32>> {
+/// Voice-activity verdict for a recording: where speech begins and ends, or
+/// None when the audio contains no speech at all.
+enum SpeechBounds {
+    None,
+    Range(usize, usize),
+}
+
+/// Runs Silero voice-activity detection as a gate, not a scalpel: it decides
+/// whether speech exists and where its outer edges are, but the audio Whisper
+/// decodes is never cut apart or re-stitched — mid-utterance surgery costs
+/// transcription accuracy. Detection runs on the (normalized) probe signal;
+/// returns None when VAD itself is unavailable.
+fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBounds> {
     const SAMPLES_PER_CENTISECOND: f32 = audio::WHISPER_SAMPLE_RATE as f32 / 100.0;
+    // Generous margin around the detected speech so edge trimming can never
+    // clip a first or last word.
+    const EDGE_MARGIN_SAMPLES: usize = (audio::WHISPER_SAMPLE_RATE / 2) as usize;
     let model = vad_model_path.to_str()?;
     let mut context_params = WhisperVadContextParams::new();
     context_params.set_use_gpu(false);
     let mut vad = WhisperVadContext::new(model, context_params).ok()?;
-    // whisper.cpp's VAD defaults (100 ms silence splits, 30 ms padding) chop
-    // words at segment boundaries. Match faster-whisper's dictation-friendly
-    // tuning instead: an utterance with normal pauses stays one generously
-    // padded segment, while pure silence still yields none.
+    // whisper.cpp's VAD defaults split on 100 ms of silence; dictation wants
+    // faster-whisper's tuning, where an utterance with natural pauses reads
+    // as one padded stretch of speech.
     let mut vad_params = WhisperVadParams::new();
     vad_params.set_min_silence_duration(2_000);
     vad_params.set_speech_pad(400);
-    let segments = vad.segments_from_samples(vad_params, samples).ok()?;
-    // Match whisper_full's reconstruction: extend every non-final segment by
-    // the overlap window and join segments with 0.1 s of silence.
-    let overlap_samples = (0.1 * audio::WHISPER_SAMPLE_RATE as f32) as usize;
-    let joiner = vec![0.0f32; overlap_samples];
-    let mut speech: Vec<f32> = Vec::new();
-    let segment_count = segments.num_segments();
-    for index in 0..segment_count {
+    let segments = vad.segments_from_samples(vad_params, probe).ok()?;
+    let mut bounds: Option<(usize, usize)> = None;
+    for index in 0..segments.num_segments() {
         let Some(segment) = segments.get_segment(index) else {
             continue;
         };
-        let limit = samples.len().saturating_sub(1);
-        let start = ((segment.start * SAMPLES_PER_CENTISECOND) as usize).min(limit);
-        let mut end = (segment.end * SAMPLES_PER_CENTISECOND) as usize;
-        if index < segment_count - 1 {
-            end += overlap_samples;
-        }
-        let end = end.min(limit);
-        if end <= start {
-            continue;
-        }
-        if !speech.is_empty() {
-            speech.extend_from_slice(&joiner);
-        }
-        speech.extend_from_slice(&samples[start..end]);
+        let start = (segment.start * SAMPLES_PER_CENTISECOND) as usize;
+        let end = (segment.end * SAMPLES_PER_CENTISECOND) as usize;
+        bounds = Some(match bounds {
+            Some((first, last)) => (first.min(start), last.max(end)),
+            None => (start, end),
+        });
     }
-    Some(speech)
+    Some(match bounds {
+        Some((first, last)) => SpeechBounds::Range(
+            first.saturating_sub(EDGE_MARGIN_SAMPLES),
+            last.saturating_add(EDGE_MARGIN_SAMPLES).min(probe.len()),
+        ),
+        None => SpeechBounds::None,
+    })
 }
 
 fn transcribe_samples(
@@ -251,23 +253,27 @@ fn transcribe_samples(
     let _inference = INFERENCE_LOCK
         .lock()
         .map_err(|_| "Whisper inference lock was poisoned".to_string())?;
-    // Quiet microphones (built-in DMIC arrays) record speech at levels that
-    // starve both the voice-activity model and Whisper itself; bring the
-    // peak up before analysis.
-    let mut audio_samples = samples.to_vec();
-    normalize_peak(&mut audio_samples);
-    // Strip non-speech audio before decoding: silence and noise are what
-    // Whisper hallucinates subtitle boilerplate on.
+    // Whisper hallucinates subtitle boilerplate on silence and noise, so a
+    // voice-activity gate decides whether speech exists and where its outer
+    // edges are. Detection runs on a peak-normalized probe copy (quiet
+    // built-in microphones starve the VAD model), but Whisper decodes the
+    // ORIGINAL audio — unamplified and contiguous — trimmed only at the
+    // edges, because that is what transcribes most accurately.
+    let mut edge_trimmed;
+    let mut samples = samples;
     if let Some(vad_model_path) = vad_model_path {
-        if let Some(mut speech) = speech_only_samples(&audio_samples, vad_model_path) {
-            if speech.is_empty() {
-                return Ok(String::new());
+        let mut probe = samples.to_vec();
+        normalize_peak(&mut probe);
+        match detect_speech_bounds(&probe, vad_model_path) {
+            Some(SpeechBounds::None) => return Ok(String::new()),
+            Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
+                edge_trimmed = samples[start.min(samples.len())..end].to_vec();
+                audio::pad_short_transcription_samples(&mut edge_trimmed);
+                samples = &edge_trimmed;
             }
-            audio::pad_short_transcription_samples(&mut speech);
-            audio_samples = speech;
+            _ => {}
         }
     }
-    let samples = &audio_samples[..];
     let mut state = context
         .create_state()
         .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
@@ -397,11 +403,15 @@ mod tests {
             let segment = segments.get_segment(index).unwrap();
             println!("  segment {index}: start={} end={}", segment.start, segment.end);
         }
-        let filtered = super::speech_only_samples(&samples, &vad_path);
-        println!(
-            "filtered samples: {:?}",
-            filtered.as_ref().map(|filtered| filtered.len())
-        );
+        let mut probe = samples.clone();
+        super::normalize_peak(&mut probe);
+        match super::detect_speech_bounds(&probe, &vad_path) {
+            Some(super::SpeechBounds::Range(start, end)) => {
+                println!("speech bounds: {start}..{end} of {}", samples.len());
+            }
+            Some(super::SpeechBounds::None) => println!("speech bounds: none"),
+            None => println!("speech bounds: vad unavailable"),
+        }
         let model = models.join("ggml-small.bin");
         let with_vad =
             super::transcribe_whisper(samples.clone(), &model, Some(&vad_path), "en", &[]);
