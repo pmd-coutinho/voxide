@@ -1,8 +1,16 @@
-# Voxide
+<div align="center">
+  <img src="docs/logo.png" width="108" alt="Voxide — three waveform bars on an iron tile">
+  <h1>Voxide</h1>
+  <p><strong>Press a key, talk, and the text lands wherever you were typing.</strong></p>
+  <p>
+    <img src="https://img.shields.io/badge/license-MIT-2E8C7A?style=flat-square" alt="MIT license">
+    <img src="https://img.shields.io/badge/built%20with-Rust%20%26%20Tauri%202-171411?style=flat-square" alt="Built with Rust and Tauri 2">
+    <img src="https://img.shields.io/badge/whisper-GPU%20%7C%20CPU-C2603C?style=flat-square" alt="Whisper on GPU or CPU">
+    <img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-555?style=flat-square" alt="Linux, macOS, Windows">
+  </p>
+</div>
 
-**Press a key, talk, and the text lands wherever you were typing.**
-
-Voxide is a cross-platform desktop dictation app built with Rust and Tauri. Speech is transcribed locally with Whisper (or the speech engine of your choice), optionally cleaned up by an AI provider you configure, and inserted directly into the active application — on Linux, macOS, and Windows.
+Voxide is a cross-platform desktop dictation app. Speech is transcribed locally with Whisper (or the engine of your choice), optionally cleaned up by an AI provider you configure, and inserted directly into the active application — on Linux, macOS, and Windows.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
@@ -11,15 +19,25 @@ Voxide is a cross-platform desktop dictation app built with Rust and Tauri. Spee
 
 ## Features
 
-- **Local-first transcription** — bundled Whisper engine with downloadable models from Tiny to Large v3; no audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
-- **Global dictation from any app** — press your hotkey, speak, and the result is typed into whatever has focus. Toggle, hold-to-record, and automatic (tap or hold) activation modes; a compact always-on-top overlay shows the live transcription while you speak.
+- **Local-first transcription** — bundled Whisper engine with downloadable models from Tiny to Large v3 Turbo; no audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
+- **Global dictation from any app** — press your hotkey, speak, and the result is typed into whatever has focus, without stealing it. Toggle, hold-to-record, and automatic activation modes; a compact overlay shows the live transcription and microphone level while you speak.
+- **Speech in, speech out — nothing else** — a voice-activity gate rejects silence and noise before decoding, so Whisper's infamous hallucinations ("Thank you for watching!") never reach your text, and noise annotations like `[door slams]` are stripped from what does.
 - **AI enhancement (optional)** — post-process transcriptions with any OpenAI-compatible or Anthropic-style provider. Per-mode providers, reusable prompt profiles, per-profile model routing, and per-application prompt overrides.
 - **Modes beyond dictation** — *Rewrite* transforms selected text in place, *Command* plans shell actions from speech with review-before-execute for destructive commands, and *File Transcription* handles audio/video files in 20-minute chunks.
 - **Custom dictionary** — spoken-phrase corrections, recognition-vocabulary hints for supported engines, and opt-in learning that suggests corrections you make repeatedly.
-- **Dictation formatting** — filler-word removal, explicit spoken punctuation, slash-command and @-mention formatting, smart capitalization, and continuous-dictation spacing.
 - **History, stats, and audio archive** — searchable local transcription history with optional audio recordings under a disk budget, streaks, milestones, and time-saved estimates.
 - **Local API** — an optional loopback-only HTTP API exposes history, dictionary, post-processing, and transcription endpoints for scripting.
 - **Privacy by construction** — everything is stored locally; API keys live in the operating system's secure credential store, never in config files. Diagnostic logs never contain dictation, clipboard, or key content.
+
+## How a dictation flows
+
+```
+hotkey ──► capture mic ──► VAD gate ──► Whisper (GPU/CPU, warm model) ──► filters ──► typed into your app
+                              │
+                              └── no speech? nothing is typed, ever
+```
+
+The Whisper model stays loaded between dictations, voice-activity detection runs on a normalized probe while the decoder always sees your original audio, and beam-search decoding plus no-speech filtering keep the output faithful to what you actually said.
 
 ## Building from source
 
@@ -41,7 +59,7 @@ npm exec tauri build -- --no-bundle   # standalone release binary
 
 `npm run build` builds and type-checks the frontend only; `cargo test` (in `src-tauri/`) runs the backend test suite. Neither validates audio or desktop integration — launch the app natively for that.
 
-### GPU transcription (optional)
+### GPU transcription (optional, recommended)
 
 Local Whisper transcription runs on the CPU by default. whisper.cpp's GPU backends are exposed as cargo features:
 
@@ -51,6 +69,8 @@ Local Whisper transcription runs on the CPU by default. whisper.cpp's GPU backen
 ```sh
 npm exec tauri build -- --no-bundle --features vulkan
 ```
+
+On hybrid laptops Voxide automatically prefers the discrete GPU over the integrated one; set `VOXIDE_GPU_DEVICE=<n>` to override the choice.
 
 ## Global shortcuts on Wayland
 
