@@ -5276,10 +5276,11 @@ fn start_native_dictation(
 
 /// Produces a deliberately conservative live transcript. Whisper previews are
 /// independent decodes of a growing, then rolling, audio window. The tail is
-/// therefore provisional, but a word that has survived an overlap between two
+/// therefore provisional. A word that has survived an overlap between two
 /// windows is old enough to make the overlay monotonic: it is never rewritten
-/// by a later, noisier snapshot. The actual final decode still replaces the
-/// overlay when recording stops.
+/// by a later, noisier snapshot. Before an overlap exists, show the current
+/// provisional hypothesis rather than leaving the overlay blank. The actual
+/// final decode still replaces the overlay when recording stops.
 #[derive(Default)]
 struct WhisperPreviewStability {
     /// The best chronological sequence assembled from preview windows. Its
@@ -5301,7 +5302,7 @@ impl WhisperPreviewStability {
         }
         if self.timeline_words.is_empty() {
             self.timeline_words = current_words;
-            return None;
+            return self.provisional_text();
         }
 
         // The window initially grows from the same start, then rolls forward
@@ -5328,7 +5329,7 @@ impl WhisperPreviewStability {
         // is still useful before anything has been confirmed: it lets an early
         // correction replace only the provisional tail.
         if overlap == 0 || (overlap == 1 && start != 0) {
-            return self.confirmed_text();
+            return self.replace_unconfirmed_timeline(current_words);
         }
         let matched_end = start + overlap;
 
@@ -5344,11 +5345,27 @@ impl WhisperPreviewStability {
         self.timeline_words
             .extend(current_words.into_iter().skip(overlap));
         self.confirmed_words = self.confirmed_words.max(matched_end);
-        self.confirmed_text()
+        self.confirmed_text().or_else(|| self.provisional_text())
     }
 
     fn confirmed_text(&self) -> Option<String> {
         (self.confirmed_words != 0).then(|| self.timeline_words[..self.confirmed_words].join(" "))
+    }
+
+    /// If Whisper's first few snapshots have no usable word overlap, they
+    /// cannot be safely committed. They are still useful live feedback, so
+    /// keep the overlay alive with the newest provisional hypothesis. Once a
+    /// prefix is confirmed, this path deliberately stops replacing text.
+    fn replace_unconfirmed_timeline(&mut self, current_words: Vec<String>) -> Option<String> {
+        if self.confirmed_words != 0 {
+            return self.confirmed_text();
+        }
+        self.timeline_words = current_words;
+        self.provisional_text()
+    }
+
+    fn provisional_text(&self) -> Option<String> {
+        (!self.timeline_words.is_empty()).then(|| self.timeline_words.join(" "))
     }
 }
 
@@ -8342,7 +8359,7 @@ mod tests {
     #[test]
     fn live_preview_only_commits_words_that_repeat() {
         let mut preview = WhisperPreviewStability::default();
-        assert_eq!(preview.observe("hello world"), None);
+        assert_eq!(preview.observe("hello world"), Some("hello world".into()));
         assert_eq!(preview.observe("hello word"), Some("hello".into()));
         assert_eq!(
             preview.observe("hello word again"),
@@ -8357,7 +8374,10 @@ mod tests {
     #[test]
     fn live_preview_keeps_confirmed_text_when_the_audio_window_moves() {
         let mut preview = WhisperPreviewStability::default();
-        assert_eq!(preview.observe("one two three"), None);
+        assert_eq!(
+            preview.observe("one two three"),
+            Some("one two three".into())
+        );
         assert_eq!(
             preview.observe("one two three four"),
             Some("one two three".into())
@@ -8375,7 +8395,10 @@ mod tests {
     #[test]
     fn live_preview_never_rewrites_a_confirmed_word() {
         let mut preview = WhisperPreviewStability::default();
-        assert_eq!(preview.observe("hello world again"), None);
+        assert_eq!(
+            preview.observe("hello world again"),
+            Some("hello world again".into())
+        );
         assert_eq!(
             preview.observe("hello world again today"),
             Some("hello world again".into())
@@ -8390,5 +8413,13 @@ mod tests {
             preview.observe("hello world again today tomorrow"),
             Some("hello world again today".into())
         );
+    }
+
+    #[test]
+    fn live_preview_stays_visible_when_early_snapshots_do_not_align() {
+        let mut preview = WhisperPreviewStability::default();
+        assert_eq!(preview.observe("first guess"), Some("first guess".into()));
+        assert_eq!(preview.observe("second guess"), Some("second guess".into()));
+        assert_eq!(preview.observe("third guess"), Some("third guess".into()));
     }
 }

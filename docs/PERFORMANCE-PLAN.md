@@ -197,7 +197,8 @@ Add stage timing so every later change is measured, not guessed.
 - Preview decode params: Beam 2 on a GPU (greedy on CPU fallback) + shorter
   window (~8 s instead of 20 s), VAD gating, and an aligned rolling-window
   timeline. Only words repeated by an overlapping snapshot are committed, and
-  committed overlay text never rewrites.
+  committed overlay text never rewrites; before that confirmation, the latest
+  provisional hypothesis remains visible rather than leaving the overlay blank.
 - On stop, cancel any in-flight preview: wire the existing
   `preview_generation` bump to a scoped raw whisper-rs abort callback, so the
   final pass waits milliseconds, not a full preview decode.
@@ -309,8 +310,9 @@ Environment notes specific to this machine:
   scoped raw callback backed by the preview generation, isolated warm state
   for preview/final passes, and logs emitted, empty, and skipped preview
   outcomes. Previews are VAD-gated and their display only advances words that
-  recur in aligned consecutive snapshots; once shown, an overlapping rolling
-  window cannot rewrite that text. The CUDA bench now verifies 1–8 s growing
+  recur in aligned consecutive snapshots; once committed, an overlapping
+  rolling window cannot rewrite that text. Unaligned early hypotheses stay
+  visible as provisional feedback. The CUDA bench now verifies 1–8 s growing
   snapshots (228–296 ms) and cancellation of a stale generation.
 - Status: Phases 0–5 complete for the local Whisper engine. Phase 6 remains a
   separate product integration: CUDA Whisper already reaches the raw decode
