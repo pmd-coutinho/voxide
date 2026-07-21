@@ -1,16 +1,22 @@
 use std::{
-    ffi::CStr,
+    collections::HashSet,
+    ffi::{c_void, CStr},
     os::raw::c_int,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::Instant,
 };
 
+use serde::{Deserialize, Serialize};
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
-    WhisperVadContextParams, WhisperVadParams,
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+    WhisperVadContext, WhisperVadContextParams, WhisperVadParams,
 };
 
-use crate::{audio, media};
+use crate::{audio, debug_log, media};
 
 pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
 
@@ -19,16 +25,130 @@ pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
 /// otherwise be paid at the start of every dictation.
 static CONTEXT_CACHE: OnceLock<Mutex<Option<(PathBuf, Arc<WhisperContext>)>>> = OnceLock::new();
 
+/// A state owns Whisper's reusable compute buffers. Previews deliberately
+/// keep their own state: an aborted preview must never leave the final decode
+/// reusing partial decoder state. Inference remains serialized below because
+/// the two states still share one Whisper context/GPU backend.
+static FINAL_STATE_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperState)>>> = OnceLock::new();
+static PREVIEW_STATE_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperState)>>> = OnceLock::new();
+
+/// Silero's model is small but loading it for every utterance is still
+/// needless startup work on the stop-to-text path.
+static VAD_CONTEXT_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperVadContext)>>> = OnceLock::new();
+
 /// Serializes inference: the live preview and the final transcription share
 /// the warm context, and concurrent runs on one context corrupt each other
 /// on GPU backends. The final pass simply waits out an in-flight preview.
 static INFERENCE_LOCK: Mutex<()> = Mutex::new(());
+
+/// A final transcription gets priority over previews. A preview only ever
+/// takes the inference lock when no final pass is waiting, preventing a new
+/// preview tick from extending stop-to-text latency.
+static FINAL_INFERENCE_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the final/preview priority decision atomic with acquiring the
+/// inference mutex. It is held only long enough to admit work, never during
+/// VAD or decoding.
+static INFERENCE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BeamSize {
+    /// Beam 5 on an available hardware GPU; greedy on a CPU fallback.
+    #[default]
+    Auto,
+    Greedy,
+    Beam2,
+    Beam5,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranscriptionTimings {
+    pub lock_wait_ms: u64,
+    pub vad_ms: u64,
+    pub state_ms: u64,
+    pub decode_ms: u64,
+}
+
+#[derive(Debug)]
+pub struct WhisperTranscription {
+    pub text: String,
+    pub timings: TranscriptionTimings,
+}
+
+/// Selects final-quality or cheap, cancellable preview decoding. The preview
+/// generation is owned by the capture state; incrementing it makes any
+/// in-flight preview return from whisper.cpp at its next abort check.
+#[derive(Clone)]
+pub struct TranscriptionOptions {
+    beam_size: BeamSize,
+    preview_generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl TranscriptionOptions {
+    pub fn final_decode(beam_size: BeamSize) -> Self {
+        Self {
+            beam_size,
+            preview_generation: None,
+        }
+    }
+
+    pub fn preview(generation: Arc<AtomicU64>, expected_generation: u64) -> Self {
+        Self {
+            beam_size: BeamSize::Greedy,
+            preview_generation: Some((generation, expected_generation)),
+        }
+    }
+
+    fn is_preview(&self) -> bool {
+        self.preview_generation.is_some()
+    }
+}
+
+/// Storage passed to whisper.cpp while a preview decode is running. It lives
+/// on the Rust stack for the whole synchronous `state.full` call below, so the
+/// C callback never observes dangling state.
+struct PreviewAbortCallback {
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
+}
+
+unsafe extern "C" fn should_abort_preview(user_data: *mut c_void) -> bool {
+    // The callback is installed only with a pointer to PreviewAbortCallback
+    // whose owner remains alive until `state.full` has returned.
+    let callback = unsafe { &*(user_data as *const PreviewAbortCallback) };
+    callback.generation.load(Ordering::SeqCst) != callback.expected_generation
+}
 
 /// Loads the model into the warm cache ahead of the first dictation.
 pub fn preload_whisper(model_path: &Path) -> Result<(), String> {
     load_context(model_path).map(|_| ())
 }
 
+/// Preloads the VAD model after it has been downloaded at application startup.
+pub fn preload_vad(vad_model_path: &Path) -> Result<(), String> {
+    let model = vad_model_path
+        .to_str()
+        .ok_or_else(|| "The VAD model path is not valid Unicode".to_string())?;
+    let cache = VAD_CONTEXT_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "Whisper VAD cache lock was poisoned".to_string())?;
+    if cached
+        .as_ref()
+        .is_some_and(|(path, _)| path == vad_model_path)
+    {
+        return Ok(());
+    }
+    let mut params = WhisperVadContextParams::new();
+    params.set_use_gpu(false);
+    let vad = WhisperVadContext::new(model, params)
+        .map_err(|error| format!("Could not load Whisper VAD: {error}"))?;
+    *cached = Some((vad_model_path.to_path_buf(), vad));
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn transcribe_whisper(
     samples: Vec<f32>,
     model_path: &Path,
@@ -36,6 +156,25 @@ pub fn transcribe_whisper(
     language: &str,
     custom_words: &[String],
 ) -> Result<String, String> {
+    transcribe_whisper_with_options(
+        samples,
+        model_path,
+        vad_model_path,
+        language,
+        custom_words,
+        TranscriptionOptions::final_decode(BeamSize::Auto),
+    )
+    .map(|result| result.text)
+}
+
+pub fn transcribe_whisper_with_options(
+    samples: Vec<f32>,
+    model_path: &Path,
+    vad_model_path: Option<&Path>,
+    language: &str,
+    custom_words: &[String],
+    options: TranscriptionOptions,
+) -> Result<WhisperTranscription, String> {
     if !model_path.is_file() {
         return Err(format!(
             "Whisper model is not installed: {}",
@@ -50,11 +189,19 @@ pub fn transcribe_whisper(
     }
 
     let context = load_context(model_path)?;
-    let text = transcribe_samples(&context, &samples, vad_model_path, language, custom_words)?;
-    if text.is_empty() {
+    let result = transcribe_samples(
+        model_path,
+        &context,
+        &samples,
+        vad_model_path,
+        language,
+        custom_words,
+        &options,
+    )?;
+    if result.text.is_empty() {
         return Err("The voice engine did not recognize any speech".into());
     }
-    Ok(text)
+    Ok(result)
 }
 
 pub fn transcribe_media_file(
@@ -63,6 +210,7 @@ pub fn transcribe_media_file(
     vad_model_path: Option<&Path>,
     language: &str,
     custom_words: &[String],
+    beam_size: BeamSize,
     progress: Option<ProgressCallback>,
 ) -> Result<(String, u64), String> {
     let duration_ms = media::file_duration_ms(path)?;
@@ -88,10 +236,17 @@ pub fn transcribe_media_file(
             }
             continue;
         }
-        let result =
-            transcribe_samples(&context, &samples, vad_model_path, language, custom_words)?;
-        if !result.is_empty() {
-            text.push(result);
+        let result = transcribe_samples(
+            model_path,
+            &context,
+            &samples,
+            vad_model_path,
+            language,
+            custom_words,
+            &TranscriptionOptions::final_decode(beam_size),
+        )?;
+        if !result.text.is_empty() {
+            text.push(result.text);
         }
         if let Some(progress) = &progress {
             progress(chunk + 1, total_chunks);
@@ -119,25 +274,24 @@ fn preferred_gpu_device() -> Option<c_int> {
         for device_index in 0..whisper_rs_sys::ggml_backend_dev_count() {
             let device = whisper_rs_sys::ggml_backend_dev_get(device_index);
             let device_type = whisper_rs_sys::ggml_backend_dev_type(device);
-            let discrete = device_type
-                == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU;
-            let integrated = device_type
-                == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU;
+            let discrete =
+                device_type == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU;
+            let integrated =
+                device_type == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU;
             if !discrete && !integrated {
                 continue;
             }
             let description = CStr::from_ptr(whisper_rs_sys::ggml_backend_dev_description(device))
                 .to_string_lossy()
                 .to_lowercase();
-            let software =
-                description.contains("llvmpipe") || description.contains("swiftshader");
-            let score = if software {
-                -1
-            } else if discrete {
-                2
-            } else {
-                1
-            };
+            let software = description.contains("llvmpipe") || description.contains("swiftshader");
+            // A software rasterizer is slower than the CPU fallback and must
+            // not accidentally win just because it is the only "GPU" entry.
+            if software {
+                gpu_index += 1;
+                continue;
+            }
+            let score = if discrete { 2 } else { 1 };
             if best.map_or(true, |(best_score, _)| score > best_score) {
                 best = Some((score, gpu_index));
             }
@@ -145,6 +299,74 @@ fn preferred_gpu_device() -> Option<c_int> {
         }
     }
     best.map(|(_, index)| index)
+}
+
+fn selected_gpu_description(selected: Option<c_int>) -> String {
+    let Some(selected) = selected else {
+        return "none (CPU fallback if no backend becomes available)".into();
+    };
+    let mut gpu_index: c_int = 0;
+    unsafe {
+        for device_index in 0..whisper_rs_sys::ggml_backend_dev_count() {
+            let device = whisper_rs_sys::ggml_backend_dev_get(device_index);
+            let device_type = whisper_rs_sys::ggml_backend_dev_type(device);
+            let is_gpu = matches!(
+                device_type,
+                whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                    | whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            );
+            if !is_gpu {
+                continue;
+            }
+            if gpu_index == selected {
+                let description =
+                    CStr::from_ptr(whisper_rs_sys::ggml_backend_dev_description(device))
+                        .to_string_lossy();
+                return format!("{description} (index {selected})");
+            }
+            gpu_index += 1;
+        }
+    }
+    format!("index {selected}")
+}
+
+fn has_hardware_gpu_backend() -> bool {
+    preferred_gpu_device().is_some()
+}
+
+fn physical_cpu_count() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cores = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("cpu")
+                    || name.len() <= 3
+                    || !name[3..].bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    continue;
+                }
+                let topology = entry.path().join("topology");
+                let package = std::fs::read_to_string(topology.join("physical_package_id"));
+                let core = std::fs::read_to_string(topology.join("core_id"));
+                if let (Ok(package), Ok(core)) = (package, core) {
+                    cores.insert((package.trim().to_owned(), core.trim().to_owned()));
+                }
+            }
+        }
+        if !cores.is_empty() {
+            return cores.len();
+        }
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+fn cpu_decode_threads() -> c_int {
+    physical_cpu_count().clamp(1, c_int::MAX as usize) as c_int
 }
 
 fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
@@ -169,9 +391,14 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     // features, which the vulkan build bypasses (see Cargo.toml).
     let mut parameters = WhisperContextParameters::default();
     parameters.use_gpu(true);
-    if let Some(device) = preferred_gpu_device() {
+    let selected_gpu = preferred_gpu_device();
+    if let Some(device) = selected_gpu {
         parameters.gpu_device(device);
     }
+    debug_log::append(&format!(
+        "Whisper context loading (gpu_requested: true, selected_gpu: {})",
+        selected_gpu_description(selected_gpu)
+    ));
     let context = Arc::new(
         WhisperContext::new_with_params(model_path, parameters)
             .map_err(|error| format!("Could not load Whisper model: {error}"))?,
@@ -218,10 +445,10 @@ fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBo
     // Generous margin around the detected speech so edge trimming can never
     // clip a first or last word.
     const EDGE_MARGIN_SAMPLES: usize = (audio::WHISPER_SAMPLE_RATE / 2) as usize;
-    let model = vad_model_path.to_str()?;
-    let mut context_params = WhisperVadContextParams::new();
-    context_params.set_use_gpu(false);
-    let mut vad = WhisperVadContext::new(model, context_params).ok()?;
+    preload_vad(vad_model_path).ok()?;
+    let cache = VAD_CONTEXT_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().ok()?;
+    let (_, vad) = cached.as_mut().filter(|(path, _)| path == vad_model_path)?;
     // whisper.cpp's VAD defaults split on 100 ms of silence; dictation wants
     // faster-whisper's tuning, where an utterance with natural pauses reads
     // as one padded stretch of speech. As a pure gate the params are biased
@@ -255,45 +482,122 @@ fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBo
 }
 
 fn transcribe_samples(
+    model_path: &Path,
     context: &WhisperContext,
     samples: &[f32],
     vad_model_path: Option<&Path>,
     language: &str,
     custom_words: &[String],
-) -> Result<String, String> {
-    let _inference = INFERENCE_LOCK
-        .lock()
-        .map_err(|_| "Whisper inference lock was poisoned".to_string())?;
-    // Whisper hallucinates subtitle boilerplate on silence and noise, so a
-    // voice-activity gate decides whether speech exists and where its outer
-    // edges are. Detection runs on a peak-normalized probe copy (quiet
-    // built-in microphones starve the VAD model), but Whisper decodes the
-    // ORIGINAL audio — unamplified and contiguous — trimmed only at the
-    // edges, because that is what transcribes most accurately.
+    options: &TranscriptionOptions,
+) -> Result<WhisperTranscription, String> {
+    let lock_started = Instant::now();
+    let _inference = if options.is_preview() {
+        let _admission = INFERENCE_ADMISSION_LOCK
+            .lock()
+            .map_err(|_| "Whisper inference admission lock was poisoned".to_string())?;
+        if FINAL_INFERENCE_PENDING.load(Ordering::SeqCst) != 0 {
+            return Err("Whisper preview skipped: final transcription is pending".into());
+        }
+        INFERENCE_LOCK.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                "Whisper preview skipped: inference is busy".to_string()
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                "Whisper inference lock was poisoned".to_string()
+            }
+        })?
+    } else {
+        let _admission = INFERENCE_ADMISSION_LOCK
+            .lock()
+            .map_err(|_| "Whisper inference admission lock was poisoned".to_string())?;
+        FINAL_INFERENCE_PENDING.fetch_add(1, Ordering::SeqCst);
+        drop(_admission);
+        let guard = INFERENCE_LOCK
+            .lock()
+            .map_err(|_| "Whisper inference lock was poisoned".to_string());
+        FINAL_INFERENCE_PENDING.fetch_sub(1, Ordering::SeqCst);
+        guard?
+    };
+    let mut timings = TranscriptionTimings {
+        lock_wait_ms: lock_started.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
+    // VAD is a quality gate for the completed recording. It is intentionally
+    // not applied to a live snapshot: while someone is still talking, the
+    // VAD's conservative silence rules can reject the only partial segment
+    // and leave the overlay permanently at "Listening…". Whisper's own
+    // no-speech threshold remains enabled below for preview snapshots.
+    //
+    // Final audio is handled as before: VAD decides whether speech exists and
+    // where its outer edges are. Detection runs on a peak-normalized probe
+    // copy, while Whisper decodes the original contiguous audio.
     let mut edge_trimmed;
     let mut samples = samples;
-    if let Some(vad_model_path) = vad_model_path {
-        let mut probe = samples.to_vec();
-        normalize_peak(&mut probe);
-        match detect_speech_bounds(&probe, vad_model_path) {
-            Some(SpeechBounds::None) => return Ok(String::new()),
-            Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
-                edge_trimmed = samples[start.min(samples.len())..end].to_vec();
-                audio::pad_short_transcription_samples(&mut edge_trimmed);
-                samples = &edge_trimmed;
+    if !options.is_preview() {
+        if let Some(vad_model_path) = vad_model_path {
+            let vad_started = Instant::now();
+            let mut probe = samples.to_vec();
+            normalize_peak(&mut probe);
+            let bounds = detect_speech_bounds(&probe, vad_model_path);
+            timings.vad_ms = vad_started.elapsed().as_millis() as u64;
+            match bounds {
+                Some(SpeechBounds::None) => {
+                    return Ok(WhisperTranscription {
+                        text: String::new(),
+                        timings,
+                    });
+                }
+                Some(SpeechBounds::Range(start, end)) if start > 0 || end < samples.len() => {
+                    edge_trimmed = samples[start.min(samples.len())..end].to_vec();
+                    audio::pad_short_transcription_samples(&mut edge_trimmed);
+                    samples = &edge_trimmed;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    let mut state = context
-        .create_state()
-        .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
-    // Beam search decodes noisy audio markedly better than greedy sampling
-    // and is what comparable dictation setups use.
-    let mut parameters = FullParams::new(SamplingStrategy::BeamSearch {
-        beam_size: 5,
-        patience: -1.0,
-    });
+    let state_started = Instant::now();
+    let state_cache = if options.is_preview() {
+        PREVIEW_STATE_CACHE.get_or_init(|| Mutex::new(None))
+    } else {
+        FINAL_STATE_CACHE.get_or_init(|| Mutex::new(None))
+    };
+    let mut cached_state = state_cache
+        .lock()
+        .map_err(|_| "Whisper state cache lock was poisoned".to_string())?;
+    if !cached_state
+        .as_ref()
+        .is_some_and(|(path, _)| path == model_path)
+    {
+        let state = context
+            .create_state()
+            .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
+        *cached_state = Some((model_path.to_path_buf(), state));
+    }
+    timings.state_ms = state_started.elapsed().as_millis() as u64;
+    let (_, state) = cached_state
+        .as_mut()
+        .expect("Whisper state cache is populated above");
+    let sampling_strategy = if options.is_preview() {
+        SamplingStrategy::Greedy { best_of: 1 }
+    } else {
+        match options.beam_size {
+            BeamSize::Auto if has_hardware_gpu_backend() => SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            },
+            BeamSize::Auto | BeamSize::Greedy => SamplingStrategy::Greedy { best_of: 1 },
+            BeamSize::Beam2 => SamplingStrategy::BeamSearch {
+                beam_size: 2,
+                patience: -1.0,
+            },
+            BeamSize::Beam5 => SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            },
+        }
+    };
+    let mut parameters = FullParams::new(sampling_strategy);
     let language = language.trim();
     parameters.set_language((!language.is_empty()).then_some(language));
     parameters.set_print_special(false);
@@ -303,6 +607,28 @@ fn transcribe_samples(
     // Dictation wants speech only — no "[sound of plastic crinkling]" tags.
     parameters.set_suppress_nst(true);
     parameters.set_no_speech_thold(NO_SPEECH_PROBABILITY_LIMIT);
+    if !has_hardware_gpu_backend() {
+        parameters.set_n_threads(cpu_decode_threads());
+    }
+    let preview_abort =
+        options
+            .preview_generation
+            .as_ref()
+            .map(|(generation, expected_generation)| PreviewAbortCallback {
+                generation: Arc::clone(generation),
+                expected_generation: *expected_generation,
+            });
+    if let Some(callback) = preview_abort.as_ref() {
+        // whisper-rs 0.16's convenience abort-callback wrapper does not keep
+        // a correctly typed allocation for this callback. Use the raw API
+        // with explicitly owned, scoped storage instead.
+        unsafe {
+            parameters.set_abort_callback(Some(should_abort_preview));
+            parameters.set_abort_callback_user_data(
+                (callback as *const PreviewAbortCallback).cast_mut().cast(),
+            );
+        }
+    }
     let vocabulary = custom_words
         .iter()
         .map(|word| word.trim())
@@ -313,9 +639,11 @@ fn transcribe_samples(
     if !vocabulary.is_empty() {
         parameters.set_initial_prompt(&format!("Recognition vocabulary: {vocabulary}"));
     }
+    let decode_started = Instant::now();
     state
         .full(parameters, samples)
         .map_err(|error| format!("Whisper could not transcribe the recording: {error}"))?;
+    timings.decode_ms = decode_started.elapsed().as_millis() as u64;
 
     let text = state
         .as_iter()
@@ -323,7 +651,7 @@ fn transcribe_samples(
         .filter_map(|segment| clean_transcription_segment(&segment.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(text)
+    Ok(WhisperTranscription { text, timings })
 }
 
 /// Segments whose no-speech probability reaches this limit are silence
@@ -370,7 +698,10 @@ fn clean_transcription_segment(segment: &str) -> Option<String> {
         .trim()
         .trim_start_matches("- ")
         .trim_start_matches('♪');
-    let cleaned = without_dash.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = without_dash
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
@@ -396,11 +727,16 @@ mod tests {
                 .samples::<i16>()
                 .map(|sample| sample.unwrap() as f32 / i16::MAX as f32)
                 .collect(),
-            hound::SampleFormat::Float => {
-                reader.samples::<f32>().map(|sample| sample.unwrap()).collect()
-            }
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|sample| sample.unwrap())
+                .collect(),
         };
-        println!("samples: {} ({:.2}s)", samples.len(), samples.len() as f32 / 16_000.0);
+        println!(
+            "samples: {} ({:.2}s)",
+            samples.len(),
+            samples.len() as f32 / 16_000.0
+        );
         let vad_path = models.join("ggml-silero-v5.1.2.bin");
         let mut context_params = WhisperVadContextParams::new();
         context_params.set_use_gpu(false);
@@ -412,7 +748,10 @@ mod tests {
         println!("vad segments: {}", segments.num_segments());
         for index in 0..segments.num_segments() {
             let segment = segments.get_segment(index).unwrap();
-            println!("  segment {index}: start={} end={}", segment.start, segment.end);
+            println!(
+                "  segment {index}: start={} end={}",
+                segment.start, segment.end
+            );
         }
         let mut probe = samples.clone();
         super::normalize_peak(&mut probe);
@@ -429,6 +768,104 @@ mod tests {
         let without_vad = super::transcribe_whisper(samples, &model, None, "en", &[]);
         println!("with vad: {with_vad:?}");
         println!("without vad: {without_vad:?}");
+    }
+
+    /// Measures the actual local decode path without the desktop capture or
+    /// insertion stages. Run a 16 kHz mono WAV through CPU/Vulkan/CUDA builds:
+    ///   VOXIDE_TEST_WAV=... cargo test --release decode_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn decode_bench_on_real_wav() {
+        let wav = std::env::var("VOXIDE_TEST_WAV").expect("set VOXIDE_TEST_WAV");
+        let home = std::env::var("HOME").expect("HOME is set");
+        let models = std::path::PathBuf::from(home).join(".local/share/voxide/models");
+        let model = std::env::var_os("VOXIDE_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| models.join("ggml-large-v3-turbo.bin"));
+        let vad = models.join("ggml-silero-v5.1.2.bin");
+        assert!(model.is_file(), "whisper model missing: {model:?}");
+        assert!(vad.is_file(), "VAD model missing: {vad:?}");
+
+        let mut reader = hound::WavReader::open(&wav).expect("wav opens");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000, "decode bench expects 16 kHz WAV");
+        assert_eq!(spec.channels, 1, "decode bench expects mono WAV");
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("valid WAV sample") as f32 / i16::MAX as f32)
+                .collect(),
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|sample| sample.expect("valid WAV sample"))
+                .collect(),
+        };
+        let result = super::transcribe_whisper_with_options(
+            samples.clone(),
+            &model,
+            Some(&vad),
+            "en",
+            &[],
+            super::TranscriptionOptions::final_decode(super::BeamSize::Auto),
+        )
+        .expect("decode succeeds");
+        println!(
+            "decode_bench (lock_wait_ms: {}, vad_ms: {}, state_ms: {}, decode_ms: {}, text_chars: {})",
+            result.timings.lock_wait_ms,
+            result.timings.vad_ms,
+            result.timings.state_ms,
+            result.timings.decode_ms,
+            result.text.chars().count(),
+        );
+
+        // Exercise the exact live-preview options over a growing recording.
+        // This catches regressions where a warm preview state, cancellation,
+        // or partial-audio handling silently leaves the overlay at
+        // "Listening…" while final transcription still succeeds.
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut preview_emissions = 0;
+        for seconds in 1..=(samples.len() / crate::audio::WHISPER_SAMPLE_RATE as usize) {
+            let end = (seconds * crate::audio::WHISPER_SAMPLE_RATE as usize).min(samples.len());
+            let preview = super::transcribe_whisper_with_options(
+                samples[..end].to_vec(),
+                &model,
+                Some(&vad),
+                "en",
+                &[],
+                super::TranscriptionOptions::preview(std::sync::Arc::clone(&generation), 1),
+            );
+            match preview {
+                Ok(preview) => {
+                    if !preview.text.trim().is_empty() {
+                        preview_emissions += 1;
+                    }
+                    println!(
+                        "preview_bench (audio_s: {seconds}, decode_ms: {}, text_chars: {})",
+                        preview.timings.decode_ms,
+                        preview.text.chars().count(),
+                    );
+                }
+                Err(error) => println!("preview_bench (audio_s: {seconds}, error: {error})"),
+            }
+        }
+        assert!(
+            preview_emissions > 0,
+            "no live-preview snapshot produced text"
+        );
+
+        generation.store(2, std::sync::atomic::Ordering::SeqCst);
+        let cancelled = super::transcribe_whisper_with_options(
+            samples[..crate::audio::WHISPER_SAMPLE_RATE as usize].to_vec(),
+            &model,
+            Some(&vad),
+            "en",
+            &[],
+            super::TranscriptionOptions::preview(std::sync::Arc::clone(&generation), 1),
+        );
+        assert!(
+            cancelled.is_err(),
+            "a stale preview generation must abort before decoding"
+        );
     }
 
     /// Reproduces the silence-hallucination report ("Thanks for watching!")
@@ -457,8 +894,7 @@ mod tests {
                 random() * if burst { 0.06 } else { 0.008 }
             })
             .collect();
-        let with_vad =
-            super::transcribe_whisper(samples.clone(), &model, Some(&vad), "en", &[]);
+        let with_vad = super::transcribe_whisper(samples.clone(), &model, Some(&vad), "en", &[]);
         let without_vad = super::transcribe_whisper(samples, &model, None, "en", &[]);
         println!("with vad: {with_vad:?}");
         println!("without vad: {without_vad:?}");

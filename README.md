@@ -64,10 +64,26 @@ npm exec tauri build -- --no-bundle   # standalone release binary
 Local Whisper transcription runs on the CPU by default. whisper.cpp's GPU backends are exposed as cargo features:
 
 - **`vulkan`** — any GPU vendor. Build-time deps (Fedora names): `vulkan-headers`, `vulkan-loader-devel`, `glslc`.
-- **`cuda`** — NVIDIA only, needs the CUDA toolkit at build time.
+- **`cuda`** — NVIDIA only, needs the CUDA toolkit at build time. A
+  user-local toolkit works; no system-wide CUDA installation is required.
 
 ```sh
 npm exec tauri build -- --no-bundle --features vulkan
+```
+
+For CUDA, point the build at your toolkit. The resulting Linux binary embeds
+the toolkit's library directory as its runtime search path, so it can also be
+launched from a desktop/compositor keybinding without setting
+`LD_LIBRARY_PATH` again:
+
+```sh
+export CUDA_HOME="$HOME/.local/share/voxide-cuda/toolkit"
+export CUDA_PATH="$CUDA_HOME"
+export CUDAToolkit_ROOT="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+export CMAKE_CUDA_ARCHITECTURES=89 # RTX 40-series laptop GPU; choose yours
+export CMAKE_CUDA_FLAGS=--allow-unsupported-compiler # needed by CUDA 13 + GCC 16
+npm exec tauri build -- --no-bundle --features cuda
 ```
 
 On hybrid laptops Voxide automatically prefers the discrete GPU over the integrated one; set `VOXIDE_GPU_DEVICE=<n>` to override the choice.

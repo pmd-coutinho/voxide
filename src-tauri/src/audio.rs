@@ -219,20 +219,59 @@ pub fn input_device_names() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Performs the one-time device and sound-server discovery during startup so
+/// the first record action only needs to configure and start its stream.
+pub fn prewarm_input_devices() -> Result<usize, String> {
+    input_device_names().map(|devices| devices.len())
+}
+
 /// Friendly microphone selection on Linux sound servers (PipeWire or
 /// PulseAudio) via `pactl`. Capture still runs through the ALSA "default"
 /// device; its pipewire/pulse plugin routes to the requested source through
 /// the PIPEWIRE_NODE / PULSE_SOURCE environment variables.
 #[cfg(target_os = "linux")]
 mod pulse {
-    use std::process::Command;
+    use std::{
+        process::Command,
+        sync::{Mutex, OnceLock},
+        time::{Duration, Instant},
+    };
 
+    const SOURCE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+    struct SourceCache {
+        refreshed_at: Instant,
+        sources: Option<Vec<Source>>,
+    }
+
+    static SOURCE_CACHE: OnceLock<Mutex<Option<SourceCache>>> = OnceLock::new();
+
+    #[derive(Clone)]
     pub struct Source {
         pub name: String,
         pub description: String,
     }
 
     pub fn sources() -> Option<Vec<Source>> {
+        let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(cached) = cache.lock() {
+            if let Some(cached) = cached.as_ref() {
+                if cached.refreshed_at.elapsed() < SOURCE_CACHE_TTL {
+                    return cached.sources.clone();
+                }
+            }
+        }
+        let sources = sources_uncached();
+        if let Ok(mut cached) = cache.lock() {
+            *cached = Some(SourceCache {
+                refreshed_at: Instant::now(),
+                sources: sources.clone(),
+            });
+        }
+        sources
+    }
+
+    fn sources_uncached() -> Option<Vec<Source>> {
         let output = Command::new("pactl")
             .args(["--format=json", "list", "sources"])
             .output()
@@ -274,10 +313,11 @@ mod pulse {
             clear_routing();
             return requested.map(str::to_string);
         };
-        let selected =
-            requested.and_then(|requested| {
-                sources.iter().find(|source| source.description == requested)
-            });
+        let selected = requested.and_then(|requested| {
+            sources
+                .iter()
+                .find(|source| source.description == requested)
+        });
         match selected {
             Some(source) => {
                 // The pipewire ALSA plugin honors PIPEWIRE_NODE and the pulse

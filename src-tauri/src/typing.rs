@@ -88,10 +88,17 @@ fn paste_text_into_active_application(text: &str) -> Result<(), String> {
         .set_text(text)
         .map_err(|error| format!("Could not prepare clipboard paste text: {error}"))?;
     let pasted = send_paste_shortcut();
-    thread::sleep(Duration::from_millis(100));
-    let restored = restore_clipboard_snapshot(&mut clipboard, previous_contents);
+    // The target application needs a brief window to read the temporary
+    // clipboard contents, but restoring them must not add 100 ms to the
+    // user's perceived stop-to-text latency. Keeping this Clipboard alive in
+    // the detached task is important on Wayland, where it owns the clipboard
+    // data source until the paste completes.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        let _ = restore_clipboard_snapshot(&mut clipboard, previous_contents);
+    });
     pasted?;
-    restored
+    Ok(())
 }
 
 /// Copies the current selection through the platform's normal copy shortcut.

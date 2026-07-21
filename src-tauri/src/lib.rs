@@ -514,6 +514,8 @@ struct Settings {
     audio_history_budget_gb: f64,
     selected_voice_engine: VoiceEngine,
     selected_model: String,
+    #[serde(default)]
+    whisper_beam_size: speech::BeamSize,
     local_model_path: Option<String>,
     selected_input_device: Option<String>,
     cloud_transcription_model: String,
@@ -605,6 +607,7 @@ impl Default for Settings {
             audio_history_budget_gb: 4.0,
             selected_voice_engine: VoiceEngine::Whisper,
             selected_model: "base".into(),
+            whisper_beam_size: speech::BeamSize::Auto,
             local_model_path: None,
             selected_input_device: None,
             cloud_transcription_model: "gpt-4o-mini-transcribe".into(),
@@ -1292,7 +1295,7 @@ struct NativeCaptureState {
     capture: Mutex<Option<audio::AudioCapture>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
-    preview_generation: AtomicU64,
+    preview_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2425,6 +2428,7 @@ async fn transcribe_file(
                     vad_model.as_deref(),
                     &language,
                     &custom_words,
+                    settings.whisper_beam_size,
                     Some(progress),
                 )
             })
@@ -4760,6 +4764,8 @@ fn whisper_model_filename(model_id: &str) -> Result<&'static str, String> {
         "small.en" => Ok("ggml-small.en.bin"),
         "medium.en" => Ok("ggml-medium.en.bin"),
         "large-v3-turbo" => Ok("ggml-large-v3-turbo.bin"),
+        "large-v3-turbo-q5_0" => Ok("ggml-large-v3-turbo-q5_0.bin"),
+        "large-v3-turbo-q8_0" => Ok("ggml-large-v3-turbo-q8_0.bin"),
         "large-v3" => Ok("ggml-large-v3.bin"),
         _ => Err(format!("Unsupported built-in Whisper model: {model_id}")),
     }
@@ -5209,6 +5215,7 @@ fn start_native_dictation(
         .preview_generation
         .fetch_add(1, Ordering::SeqCst)
         + 1;
+    let preview_cancellation = Arc::clone(&capture_state.preview_generation);
     if settings.enable_streaming_preview {
         emit_overlay(&app, "recording", "Listening…");
     }
@@ -5220,6 +5227,7 @@ fn start_native_dictation(
                 spawn_live_whisper_preview(
                     app.clone(),
                     preview_generation,
+                    preview_cancellation,
                     model_path,
                     vad_model_path(&state),
                     settings.language.clone(),
@@ -5269,6 +5277,7 @@ fn start_native_dictation(
 fn spawn_live_whisper_preview(
     app: AppHandle,
     preview_generation: u64,
+    preview_cancellation: Arc<AtomicU64>,
     model_path: PathBuf,
     vad_model: Option<PathBuf>,
     language: String,
@@ -5289,7 +5298,7 @@ fn spawn_live_whisper_preview(
             let captured = capture_state.capture.lock().ok().and_then(|capture| {
                 capture
                     .as_ref()
-                    .and_then(|capture| capture.snapshot_recent(Duration::from_secs(20)).ok())
+                    .and_then(|capture| capture.snapshot_recent(Duration::from_secs(8)).ok())
             });
             let Some(captured) = captured else {
                 return;
@@ -5297,6 +5306,7 @@ fn spawn_live_whisper_preview(
             if captured.duration_ms < 1_000 {
                 continue;
             }
+            let captured_duration_ms = captured.duration_ms;
             let samples = match audio::mono_resample_for_whisper(captured) {
                 Ok(samples) => samples,
                 Err(_) => continue,
@@ -5305,32 +5315,49 @@ fn spawn_live_whisper_preview(
             let vad_model = vad_model.clone();
             let language = language.clone();
             let custom_words = custom_words.clone();
+            let preview_cancellation = Arc::clone(&preview_cancellation);
             let transcription_started = Instant::now();
-            let partial = tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_whisper(
+            let preview_result = tauri::async_runtime::spawn_blocking(move || {
+                speech::transcribe_whisper_with_options(
                     samples,
                     &model_path,
                     vad_model.as_deref(),
                     &language,
                     &custom_words,
+                    speech::TranscriptionOptions::preview(preview_cancellation, preview_generation),
                 )
             })
             .await
-            .ok()
-            .and_then(Result::ok);
-            interval = transcription_started.elapsed().mul_f32(1.5).clamp(
-                Duration::from_millis(250),
-                Duration::from_millis(2_500),
-            );
-            if let Some(partial) = partial.filter(|partial| !partial.trim().is_empty()) {
-                let capture_state = app.state::<NativeCaptureState>();
-                if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation {
-                    emit_overlay(
-                        &app,
-                        "recording",
-                        tail_characters(&partial, preview_char_limit),
-                    );
+            .map_err(|error| format!("preview task failed: {error}"))
+            .and_then(|result| result);
+            interval = transcription_started
+                .elapsed()
+                .mul_f32(1.5)
+                .clamp(Duration::from_millis(250), Duration::from_millis(2_500));
+            match preview_result {
+                Ok(result) if !result.text.trim().is_empty() => {
+                    let capture_state = app.state::<NativeCaptureState>();
+                    if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation
+                    {
+                        debug_log::append(&format!(
+                            "Live Whisper preview emitted (audio_ms: {}, decode_ms: {})",
+                            captured_duration_ms, result.timings.decode_ms
+                        ));
+                        emit_overlay(
+                            &app,
+                            "recording",
+                            tail_characters(&result.text, preview_char_limit),
+                        );
+                    }
                 }
+                Ok(_) => debug_log::append(&format!(
+                    "Live Whisper preview was empty (audio_ms: {})",
+                    captured_duration_ms
+                )),
+                Err(error) => debug_log::append(&format!(
+                    "Live Whisper preview skipped (audio_ms: {}): {error}",
+                    captured_duration_ms
+                )),
             }
         }
     });
@@ -5523,7 +5550,8 @@ async fn stop_native_dictation(
     }
     audio::pad_short_transcription_samples(&mut samples);
 
-    let raw_text = match settings.selected_voice_engine {
+    let transcription_started = Instant::now();
+    let (raw_text, whisper_timings) = match settings.selected_voice_engine {
         VoiceEngine::Whisper => {
             let model_path = whisper_model_path(&settings, &state)?;
             if !valid_whisper_model_file(&model_path) {
@@ -5531,17 +5559,21 @@ async fn stop_native_dictation(
             }
             let language = settings.language.clone();
             let vad_model = vad_model_path(&state);
-            tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_whisper(
+            let beam_size = settings.whisper_beam_size;
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                speech::transcribe_whisper_with_options(
                     samples,
                     &model_path,
                     vad_model.as_deref(),
                     &language,
                     &custom_words,
+                    speech::TranscriptionOptions::final_decode(beam_size),
                 )
             })
-                .await
+            .await
                 .map_err(|error| format!("Voice engine task failed: {error}"))??
+                ;
+            (result.text, Some(result.timings))
         }
         VoiceEngine::Cloud => {
             let profile = {
@@ -5553,25 +5585,28 @@ async fn stop_native_dictation(
             };
             let api_key = provider_api_key(&profile.id)?;
             let wav = audio::wav_bytes_from_16khz_mono(&samples)?;
-            provider::transcribe_openai_compatible_audio(
+            let text = provider::transcribe_openai_compatible_audio(
                 &profile,
                 api_key.as_deref(),
                 &settings.cloud_transcription_model,
                 &settings.language,
                 wav,
             )
-            .await?
+            .await?;
+            (text, None)
         }
         VoiceEngine::AppleSpeech => {
             let language = settings.apple_speech_locale.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            let text = tauri::async_runtime::spawn_blocking(move || {
                 apple_speech::transcribe_samples(&samples, &language, &custom_words)
             })
             .await
-            .map_err(|error| format!("Apple Speech task failed: {error}"))??
+            .map_err(|error| format!("Apple Speech task failed: {error}"))??;
+            (text, None)
         }
         _ => return Err("This voice engine is not available in the portable runtime yet. Select Whisper or configure a compatible cloud provider.".into()),
     };
+    let transcription_latency_ms = transcription_started.elapsed().as_millis() as u64;
     let post_processing_started = Instant::now();
     let post_processing = if matches!(
         instruction_mode,
@@ -5649,6 +5684,7 @@ async fn stop_native_dictation(
             tail_characters(&text, settings.transcription_preview_char_limit),
         );
     }
+    let insertion_started = Instant::now();
     let inserted_into_active_application =
         if !is_prompt_test && settings.type_into_active_application {
             typing::type_into_active_application(&text, settings.text_insertion_mode)?;
@@ -5656,6 +5692,7 @@ async fn stop_native_dictation(
         } else {
             false
         };
+    let insertion_latency_ms = insertion_started.elapsed().as_millis() as u64;
     if inserted_into_active_application
         && (settings.continuous_dictation_spacing_enabled
             || settings.context_aware_capitalization_enabled)
@@ -5753,6 +5790,22 @@ async fn stop_native_dictation(
         "history_only"
     };
     if !is_prompt_test {
+        let timings = whisper_timings.unwrap_or_default();
+        let decode_ms = if matches!(settings.selected_voice_engine, VoiceEngine::Whisper) {
+            timings.decode_ms
+        } else {
+            transcription_latency_ms
+        };
+        debug_log::append(&format!(
+            "Dictation timing (audio_s: {:.1}, lock_wait_ms: {}, vad_ms: {}, state_ms: {}, decode_ms: {}, post_ms: {}, insert_ms: {})",
+            duration_ms as f64 / 1_000.0,
+            timings.lock_wait_ms,
+            timings.vad_ms,
+            timings.state_ms,
+            decode_ms,
+            post_processing_latency_ms,
+            insertion_latency_ms,
+        ));
         debug_log::append(&format!(
             "Dictation completed (engine: {:?}, duration_ms: {duration_ms}, ai_processed: {}, output: {output_method})",
             settings.selected_voice_engine, post_processing.was_ai_processed
@@ -6447,12 +6500,7 @@ fn update_tray_status(app: &AppHandle, visual_state: TrayVisualState) {
             true,
             "Voxide — ready to record",
         ),
-        TrayVisualState::Recording => (
-            "Recording…",
-            "Stop Dictation",
-            false,
-            "Voxide — recording",
-        ),
+        TrayVisualState::Recording => ("Recording…", "Stop Dictation", false, "Voxide — recording"),
         TrayVisualState::Processing => (
             "Transcribing…",
             "Transcribing…",
@@ -6559,8 +6607,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn run() {
-    let state =
-        AppState::load().unwrap_or_else(|error| panic!("Voxide could not start: {error}"));
+    let state = AppState::load().unwrap_or_else(|error| panic!("Voxide could not start: {error}"));
     let analytics = analytics::AnalyticsService::load(state.analytics_identity_path());
 
     let builder = tauri::Builder::default()
@@ -6725,11 +6772,20 @@ pub fn run() {
                     return;
                 }
                 ensure_vad_model(&state).await;
+                let vad = vad_model_path(&state);
                 let model = match whisper_model_path(&settings, &state) {
                     Ok(path) if path.is_file() => path,
                     _ => return,
                 };
                 let _ = tauri::async_runtime::spawn_blocking(move || {
+                    if let Some(vad) = vad {
+                        match speech::preload_vad(&vad) {
+                            Ok(()) => debug_log::append("Whisper VAD model preloaded"),
+                            Err(error) => {
+                                debug_log::append(&format!("Whisper VAD preload failed: {error}"))
+                            }
+                        }
+                    }
                     match speech::preload_whisper(&model) {
                         Ok(()) => debug_log::append("Whisper model preloaded"),
                         Err(error) => {
@@ -6738,6 +6794,23 @@ pub fn run() {
                     }
                 })
                 .await;
+            });
+            let capture_prewarm_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match tauri::async_runtime::spawn_blocking(audio::prewarm_input_devices).await {
+                    Ok(Ok(count)) => debug_log::append(&format!(
+                        "Audio capture devices prewarmed ({count} available)"
+                    )),
+                    Ok(Err(error)) => {
+                        debug_log::append(&format!("Audio capture prewarm failed: {error}"))
+                    }
+                    Err(error) => {
+                        debug_log::append(&format!("Audio capture prewarm task failed: {error}"))
+                    }
+                }
+                // Keep the handle alive through the background task on
+                // platforms where Tauri releases app state on shutdown.
+                let _ = capture_prewarm_handle;
             });
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -7833,10 +7906,8 @@ mod tests {
 
     #[test]
     fn audio_history_pruning_follows_history_order_not_file_mtime() {
-        let directory = std::env::temp_dir().join(format!(
-            "voxide-audio-pruning-test-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("voxide-audio-pruning-test-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temporary directory should be created");
         let newest_history_entry = directory.join("newest-history-entry.wav");
         let oldest_history_entry = directory.join("oldest-history-entry.wav");

@@ -8,6 +8,7 @@ type Theme = "system" | "light" | "dark";
 type DictationMode = "dictate" | "prompt" | "rewrite" | "command" | "file";
 type TranscriptionSound = "none" | "cue_1" | "cue_2" | "cue_3" | "cue_4" | "cue_5";
 type TextInsertionMode = "standard" | "reliablePaste";
+type WhisperBeamSize = "auto" | "greedy" | "beam2" | "beam5";
 const builtInProviderIds = new Set(["openai", "anthropic", "xai", "groq", "cerebras", "google", "openrouter", "ollama", "lmstudio"]);
 const providerSetupLabels: Record<string, string> = {
   openai: "Get API key", anthropic: "Get API key", xai: "Get API key", groq: "Get API key",
@@ -63,6 +64,7 @@ interface Settings {
   audioHistoryBudgetGb: number;
   selectedVoiceEngine: "whisper" | "parakeet" | "nemotron" | "appleSpeech" | "cloud";
   selectedModel: string;
+  whisperBeamSize: WhisperBeamSize;
   localModelPath?: string;
   selectedInputDevice?: string;
   cloudTranscriptionModel: string;
@@ -713,7 +715,8 @@ function renderVoiceEngine(): void {
   );
   const deviceOptions = [`<option value="" ${!database.settings.selectedInputDevice || selectedInputDeviceUnavailable ? "selected" : ""}>System default${selectedInputDeviceUnavailable ? " (preferred device unavailable)" : ""}</option>`, ...audioDevices.map((device) => `<option value="${escapeHtml(device)}" ${database.settings.selectedInputDevice === device ? "selected" : ""}>${escapeHtml(device)}</option>`)].join("");
   const engineConfiguration = isWhisper
-    ? `<label>Selected Whisper model<select id="selected-model"><option value="tiny" ${database.settings.selectedModel === "tiny" ? "selected" : ""}>Tiny — multilingual, fastest</option><option value="base" ${database.settings.selectedModel === "base" ? "selected" : ""}>Base — multilingual, default</option><option value="small" ${database.settings.selectedModel === "small" ? "selected" : ""}>Small — multilingual, higher accuracy</option><option value="medium" ${database.settings.selectedModel === "medium" ? "selected" : ""}>Medium — multilingual</option><option value="large-v3-turbo" ${database.settings.selectedModel === "large-v3-turbo" ? "selected" : ""}>Large v3 Turbo — multilingual</option><option value="large-v3" ${database.settings.selectedModel === "large-v3" ? "selected" : ""}>Large v3 — multilingual</option><optgroup label="Legacy English-only Whisper models"><option value="tiny.en" ${database.settings.selectedModel === "tiny.en" ? "selected" : ""}>Tiny English</option><option value="base.en" ${database.settings.selectedModel === "base.en" ? "selected" : ""}>Base English</option><option value="small.en" ${database.settings.selectedModel === "small.en" ? "selected" : ""}>Small English</option><option value="medium.en" ${database.settings.selectedModel === "medium.en" ? "selected" : ""}>Medium English</option></optgroup></select></label>
+    ? `<label>Selected Whisper model<select id="selected-model"><option value="tiny" ${database.settings.selectedModel === "tiny" ? "selected" : ""}>Tiny — multilingual, fastest</option><option value="base" ${database.settings.selectedModel === "base" ? "selected" : ""}>Base — multilingual, default</option><option value="small" ${database.settings.selectedModel === "small" ? "selected" : ""}>Small — multilingual, higher accuracy</option><option value="medium" ${database.settings.selectedModel === "medium" ? "selected" : ""}>Medium — multilingual</option><option value="large-v3-turbo" ${database.settings.selectedModel === "large-v3-turbo" ? "selected" : ""}>Large v3 Turbo — multilingual</option><option value="large-v3-turbo-q5_0" ${database.settings.selectedModel === "large-v3-turbo-q5_0" ? "selected" : ""}>Large v3 Turbo Q5 — smaller local fallback</option><option value="large-v3-turbo-q8_0" ${database.settings.selectedModel === "large-v3-turbo-q8_0" ? "selected" : ""}>Large v3 Turbo Q8 — smaller local fallback</option><option value="large-v3" ${database.settings.selectedModel === "large-v3" ? "selected" : ""}>Large v3 — multilingual</option><optgroup label="Legacy English-only Whisper models"><option value="tiny.en" ${database.settings.selectedModel === "tiny.en" ? "selected" : ""}>Tiny English</option><option value="base.en" ${database.settings.selectedModel === "base.en" ? "selected" : ""}>Base English</option><option value="small.en" ${database.settings.selectedModel === "small.en" ? "selected" : ""}>Small English</option><option value="medium.en" ${database.settings.selectedModel === "medium.en" ? "selected" : ""}>Medium English</option></optgroup></select></label>
+      <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isCloud
       ? `<label>Cloud transcription model<input id="cloud-transcription-model" value="${escapeHtml(database.settings.cloudTranscriptionModel)}" placeholder="gpt-4o-mini-transcribe"></label><p class="muted">Uses the enabled OpenAI-compatible AI provider and its stored API key.</p>`
@@ -2329,12 +2332,14 @@ async function handleAction(element: HTMLElement): Promise<void> {
       break;
     case "save-engine": {
       const model = readInput("selected-model")?.value.trim();
+      const whisperBeamSize = readInput("whisper-beam-size")?.value as WhisperBeamSize | undefined;
       const language = readInput("language")?.value.trim();
       const appleSpeechLocale = readInput("apple-speech-locale")?.value.trim();
       const localModelPath = readInput("local-model-path")?.value.trim();
       const selectedInputDevice = readInput("input-device")?.value.trim();
       const cloudTranscriptionModel = readInput("cloud-transcription-model")?.value.trim();
       if (model) database.settings.selectedModel = model;
+      if (whisperBeamSize) database.settings.whisperBeamSize = whisperBeamSize;
       if (language) database.settings.language = language;
       if (appleSpeechLocale) database.settings.appleSpeechLocale = appleSpeechLocale;
       database.settings.localModelPath = localModelPath || undefined;
