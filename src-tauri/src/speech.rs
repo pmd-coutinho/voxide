@@ -16,6 +16,11 @@ pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
 /// otherwise be paid at the start of every dictation.
 static CONTEXT_CACHE: OnceLock<Mutex<Option<(PathBuf, Arc<WhisperContext>)>>> = OnceLock::new();
 
+/// Serializes inference: the live preview and the final transcription share
+/// the warm context, and concurrent runs on one context corrupt each other
+/// on GPU backends. The final pass simply waits out an in-flight preview.
+static INFERENCE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Loads the model into the warm cache ahead of the first dictation.
 pub fn preload_whisper(model_path: &Path) -> Result<(), String> {
     load_context(model_path).map(|_| ())
@@ -24,6 +29,7 @@ pub fn preload_whisper(model_path: &Path) -> Result<(), String> {
 pub fn transcribe_whisper(
     samples: Vec<f32>,
     model_path: &Path,
+    vad_model_path: Option<&Path>,
     language: &str,
     custom_words: &[String],
 ) -> Result<String, String> {
@@ -41,7 +47,7 @@ pub fn transcribe_whisper(
     }
 
     let context = load_context(model_path)?;
-    let text = transcribe_samples(&context, &samples, language, custom_words)?;
+    let text = transcribe_samples(&context, &samples, vad_model_path, language, custom_words)?;
     if text.is_empty() {
         return Err("The voice engine did not recognize any speech".into());
     }
@@ -51,6 +57,7 @@ pub fn transcribe_whisper(
 pub fn transcribe_media_file(
     path: &Path,
     model_path: &Path,
+    vad_model_path: Option<&Path>,
     language: &str,
     custom_words: &[String],
     progress: Option<ProgressCallback>,
@@ -78,7 +85,8 @@ pub fn transcribe_media_file(
             }
             continue;
         }
-        let result = transcribe_samples(&context, &samples, language, custom_words)?;
+        let result =
+            transcribe_samples(&context, &samples, vad_model_path, language, custom_words)?;
         if !result.is_empty() {
             text.push(result);
         }
@@ -172,9 +180,13 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
 fn transcribe_samples(
     context: &WhisperContext,
     samples: &[f32],
+    vad_model_path: Option<&Path>,
     language: &str,
     custom_words: &[String],
 ) -> Result<String, String> {
+    let _inference = INFERENCE_LOCK
+        .lock()
+        .map_err(|_| "Whisper inference lock was poisoned".to_string())?;
     let mut state = context
         .create_state()
         .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
@@ -188,6 +200,15 @@ fn transcribe_samples(
     // Dictation wants speech only — no "[sound of plastic crinkling]" tags.
     parameters.set_suppress_nst(true);
     parameters.set_no_speech_thold(NO_SPEECH_PROBABILITY_LIMIT);
+    // Voice-activity detection removes silence and noise before decoding —
+    // the audio Whisper hallucinates subtitle boilerplate on. Dictation
+    // proceeds without it when the VAD model is unavailable.
+    let vad_model = vad_model_path.and_then(Path::to_str);
+    if let Some(vad_model) = vad_model {
+        parameters.set_vad_model_path(Some(vad_model));
+        parameters.set_vad_params(whisper_rs::WhisperVadParams::new());
+        parameters.enable_vad(true);
+    }
     let vocabulary = custom_words
         .iter()
         .map(|word| word.trim())

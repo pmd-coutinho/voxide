@@ -2417,10 +2417,12 @@ async fn transcribe_file(
             }
             let language = settings.language.clone();
             let media_path = path.clone();
+            let vad_model = vad_model_path(&state);
             tauri::async_runtime::spawn_blocking(move || {
                 speech::transcribe_media_file(
                     &media_path,
                     &model_path,
+                    vad_model.as_deref(),
                     &language,
                     &custom_words,
                     Some(progress),
@@ -4829,6 +4831,49 @@ fn valid_whisper_model_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Silero voice-activity-detection model used to strip non-speech audio
+/// before Whisper decodes it. Small (~2 MB); fetched once at startup.
+const VAD_MODEL_FILENAME: &str = "ggml-silero-v5.1.2.bin";
+const VAD_MODEL_URL: &str =
+    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+
+fn vad_model_path(state: &AppState) -> Option<PathBuf> {
+    let path = state.models_directory().ok()?.join(VAD_MODEL_FILENAME);
+    path.is_file().then_some(path)
+}
+
+async fn ensure_vad_model(state: &AppState) {
+    let Ok(directory) = state.models_directory() else {
+        return;
+    };
+    let path = directory.join(VAD_MODEL_FILENAME);
+    if path.is_file() {
+        return;
+    }
+    let downloaded = async {
+        let response = reqwest::get(VAD_MODEL_URL).await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response.bytes().await.ok()?;
+        if bytes.len() < 100_000 || looks_like_markup(&bytes) {
+            return None;
+        }
+        let temporary = path.with_extension("bin.tmp");
+        fs::write(&temporary, &bytes).ok()?;
+        fs::rename(&temporary, &path).ok()
+    }
+    .await;
+    debug_log::append(&format!(
+        "VAD model download {}",
+        if downloaded.is_some() {
+            "completed"
+        } else {
+            "failed; dictation continues without voice-activity detection"
+        }
+    ));
+}
+
 fn whisper_model_path(settings: &Settings, state: &AppState) -> Result<PathBuf, String> {
     if let Some(path) = settings
         .local_model_path
@@ -5165,6 +5210,7 @@ fn start_native_dictation(
                     app.clone(),
                     preview_generation,
                     model_path,
+                    vad_model_path(&state),
                     settings.language.clone(),
                     custom_words.clone(),
                     settings.transcription_preview_char_limit,
@@ -5213,6 +5259,7 @@ fn spawn_live_whisper_preview(
     app: AppHandle,
     preview_generation: u64,
     model_path: PathBuf,
+    vad_model: Option<PathBuf>,
     language: String,
     custom_words: Vec<String>,
     preview_char_limit: usize,
@@ -5244,11 +5291,18 @@ fn spawn_live_whisper_preview(
                 Err(_) => continue,
             };
             let model_path = model_path.clone();
+            let vad_model = vad_model.clone();
             let language = language.clone();
             let custom_words = custom_words.clone();
             let transcription_started = Instant::now();
             let partial = tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_whisper(samples, &model_path, &language, &custom_words)
+                speech::transcribe_whisper(
+                    samples,
+                    &model_path,
+                    vad_model.as_deref(),
+                    &language,
+                    &custom_words,
+                )
             })
             .await
             .ok()
@@ -5464,8 +5518,15 @@ async fn stop_native_dictation(
                 return Err("The selected Whisper model is missing, empty, or invalid. Download it again before recording.".into());
             }
             let language = settings.language.clone();
+            let vad_model = vad_model_path(&state);
             tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_whisper(samples, &model_path, &language, &custom_words)
+                speech::transcribe_whisper(
+                    samples,
+                    &model_path,
+                    vad_model.as_deref(),
+                    &language,
+                    &custom_words,
+                )
             })
                 .await
                 .map_err(|error| format!("Voice engine task failed: {error}"))??
@@ -6637,9 +6698,9 @@ pub fn run() {
                 }
             });
             let preload_handle = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::spawn(async move {
                 // Warm the Whisper model cache so the first dictation does not
-                // pay the model-load latency.
+                // pay the model-load latency, and fetch the VAD model once.
                 let state = preload_handle.state::<AppState>();
                 let Ok(settings) = state
                     .database
@@ -6651,15 +6712,20 @@ pub fn run() {
                 if !matches!(settings.selected_voice_engine, VoiceEngine::Whisper) {
                     return;
                 }
-                match whisper_model_path(&settings, &state) {
-                    Ok(path) if path.is_file() => match speech::preload_whisper(&path) {
+                ensure_vad_model(&state).await;
+                let model = match whisper_model_path(&settings, &state) {
+                    Ok(path) if path.is_file() => path,
+                    _ => return,
+                };
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    match speech::preload_whisper(&model) {
                         Ok(()) => debug_log::append("Whisper model preloaded"),
                         Err(error) => {
                             debug_log::append(&format!("Whisper preload failed: {error}"))
                         }
-                    },
-                    _ => {}
-                }
+                    }
+                })
+                .await;
             });
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

@@ -685,6 +685,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
     let language = settings.language.clone();
     let transcribed = match settings.selected_voice_engine {
         VoiceEngine::Whisper => {
+            let vad_model = crate::vad_model_path(&state);
             let model_path = match whisper_model_path(&settings, &state) {
                 Ok(path) => path,
                 Err(message) => return error(StatusCode::BAD_REQUEST, message),
@@ -702,6 +703,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                         speech::transcribe_media_file(
                             &path,
                             &model_path,
+                            vad_model.as_deref(),
                             &language,
                             &custom_words,
                             None,
@@ -735,8 +737,14 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                         Err(message) => return error(StatusCode::BAD_REQUEST, message),
                     };
                     match tauri::async_runtime::spawn_blocking(move || {
-                        speech::transcribe_whisper(samples, &model_path, &language, &custom_words)
-                            .map(|text| (text, sample_count))
+                        speech::transcribe_whisper(
+                            samples,
+                            &model_path,
+                            vad_model.as_deref(),
+                            &language,
+                            &custom_words,
+                        )
+                        .map(|text| (text, sample_count))
                     })
                     .await
                     {
