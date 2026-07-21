@@ -204,19 +204,40 @@ fn transcribe_samples(
 
     let text = state
         .as_iter()
-        // Whisper hallucinates subtitle boilerplate ("Thank you for
-        // watching!") on silence and noise; its own no-speech probability
-        // marks those segments, so drop them instead of typing them.
-        .filter(|segment| segment.no_speech_probability() < NO_SPEECH_PROBABILITY_LIMIT)
+        .filter(|segment| !segment_is_silence(segment))
         .filter_map(|segment| clean_transcription_segment(&segment.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
     Ok(text)
 }
 
-/// Segments whose no-speech probability reaches this limit are treated as
-/// silence. Matches Whisper's conventional default threshold.
+/// Segments whose no-speech probability reaches this limit are silence
+/// candidates. Matches Whisper's conventional default threshold.
 const NO_SPEECH_PROBABILITY_LIMIT: f32 = 0.6;
+/// Silence candidates are only discarded when the decoded text is also
+/// low-confidence (mean token log-probability below this), mirroring the
+/// reference Whisper implementation's dual test. Confident speech survives
+/// even when its no-speech score is jumpy.
+const LOW_CONFIDENCE_MEAN_LOGPROB: f32 = -1.0;
+
+/// Whisper hallucinates subtitle boilerplate ("Thank you for watching!") on
+/// silence and noise. Those segments combine a high no-speech probability
+/// with low-confidence text; real speech decodes confidently.
+fn segment_is_silence(segment: &whisper_rs::WhisperSegment) -> bool {
+    if segment.no_speech_probability() < NO_SPEECH_PROBABILITY_LIMIT {
+        return false;
+    }
+    let token_count = segment.n_tokens();
+    if token_count == 0 {
+        return true;
+    }
+    let mean_logprob = (0..token_count)
+        .filter_map(|index| segment.get_token(index))
+        .map(|token| token.token_probability().max(f32::EPSILON).ln())
+        .sum::<f32>()
+        / token_count as f32;
+    mean_logprob < LOW_CONFIDENCE_MEAN_LOGPROB
+}
 
 /// Strips Whisper's non-speech artifacts from a segment: noise annotations
 /// such as "[sound of plastic crinkling]" or "(water splashing)", music
