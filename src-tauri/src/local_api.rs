@@ -24,7 +24,8 @@ use crate::{
     active_recognition_vocabulary, audio, media, normalize_custom_words, parakeet,
     parakeet_model_path, post_process_dictation_outcome, provider, provider_api_key,
     selected_provider, speech, transcribe_apple_media_file, valid_whisper_model_file,
-    whisper_model_path, AppState, CustomWordEntry, DictionaryEntry, VoiceEngine,
+    whisper_model_path, AppState, CustomWordEntry, DictationCleanupStyle, DictionaryEntry,
+    VoiceEngine,
 };
 
 const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
@@ -1002,6 +1003,7 @@ async fn postprocess(State(api): State<ApiState>, headers: HeaderMap, body: Byte
         None,
         None,
         None,
+        DictationCleanupStyle::Standard,
         &mut ignore_delta,
     )
     .await

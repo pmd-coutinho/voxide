@@ -422,7 +422,7 @@ fn replace_first_letter(text: &str, transform: impl Fn(char) -> String) -> Strin
     format!("{}{}{}", &text[..index], transform(character), &text[end..])
 }
 
-fn remove_filler_words(text: &str, filler_words: &[String]) -> String {
+pub(crate) fn remove_filler_words(text: &str, filler_words: &[String]) -> String {
     let fillers = filler_words
         .iter()
         .map(|word| word.trim().to_lowercase())
@@ -504,7 +504,11 @@ struct PhraseRule {
     spacing: Spacing,
 }
 
-fn apply_spoken_punctuation(text: &str, prefix: &str, rules: &[PunctuationRule]) -> String {
+pub(crate) fn apply_spoken_punctuation(
+    text: &str,
+    prefix: &str,
+    rules: &[PunctuationRule],
+) -> String {
     let prefix_words = phrase_words(prefix);
     if prefix_words.is_empty() || text.is_empty() || rules.is_empty() {
         return text.to_owned();

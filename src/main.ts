@@ -698,7 +698,7 @@ function renderWelcome(): void {
 function renderVoiceEngine(): void {
   const engines: [Settings["selectedVoiceEngine"], string, string, boolean][] = [
     ["whisper", "Whisper", "Local models with broad language support", true],
-    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with VAD-segmented live preview", voiceEngineAvailability.parakeet],
+    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with FluidVoice-style full-buffer preview", voiceEngineAvailability.parakeet],
     ["nemotron", "Nemotron Speech", "Apple Silicon-only runtime — portable implementation pending", false],
     ["appleSpeech", "System speech", "Use the operating system speech service", true],
     ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", true],
@@ -726,7 +726,7 @@ function renderVoiceEngine(): void {
       <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isParakeet
-      ? `<p class="muted">Parakeet TDT 0.6B v3 (INT8) runs locally through the CUDA build. Its live preview commits completed VAD phrases and keeps only the active phrase provisional. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      ? `<p class="muted">Parakeet TDT 0.6B v3 (INT8) runs locally through the CUDA build. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
       : isCloud
       ? `<label>Cloud transcription model<input id="cloud-transcription-model" value="${escapeHtml(database.settings.cloudTranscriptionModel)}" placeholder="gpt-4o-mini-transcribe"></label><p class="muted">Uses the enabled OpenAI-compatible AI provider and its stored API key.</p>`
       : isAppleSpeech

@@ -1300,13 +1300,15 @@ struct NativeCaptureState {
     parakeet_live: Mutex<ParakeetLiveState>,
 }
 
-/// State shared by Parakeet's VAD-segmented preview and the final decode.
-/// `committed_until` is a 16 kHz sample offset in the complete capture.
+/// Display-only state for Parakeet's full-buffer live preview.
+///
+/// This mirrors FluidVoice's TDT v3 implementation: each preview is a fresh
+/// decode of the complete capture, then reconciled with the previous snapshot.
+/// The final transcription is always another independent full-audio decode.
 #[derive(Debug, Clone, Default)]
 struct ParakeetLiveState {
     generation: u64,
-    committed_until: usize,
-    committed_text: Vec<String>,
+    previous_full_text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4060,14 +4062,59 @@ fn output_formatting(settings: &Settings) -> formatting::OutputFormatting<'_> {
     }
 }
 
-fn deterministic_dictation_cleanup(state: &AppState, raw_text: &str) -> Result<String, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DictationCleanupStyle {
+    Standard,
+    FluidVoiceParakeet,
+}
+
+fn prepare_dictation_text(
+    raw_text: &str,
+    formatting: &formatting::OutputFormatting<'_>,
+    dictionary: &[DictionaryEntry],
+    cleanup_style: DictationCleanupStyle,
+) -> String {
+    match cleanup_style {
+        DictationCleanupStyle::Standard => {
+            let preformatted = formatting::apply_before_ai(raw_text, formatting);
+            apply_dictionary(&preformatted, dictionary)
+        }
+        // FluidVoice runs its preview and final path as:
+        // filler removal -> custom dictionary -> spoken punctuation. Keep that
+        // order for Parakeet so a dictionary replacement can intentionally
+        // contain a spoken punctuation command.
+        DictationCleanupStyle::FluidVoiceParakeet => {
+            let without_fillers = if formatting.remove_filler_words {
+                formatting::remove_filler_words(raw_text, formatting.filler_words)
+            } else {
+                raw_text.to_owned()
+            };
+            let dictionary_corrected = apply_dictionary(&without_fillers, dictionary);
+            if formatting.auto_convert_punctuation {
+                formatting::apply_spoken_punctuation(
+                    &dictionary_corrected,
+                    formatting.punctuation_prefix,
+                    formatting.punctuation_rules,
+                )
+            } else {
+                dictionary_corrected
+            }
+        }
+    }
+}
+
+fn deterministic_dictation_cleanup(
+    state: &AppState,
+    raw_text: &str,
+    cleanup_style: DictationCleanupStyle,
+) -> Result<String, String> {
     let database = state
         .database
         .lock()
         .map_err(|_| "Voxide data lock was poisoned".to_string())?;
     let formatting = output_formatting(&database.settings);
-    let preformatted = formatting::apply_before_ai(raw_text, &formatting);
-    let dictionary_corrected = apply_dictionary(&preformatted, &database.dictionary);
+    let dictionary_corrected =
+        prepare_dictation_text(raw_text, &formatting, &database.dictionary, cleanup_style);
     Ok(formatting::apply_final_output(
         &dictionary_corrected,
         &formatting,
@@ -4101,6 +4148,7 @@ async fn post_process_dictation_outcome(
     source_window_title: Option<&str>,
     prompt_profile_id: Option<&str>,
     prompt_override: Option<&str>,
+    cleanup_style: DictationCleanupStyle,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<PostProcessOutcome, String> {
     let (dictionary, settings, profile, provider) = {
@@ -4127,8 +4175,8 @@ async fn post_process_dictation_outcome(
     // non-empty draft as the system prompt for this one isolated run.
     let system_prompt = effective_dictation_system_prompt(&profile, prompt_override);
     let formatting = output_formatting(&settings);
-    let preformatted = formatting::apply_before_ai(&raw_text, &formatting);
-    let dictionary_corrected = apply_dictionary(&preformatted, &dictionary);
+    let dictionary_corrected =
+        prepare_dictation_text(&raw_text, &formatting, &dictionary, cleanup_style);
     let (processed, ai_fallback_error, was_ai_processed, processing_model) = if !settings
         .ai_enhancement_enabled
         && !force_prompt_processing
@@ -5402,7 +5450,7 @@ fn start_native_dictation(
     };
     let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
     let app_for_levels = app.clone();
-    let (settings, custom_words, cloud_profile) = {
+    let (settings, custom_words, cloud_profile, dictionary) = {
         let database = state
             .database
             .lock()
@@ -5421,7 +5469,12 @@ fn start_native_dictation(
             .then(|| selected_provider(&database, None))
             .transpose()?;
         let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
-        (settings, custom_words, cloud_profile)
+        (
+            settings,
+            custom_words,
+            cloud_profile,
+            database.dictionary.clone(),
+        )
     };
     if let Err(error) = apply_overlay_window_layout(&app, &settings) {
         debug_log::append(&format!(
@@ -5495,7 +5548,8 @@ fn start_native_dictation(
                     app.clone(),
                     preview_generation,
                     model_path,
-                    vad_model_path(&state),
+                    settings.clone(),
+                    dictionary,
                     settings.transcription_preview_char_limit,
                 );
             }
@@ -5763,25 +5817,34 @@ fn spawn_live_whisper_preview(
     });
 }
 
-/// Parakeet's TDT model is offline, so live dictation is built from completed
-/// VAD utterances. Earlier phrases become immutable as soon as the following
-/// utterance begins; only the current phrase is decoded again as a
-/// provisional tail. This avoids the rolling-window revisions and silence
-/// hallucinations common in pseudo-streaming ASR previews.
+/// Mirrors FluidVoice's Parakeet TDT v3 preview path. TDT is an offline model,
+/// so every snapshot is a fresh decode of the complete capture—not VAD-sliced
+/// audio and not a stateful streaming decoder. FluidVoice runs this once every
+/// 600 ms after one second of audio, skips one tick after a slow decode, and
+/// reconciles successive full hypotheses before updating the overlay.
 fn spawn_live_parakeet_preview(
     app: AppHandle,
     preview_generation: u64,
     model_path: PathBuf,
-    vad_model: Option<PathBuf>,
+    settings: Settings,
+    dictionary: Vec<DictionaryEntry>,
     preview_char_limit: usize,
 ) {
     tauri::async_runtime::spawn(async move {
-        let mut interval = Duration::from_millis(500);
+        const PREVIEW_INTERVAL: Duration = Duration::from_millis(600);
+        const MINIMUM_PREVIEW_SAMPLES: usize = audio::WHISPER_SAMPLE_RATE as usize;
+
+        let mut skip_next_snapshot = false;
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(PREVIEW_INTERVAL).await;
             let capture_state = app.state::<NativeCaptureState>();
             if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
                 return;
+            }
+            if skip_next_snapshot {
+                skip_next_snapshot = false;
+                debug_log::append("Live Parakeet preview skipped after a slow snapshot");
+                continue;
             }
             let captured = capture_state.capture.lock().ok().and_then(|capture| {
                 capture
@@ -5791,9 +5854,6 @@ fn spawn_live_parakeet_preview(
             let Some(captured) = captured else {
                 return;
             };
-            if captured.duration_ms < 500 {
-                continue;
-            }
             let samples = match audio::mono_resample_for_whisper(captured) {
                 Ok(samples) => samples,
                 Err(error) => {
@@ -5803,75 +5863,20 @@ fn spawn_live_parakeet_preview(
                     continue;
                 }
             };
-            let mut live = match capture_state.parakeet_live.lock() {
-                Ok(live) if live.generation == preview_generation => live.clone(),
-                _ => return,
-            };
-            let started = Instant::now();
-            let ranges = vad_model
-                .as_deref()
-                .and_then(|model| speech::live_speech_ranges(&samples, model))
-                .unwrap_or_else(|| {
-                    // The small VAD asset may still be downloading at startup.
-                    // Keep a useful, explicitly provisional preview rather
-                    // than going silent; completed phrase commits resume once
-                    // the VAD is present.
-                    (!samples.is_empty())
-                        .then_some((live.committed_until.min(samples.len()), samples.len()))
-                        .into_iter()
-                        .collect()
-                });
-            let mut committed = live.committed_text.clone();
-            let completed_count = ranges.len().saturating_sub(1);
-            for &(start, end) in &ranges[..completed_count] {
-                let start = start.max(live.committed_until).min(samples.len());
-                let end = end.min(samples.len());
-                if end <= start {
-                    continue;
-                }
-                let phrase = samples[start..end].to_vec();
-                let model_path = model_path.clone();
-                match tauri::async_runtime::spawn_blocking(move || {
-                    parakeet::transcribe_samples(&phrase, &model_path)
-                })
-                .await
-                .map_err(|error| format!("preview task failed: {error}"))
-                .and_then(|result| result)
-                {
-                    Ok(text) if !text.is_empty() => committed.push(text),
-                    Ok(_) => {}
-                    Err(error) => {
-                        debug_log::append(&format!("Live Parakeet phrase skipped: {error}"))
-                    }
-                }
-                // Advance even when the model returns no text. Otherwise a
-                // single noise-only VAD segment would be decoded on every
-                // preview tick forever.
-                live.committed_until = live.committed_until.max(end);
+            if samples.len() < MINIMUM_PREVIEW_SAMPLES {
+                continue;
             }
-            let provisional = ranges.last().and_then(|(start, end)| {
-                let start = (*start).max(live.committed_until).min(samples.len());
-                let end = (*end).min(samples.len());
-                (end > start).then(|| (start, end))
-            });
-            let provisional = if let Some((start, end)) = provisional {
-                let phrase = samples[start..end].to_vec();
-                let model_path = model_path.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    parakeet::transcribe_samples(&phrase, &model_path)
-                })
-                .await
-                .map_err(|error| format!("preview task failed: {error}"))
-                .and_then(|result| result)
-                .ok()
-                .filter(|text| !text.is_empty())
-            } else {
-                None
-            };
-            interval = started
-                .elapsed()
-                .mul_f32(1.25)
-                .clamp(Duration::from_millis(300), Duration::from_millis(2_000));
+            let sample_count = samples.len();
+            let started = Instant::now();
+            let model_path = model_path.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                parakeet::transcribe_samples(&samples, &model_path)
+            })
+            .await
+            .map_err(|error| format!("preview task failed: {error}"))
+            .and_then(|result| result);
+            let elapsed = started.elapsed();
+            skip_next_snapshot = elapsed > PREVIEW_INTERVAL;
             let capture_state = app.state::<NativeCaptureState>();
             if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
                 return;
@@ -5880,28 +5885,77 @@ fn spawn_live_parakeet_preview(
                 Ok(stored) if stored.generation == preview_generation => stored,
                 _ => return,
             };
-            live.committed_text = committed;
-            *stored = live.clone();
-            let mut visible = live.committed_text;
-            if let Some(provisional) = provisional {
-                visible.push(provisional);
-            }
-            if !visible.is_empty() {
-                let text = visible.join(" ");
-                debug_log::append(&format!(
-                    "Live Parakeet preview emitted (audio_ms: {}, committed_until: {})",
-                    (samples.len() as u64).saturating_mul(1_000)
-                        / audio::WHISPER_SAMPLE_RATE as u64,
-                    live.committed_until
-                ));
-                emit_overlay(
-                    &app,
-                    "recording",
-                    tail_characters(&text, preview_char_limit),
-                );
+            match result {
+                Ok(text) if !text.trim().is_empty() => {
+                    let text = parakeet_preview_cleanup(&text, &settings, &dictionary);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let text = fluidvoice_preview_reconcile(&stored.previous_full_text, &text);
+                    stored.previous_full_text = text.clone();
+                    debug_log::append(&format!(
+                        "Live Parakeet preview emitted (audio_ms: {}, decode_ms: {})",
+                        (sample_count as u64).saturating_mul(1_000)
+                            / audio::WHISPER_SAMPLE_RATE as u64,
+                        elapsed.as_millis()
+                    ));
+                    emit_overlay(
+                        &app,
+                        "recording",
+                        tail_characters(&text, preview_char_limit),
+                    );
+                }
+                Ok(_) => debug_log::append(&format!(
+                    "Live Parakeet preview was empty (audio_ms: {})",
+                    (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64
+                )),
+                Err(error) => debug_log::append(&format!(
+                    "Live Parakeet preview skipped (audio_ms: {}): {error}",
+                    (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64
+                )),
             }
         }
     });
+}
+
+/// FluidVoice applies deterministic cleanup to each v3 snapshot, but does not
+/// run its optional AI enhancement until recording has stopped.
+fn parakeet_preview_cleanup(
+    text: &str,
+    settings: &Settings,
+    dictionary: &[DictionaryEntry],
+) -> String {
+    let formatting = output_formatting(settings);
+    prepare_dictation_text(
+        text,
+        &formatting,
+        dictionary,
+        DictationCleanupStyle::FluidVoiceParakeet,
+    )
+}
+
+/// Direct Rust equivalent of FluidVoice's `smartDiffUpdate`. Its source
+/// calculates a common prefix to avoid a visibly disruptive replacement; the
+/// returned hypothesis remains the newest complete snapshot, which is why the
+/// overlay can correct itself as the capture grows.
+fn fluidvoice_preview_reconcile(previous: &str, current: &str) -> String {
+    let previous = previous.trim();
+    let current = current.trim();
+    if previous.is_empty() || current.is_empty() {
+        return current.to_owned();
+    }
+    let previous_words = previous.split_whitespace().collect::<Vec<_>>();
+    let current_words = current.split_whitespace().collect::<Vec<_>>();
+    let shared_prefix = previous_words
+        .iter()
+        .zip(&current_words)
+        .take_while(|(previous, current)| preview_words_match(previous, current))
+        .count();
+    if shared_prefix > previous_words.len() / 2 {
+        current_words.join(" ")
+    } else {
+        current.to_owned()
+    }
 }
 
 fn spawn_live_cloud_preview(
@@ -6019,39 +6073,16 @@ fn spawn_live_apple_speech_preview(
     });
 }
 
-/// Finishes only the audio that was not already committed by the Parakeet
-/// preview. When VAD is ready, decode each remaining utterance independently;
-/// this keeps a long stop-pause from being interpreted as speech. If VAD is
-/// unavailable (for example during its first background download), the model
-/// still receives the contiguous tail so a dictation never loses its ending.
-fn transcribe_parakeet_final_tail(
+/// FluidVoice's final v3 path always decodes the entire recording through a
+/// separate final manager. Keep the same full-audio contract here: preview
+/// snapshots never decide the final segmentation or contribute text. When the
+/// user enables vocabulary boosting, use it only for this final pass.
+fn transcribe_parakeet_final(
     samples: &[f32],
     model_path: &Path,
-    vad_model: Option<&Path>,
+    vocabulary: &[String],
 ) -> Result<String, String> {
-    if samples.is_empty() {
-        return Ok(String::new());
-    }
-    let Some(ranges) = vad_model.and_then(|model| speech::live_speech_ranges(samples, model))
-    else {
-        return parakeet::transcribe_samples(samples, model_path);
-    };
-    if ranges.is_empty() {
-        return Ok(String::new());
-    }
-    let mut phrases = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        let start = start.min(samples.len());
-        let end = end.min(samples.len());
-        if end <= start {
-            continue;
-        }
-        let text = parakeet::transcribe_samples(&samples[start..end], model_path)?;
-        if !text.is_empty() {
-            phrases.push(text);
-        }
-    }
-    Ok(phrases.join(" "))
+    parakeet::transcribe_samples_with_vocabulary(samples, model_path, vocabulary)
 }
 
 #[tauri::command]
@@ -6064,7 +6095,7 @@ async fn stop_native_dictation(
     prompt_test_mode: Option<bool>,
     prompt_test_prompt: Option<String>,
 ) -> Result<NativeTranscriptionResult, String> {
-    let stopped_preview_generation = capture_state
+    capture_state
         .preview_generation
         .fetch_add(1, Ordering::SeqCst);
     let capture = capture_state
@@ -6077,11 +6108,6 @@ async fn stop_native_dictation(
         .context
         .lock()
         .map_err(|_| "Dictation context lock was poisoned".to_string())?
-        .clone();
-    let parakeet_live = capture_state
-        .parakeet_live
-        .lock()
-        .map_err(|_| "Parakeet live state lock was poisoned".to_string())?
         .clone();
     update_tray_status(&app, TrayVisualState::Processing);
     let _reset_tray = ResetTrayWhenDropped { app: app.clone() };
@@ -6164,25 +6190,8 @@ async fn stop_native_dictation(
             if !parakeet::model_is_installed(&model_path) {
                 return Err("The Parakeet model is missing. Download it before recording.".into());
             }
-            let vad_model = vad_model_path(&state);
             let text = tauri::async_runtime::spawn_blocking(move || {
-                if parakeet_live.generation == stopped_preview_generation
-                    && parakeet_live.committed_until > 0
-                {
-                    let mut phrases = parakeet_live.committed_text;
-                    let tail_start = parakeet_live.committed_until.min(samples.len());
-                    let tail = transcribe_parakeet_final_tail(
-                        &samples[tail_start..],
-                        &model_path,
-                        vad_model.as_deref(),
-                    )?;
-                    if !tail.is_empty() {
-                        phrases.push(tail);
-                    }
-                    Ok(phrases.join(" "))
-                } else {
-                    parakeet::transcribe_samples(&samples, &model_path)
-                }
+                transcribe_parakeet_final(&samples, &model_path, &custom_words)
             })
             .await
             .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
@@ -6220,13 +6229,18 @@ async fn stop_native_dictation(
         _ => return Err("This voice engine is not available in the portable runtime yet. Select Whisper or configure a compatible cloud provider.".into()),
     };
     let transcription_latency_ms = transcription_started.elapsed().as_millis() as u64;
+    let cleanup_style = if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
+        DictationCleanupStyle::FluidVoiceParakeet
+    } else {
+        DictationCleanupStyle::Standard
+    };
     let post_processing_started = Instant::now();
     let post_processing = if matches!(
         instruction_mode,
         Some(DictationMode::Command | DictationMode::Rewrite)
     ) {
         PostProcessOutcome {
-            text: deterministic_dictation_cleanup(&state, &raw_text)?,
+            text: deterministic_dictation_cleanup(&state, &raw_text, cleanup_style)?,
             ai_fallback_error: None,
             was_ai_processed: false,
             processing_model: None,
@@ -6265,6 +6279,7 @@ async fn stop_native_dictation(
             context.source_window_title.as_deref(),
             context.prompt_profile_id.as_deref(),
             prompt_test_prompt.as_deref(),
+            cleanup_style,
             &mut on_delta,
         )
         .await?
@@ -7371,13 +7386,19 @@ pub fn run() {
             });
             let preload_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Warm the Whisper model cache so the first dictation does not
-                // pay the model-load latency, and fetch the VAD model once.
+                // Warm the selected local engine so the first dictation does
+                // not pay model-load latency. Whisper additionally fetches
+                // its VAD model; FluidVoice-style Parakeet does not use it.
                 let state = preload_handle.state::<AppState>();
-                let Ok(settings) = state
+                let Ok((settings, vocabulary)) = state
                     .database
                     .lock()
-                    .map(|database| database.settings.clone())
+                    .map(|database| {
+                        let settings = database.settings.clone();
+                        let vocabulary =
+                            active_recognition_vocabulary(&settings, &database.custom_words);
+                        (settings, vocabulary)
+                    })
                 else {
                     return;
                 };
@@ -7408,21 +7429,30 @@ pub fn run() {
                         .await;
                     }
                     VoiceEngine::Parakeet if parakeet::is_compiled() => {
-                        ensure_vad_model(&state).await;
                         let model = match parakeet_model_path(&state) {
                             Ok(path) if parakeet::model_is_installed(&path) => path,
                             _ => return,
                         };
-                        let _ =
-                            tauri::async_runtime::spawn_blocking(move || {
-                                match parakeet::preload(&model) {
-                                    Ok(()) => debug_log::append("Parakeet CUDA model preloaded"),
-                                    Err(error) => debug_log::append(&format!(
-                                        "Parakeet preload failed: {error}"
-                                    )),
-                                }
-                            })
-                            .await;
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            match parakeet::preload(&model) {
+                                Ok(()) => debug_log::append("Parakeet CUDA preview model preloaded"),
+                                Err(error) => debug_log::append(&format!(
+                                    "Parakeet preview preload failed: {error}"
+                                )),
+                            }
+                            if vocabulary.is_empty() {
+                                return;
+                            }
+                            match parakeet::preload_with_vocabulary(&model, &vocabulary) {
+                                Ok(()) => debug_log::append(
+                                    "Parakeet CUDA vocabulary final model preloaded",
+                                ),
+                                Err(error) => debug_log::append(&format!(
+                                    "Parakeet vocabulary preload failed; final dictation will fall back if needed: {error}"
+                                )),
+                            }
+                        })
+                        .await;
                     }
                     _ => {}
                 }
@@ -8980,5 +9010,50 @@ mod tests {
             Some("one two three thank you".into())
         );
         assert_eq!(preview.observe_silence(), Some("one two three".into()));
+    }
+
+    #[test]
+    fn parakeet_preview_matches_fluidvoice_full_snapshot_reconciliation() {
+        assert_eq!(
+            fluidvoice_preview_reconcile("", "one two three"),
+            "one two three"
+        );
+        assert_eq!(
+            fluidvoice_preview_reconcile("one two three", "one two three test"),
+            "one two three test"
+        );
+        // A significant correction replaces the preview with FluidVoice's
+        // newest full hypothesis instead of retaining a VAD-committed prefix.
+        assert_eq!(
+            fluidvoice_preview_reconcile("one two three test", "one two tree test again"),
+            "one two tree test again"
+        );
+    }
+
+    #[test]
+    fn parakeet_preview_uses_the_same_deterministic_cleanup_as_fluidvoice() {
+        let mut settings = Settings::default();
+        settings.remove_filler_words_enabled = true;
+        settings.auto_convert_punctuation_enabled = true;
+        let dictionary = vec![DictionaryEntry {
+            id: "dictionary-1".into(),
+            spoken: "vox side".into(),
+            replacement: "Voxide".into(),
+            created_at: Utc::now(),
+        }];
+        assert_eq!(
+            parakeet_preview_cleanup("um vox side literal comma hello", &settings, &dictionary,),
+            "Voxide, hello"
+        );
+        let punctuation_dictionary = vec![DictionaryEntry {
+            id: "dictionary-2".into(),
+            spoken: "dot word".into(),
+            replacement: "literal comma".into(),
+            created_at: Utc::now(),
+        }];
+        assert_eq!(
+            parakeet_preview_cleanup("dot word hello", &settings, &punctuation_dictionary),
+            ", hello"
+        );
     }
 }

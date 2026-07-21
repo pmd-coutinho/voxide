@@ -21,7 +21,7 @@ Voxide is a cross-platform desktop dictation app. Speech is transcribed locally 
 
 - **Local-first transcription** — downloadable Whisper models from Tiny to Large v3 Turbo, plus Parakeet TDT 0.6B v3 INT8 on Linux/NVIDIA CUDA builds. No audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
 - **Global dictation from any app** — press your hotkey, speak, and the result is typed into whatever has focus, without stealing it. Toggle, hold-to-record, and automatic activation modes; a compact overlay shows the live transcription and microphone level while you speak.
-- **Conservative live preview** — Whisper CUDA uses beam search over VAD speech spans. Parakeet commits completed VAD phrases and shows only the active phrase as provisional. Both avoid long-pause hallucinations, while the final result finishes the remaining tail.
+- **FluidVoice-style Parakeet dictation** — Parakeet TDT v3 re-decodes the growing audio buffer every 600 ms after the first second, reconciles each full hypothesis with the prior preview, and applies deterministic cleanup before display. Its final dictation is a separate full-audio decode; neither path uses app-level VAD segmentation. When Vocabulary Boosting is enabled, only that final pass applies the local vocabulary context graph.
 - **Speech in, speech out — nothing else** — a voice-activity gate rejects silence and noise before decoding, so Whisper's infamous hallucinations ("Thank you for watching!") never reach your text, and noise annotations like `[door slams]` are stripped from what does.
 - **AI enhancement (optional)** — post-process transcriptions with any OpenAI-compatible or Anthropic-style provider. Per-mode providers, reusable prompt profiles, per-profile model routing, and per-application prompt overrides.
 - **Modes beyond dictation** — *Rewrite* transforms selected text in place, *Command* plans shell actions from speech with review-before-execute for destructive commands, and *File Transcription* handles audio/video files in 20-minute chunks.
@@ -33,12 +33,10 @@ Voxide is a cross-platform desktop dictation app. Speech is transcribed locally 
 ## How a dictation flows
 
 ```
-hotkey ──► capture mic ──► VAD gate ──► Whisper or Parakeet (warm local model) ──► filters ──► typed into your app
-                              │
-                              └── no speech? nothing is typed, ever
+hotkey ──► capture mic ──► Whisper (VAD gate) or Parakeet (full buffer) ──► filters ──► typed into your app
 ```
 
-The Whisper model stays loaded between dictations, voice-activity detection runs on a normalized probe while the decoder always sees your original audio, and beam-search decoding plus no-speech filtering keep the output faithful to what you actually said.
+The selected local model stays loaded between dictations. Whisper's voice-activity detection runs on a normalized probe while its decoder sees your original audio; Parakeet instead keeps every preview and final pass on the complete captured buffer. Whisper's beam search and no-speech filtering keep its output faithful to what you actually said.
 
 ## Building from source
 
@@ -101,7 +99,7 @@ export PARAKEET_CUDA_LIB_DIRS="$HOME/.local/share/voxide-parakeet/cuda-libs"
 
 Then use the normal CUDA build command above. `PARAKEET_CUDA_LIB_DIRS` is embedded into the Linux binary so compositor keybindings do not need an `LD_LIBRARY_PATH`. In Voxide, select **Parakeet** under **Voice Engine** and download the model (about 500 MB). The model is stored under the app's local data directory, can be removed from the same screen, and is used for dictation, file transcription, and the loopback API.
 
-Parakeet's sherpa-onnx implementation is offline rather than token-streaming. Voxide therefore turns its VAD utterances into live updates: fully separated phrases are final in the preview, and only the active phrase is revised. It is transcribe-only; use Whisper where translation is required.
+Parakeet's sherpa-onnx implementation is offline rather than token-streaming. Like FluidVoice, Voxide re-decodes the complete growing capture every 600 ms after the first second, then runs a separate complete-capture final decode when you stop. This route deliberately does not use VAD segmentation. When enabled, Vocabulary Boosting is applied only to the final decode. It is transcribe-only; use Whisper where translation is required.
 
 ## Global shortcuts on Wayland
 
