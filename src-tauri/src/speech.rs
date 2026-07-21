@@ -187,6 +187,7 @@ fn transcribe_samples(
     parameters.set_print_timestamps(false);
     // Dictation wants speech only — no "[sound of plastic crinkling]" tags.
     parameters.set_suppress_nst(true);
+    parameters.set_no_speech_thold(NO_SPEECH_PROBABILITY_LIMIT);
     let vocabulary = custom_words
         .iter()
         .map(|word| word.trim())
@@ -203,11 +204,19 @@ fn transcribe_samples(
 
     let text = state
         .as_iter()
+        // Whisper hallucinates subtitle boilerplate ("Thank you for
+        // watching!") on silence and noise; its own no-speech probability
+        // marks those segments, so drop them instead of typing them.
+        .filter(|segment| segment.no_speech_probability() < NO_SPEECH_PROBABILITY_LIMIT)
         .filter_map(|segment| clean_transcription_segment(&segment.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
     Ok(text)
 }
+
+/// Segments whose no-speech probability reaches this limit are treated as
+/// silence. Matches Whisper's conventional default threshold.
+const NO_SPEECH_PROBABILITY_LIMIT: f32 = 0.6;
 
 /// Strips Whisper's non-speech artifacts from a segment: noise annotations
 /// such as "[sound of plastic crinkling]" or "(water splashing)", music
