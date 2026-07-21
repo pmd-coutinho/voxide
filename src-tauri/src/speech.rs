@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
+    WhisperVadContextParams, WhisperVadParams,
+};
 
 use crate::{audio, media};
 
@@ -177,6 +180,48 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     Ok(context)
 }
 
+/// Runs Silero voice-activity detection and keeps only the speech audio,
+/// mirroring `whisper_full`'s own VAD preprocessing — which whisper-rs's
+/// state-based API bypasses entirely. Returns None when VAD is unavailable
+/// (the caller transcribes unfiltered) and an empty buffer when the audio
+/// contains no speech at all.
+fn speech_only_samples(samples: &[f32], vad_model_path: &Path) -> Option<Vec<f32>> {
+    const SAMPLES_PER_CENTISECOND: f32 = audio::WHISPER_SAMPLE_RATE as f32 / 100.0;
+    let model = vad_model_path.to_str()?;
+    let mut context_params = WhisperVadContextParams::new();
+    context_params.set_use_gpu(false);
+    let mut vad = WhisperVadContext::new(model, context_params).ok()?;
+    let segments = vad
+        .segments_from_samples(WhisperVadParams::new(), samples)
+        .ok()?;
+    // Match whisper_full's reconstruction: extend every non-final segment by
+    // the overlap window and join segments with 0.1 s of silence.
+    let overlap_samples = (0.1 * audio::WHISPER_SAMPLE_RATE as f32) as usize;
+    let joiner = vec![0.0f32; overlap_samples];
+    let mut speech: Vec<f32> = Vec::new();
+    let segment_count = segments.num_segments();
+    for index in 0..segment_count {
+        let Some(segment) = segments.get_segment(index) else {
+            continue;
+        };
+        let limit = samples.len().saturating_sub(1);
+        let start = ((segment.start * SAMPLES_PER_CENTISECOND) as usize).min(limit);
+        let mut end = (segment.end * SAMPLES_PER_CENTISECOND) as usize;
+        if index < segment_count - 1 {
+            end += overlap_samples;
+        }
+        let end = end.min(limit);
+        if end <= start {
+            continue;
+        }
+        if !speech.is_empty() {
+            speech.extend_from_slice(&joiner);
+        }
+        speech.extend_from_slice(&samples[start..end]);
+    }
+    Some(speech)
+}
+
 fn transcribe_samples(
     context: &WhisperContext,
     samples: &[f32],
@@ -187,10 +232,29 @@ fn transcribe_samples(
     let _inference = INFERENCE_LOCK
         .lock()
         .map_err(|_| "Whisper inference lock was poisoned".to_string())?;
+    // Strip non-speech audio before decoding: silence and noise are what
+    // Whisper hallucinates subtitle boilerplate on.
+    let mut filtered_speech;
+    let mut samples = samples;
+    if let Some(vad_model_path) = vad_model_path {
+        if let Some(speech) = speech_only_samples(samples, vad_model_path) {
+            if speech.is_empty() {
+                return Ok(String::new());
+            }
+            filtered_speech = speech;
+            audio::pad_short_transcription_samples(&mut filtered_speech);
+            samples = &filtered_speech;
+        }
+    }
     let mut state = context
         .create_state()
         .map_err(|error| format!("Could not prepare Whisper: {error}"))?;
-    let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // Beam search decodes noisy audio markedly better than greedy sampling
+    // and is what comparable dictation setups use.
+    let mut parameters = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: 5,
+        patience: -1.0,
+    });
     let language = language.trim();
     parameters.set_language((!language.is_empty()).then_some(language));
     parameters.set_print_special(false);
@@ -200,15 +264,6 @@ fn transcribe_samples(
     // Dictation wants speech only — no "[sound of plastic crinkling]" tags.
     parameters.set_suppress_nst(true);
     parameters.set_no_speech_thold(NO_SPEECH_PROBABILITY_LIMIT);
-    // Voice-activity detection removes silence and noise before decoding —
-    // the audio Whisper hallucinates subtitle boilerplate on. Dictation
-    // proceeds without it when the VAD model is unavailable.
-    let vad_model = vad_model_path.and_then(Path::to_str);
-    if let Some(vad_model) = vad_model {
-        parameters.set_vad_model_path(Some(vad_model));
-        parameters.set_vad_params(whisper_rs::WhisperVadParams::new());
-        parameters.enable_vad(true);
-    }
     let vocabulary = custom_words
         .iter()
         .map(|word| word.trim())
@@ -283,6 +338,43 @@ fn clean_transcription_segment(segment: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::clean_transcription_segment;
+
+    /// Reproduces the silence-hallucination report ("Thanks for watching!")
+    /// against the real local models. Run manually:
+    ///   cargo test hallucination -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn noise_only_audio_produces_no_text() {
+        let home = std::env::var("HOME").expect("HOME is set");
+        let models = std::path::PathBuf::from(home).join(".local/share/voxide/models");
+        let model = models.join("ggml-small.bin");
+        let vad = models.join("ggml-silero-v5.1.2.bin");
+        assert!(model.is_file(), "whisper model missing: {model:?}");
+        assert!(vad.is_file(), "vad model missing: {vad:?}");
+        // 4 seconds of quiet noise with a couple of louder "breath" bursts.
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as f64 / u64::MAX as f64) as f32 - 0.5
+        };
+        let samples: Vec<f32> = (0..64_000)
+            .map(|index| {
+                let burst = matches!(index, 16_000..=19_200 | 40_000..=44_800);
+                random() * if burst { 0.06 } else { 0.008 }
+            })
+            .collect();
+        let with_vad =
+            super::transcribe_whisper(samples.clone(), &model, Some(&vad), "en", &[]);
+        let without_vad = super::transcribe_whisper(samples, &model, None, "en", &[]);
+        println!("with vad: {with_vad:?}");
+        println!("without vad: {without_vad:?}");
+        assert!(
+            with_vad.is_err() || with_vad.as_deref().unwrap_or("").trim().is_empty(),
+            "noise-only audio transcribed as {with_vad:?}"
+        );
+    }
 
     #[test]
     fn drops_pure_noise_annotations() {
