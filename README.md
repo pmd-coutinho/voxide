@@ -41,6 +41,17 @@ npm exec tauri build -- --no-bundle   # standalone release binary
 
 `npm run build` builds and type-checks the frontend only; `cargo test` (in `src-tauri/`) runs the backend test suite. Neither validates audio or desktop integration — launch the app natively for that.
 
+### GPU transcription (optional)
+
+Local Whisper transcription runs on the CPU by default. whisper.cpp's GPU backends are exposed as cargo features:
+
+- **`vulkan`** — any GPU vendor. Build-time deps (Fedora names): `vulkan-headers`, `vulkan-loader-devel`, `glslc`.
+- **`cuda`** — NVIDIA only, needs the CUDA toolkit at build time.
+
+```sh
+npm exec tauri build -- --no-bundle --features vulkan
+```
+
 ## Global shortcuts on Wayland
 
 X11-style key grabs cannot observe keys in native Wayland windows, so Voxide binds global shortcuts through the XDG Desktop Portal (`org.freedesktop.portal.GlobalShortcuts`). That requires:

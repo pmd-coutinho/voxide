@@ -15,6 +15,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "voxide"
 path = "src/main.rs"
 
+[features]
+default = []
+# GPU transcription backends for whisper.cpp. Vulkan works on any GPU vendor
+# and needs vulkan-headers, vulkan-loader-devel, and glslc at build time;
+# CUDA needs the NVIDIA CUDA toolkit.
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
+
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
