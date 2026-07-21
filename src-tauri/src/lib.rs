@@ -6627,6 +6627,31 @@ pub fn run() {
                         local_api::start(&control, handle.clone(), settings.local_api_port).await;
                 }
             });
+            let preload_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                // Warm the Whisper model cache so the first dictation does not
+                // pay the model-load latency.
+                let state = preload_handle.state::<AppState>();
+                let Ok(settings) = state
+                    .database
+                    .lock()
+                    .map(|database| database.settings.clone())
+                else {
+                    return;
+                };
+                if !matches!(settings.selected_voice_engine, VoiceEngine::Whisper) {
+                    return;
+                }
+                match whisper_model_path(&settings, &state) {
+                    Ok(path) if path.is_file() => match speech::preload_whisper(&path) {
+                        Ok(()) => debug_log::append("Whisper model preloaded"),
+                        Err(error) => {
+                            debug_log::append(&format!("Whisper preload failed: {error}"))
+                        }
+                    },
+                    _ => {}
+                }
+            });
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Defer the first check so startup remains responsive, then mirror the reference

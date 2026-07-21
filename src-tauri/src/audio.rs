@@ -47,6 +47,27 @@ impl AudioCapture {
         requested_device: Option<&str>,
         on_level: Option<LevelCallback>,
     ) -> Result<Self, String> {
+        // Microphones differ wildly in raw gain (built-in DMIC arrays are far
+        // quieter than headset mics), so a fixed scale leaves quiet inputs
+        // showing a flat level meter. Track the session's noise floor and a
+        // slowly-decaying speech peak, and report where the current RMS sits
+        // between them: silence stays near zero and speech reaches the top on
+        // any microphone.
+        let on_level: Option<LevelCallback> = on_level.map(|callback| {
+            let tracker = Mutex::new((0.02f32, 0.002f32));
+            Arc::new(move |rms: f32| {
+                let level = {
+                    let Ok(mut tracker) = tracker.lock() else {
+                        return;
+                    };
+                    let (peak, floor) = &mut *tracker;
+                    *floor = (*floor * 1.01 + 1e-5).min(rms).max(1e-4);
+                    *peak = (*peak * 0.995).max(rms).max(*floor * 3.0);
+                    ((rms - *floor) / (*peak - *floor).max(1e-4)).clamp(0.0, 1.0)
+                };
+                callback(level);
+            }) as LevelCallback
+        });
         let host = cpal::default_host();
         let requested = requested_device.filter(|name| !name.trim().is_empty());
         #[cfg(target_os = "linux")]
@@ -318,7 +339,7 @@ fn append_samples<T>(
             .sum::<f32>()
             / data.len().max(1) as f32)
             .sqrt();
-        on_level((rms * 4.0).clamp(0.0, 1.0));
+        on_level(rms);
     }
     if let Ok(mut samples) = destination.try_lock() {
         samples.extend(data.iter().copied().map(f32::from_sample));
