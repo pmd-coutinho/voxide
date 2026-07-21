@@ -180,16 +180,23 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     Ok(context)
 }
 
-/// Amplifies quiet recordings to a healthy peak. Applied before VAD and
-/// decoding; capped so near-silence is not blown up into full-scale noise.
+/// Amplifies quiet recordings to a healthy level for voice-activity
+/// detection. Gain is derived from a high percentile of the magnitudes, not
+/// the absolute peak, so a single click or plosive pop cannot veto the boost
+/// that quiet speech needs; capped so near-silence is not blown up into
+/// full-scale noise.
 fn normalize_peak(samples: &mut [f32]) {
-    let peak = samples
-        .iter()
-        .fold(0.0f32, |maximum, sample| maximum.max(sample.abs()));
-    if peak > 1e-4 && peak < 0.5 {
-        let gain = (0.9 / peak).min(30.0);
+    if samples.is_empty() {
+        return;
+    }
+    let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
+    let index = (magnitudes.len() - 1).saturating_mul(995) / 1000;
+    magnitudes.select_nth_unstable_by(index, |a, b| a.total_cmp(b));
+    let reference = magnitudes[index];
+    if reference > 1e-4 && reference < 0.9 {
+        let gain = (0.9 / reference).clamp(1.0, 40.0);
         for sample in samples.iter_mut() {
-            *sample *= gain;
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
         }
     }
 }
@@ -217,8 +224,12 @@ fn detect_speech_bounds(probe: &[f32], vad_model_path: &Path) -> Option<SpeechBo
     let mut vad = WhisperVadContext::new(model, context_params).ok()?;
     // whisper.cpp's VAD defaults split on 100 ms of silence; dictation wants
     // faster-whisper's tuning, where an utterance with natural pauses reads
-    // as one padded stretch of speech.
+    // as one padded stretch of speech. As a pure gate the params are biased
+    // toward acceptance: a false accept just decodes audio that downstream
+    // filters still guard, while a false reject eats the user's dictation.
     let mut vad_params = WhisperVadParams::new();
+    vad_params.set_threshold(0.35);
+    vad_params.set_min_speech_duration(150);
     vad_params.set_min_silence_duration(2_000);
     vad_params.set_speech_pad(400);
     let segments = vad.segments_from_samples(vad_params, probe).ok()?;

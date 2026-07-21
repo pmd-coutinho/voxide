@@ -1159,7 +1159,7 @@ async function saveSettings(): Promise<void> {
   database.settings = await invoke<Settings>("save_settings", { settings: database.settings });
 }
 
-async function startRecording(promptProfileId?: string): Promise<void> {
+async function startRecording(promptProfileId?: string, fromAppUi = false): Promise<void> {
   if (recording) return;
   const isPromptTest = promptTestState.active
     && !dictationInstructionTarget
@@ -1167,7 +1167,13 @@ async function startRecording(promptProfileId?: string): Promise<void> {
     && Boolean(promptTestState.profileId);
   const capturePromptProfileId = promptProfileId ?? (isPromptTest ? promptTestState.profileId : undefined);
   liveText = "";
-  const hideFocusedMainWindow = !isOverlayWindow && !isPromptTest && await currentWindow.isFocused().catch(() => false);
+  // Only a dictation started from the app's own UI hides the window (so the
+  // text lands in the previously focused application) and restores it
+  // afterwards. Hotkey- and tray-initiated dictations must never move the
+  // user's focus — GTK's focus report is unreliable on Wayland, so it is not
+  // consulted for those.
+  const hideFocusedMainWindow = fromAppUi && !isOverlayWindow && !isPromptTest
+    && await currentWindow.isFocused().catch(() => false);
   if (hideFocusedMainWindow) {
     await currentWindow.hide();
     // Let the OS restore the previously focused application before native
@@ -1285,8 +1291,8 @@ async function stopRecording(): Promise<void> {
   if (completedWithText && completedTarget === "command") await planCommand();
 }
 
-async function toggleRecording(): Promise<void> {
-  if (recording) await stopRecording(); else await startRecording();
+async function toggleRecording(fromAppUi = false): Promise<void> {
+  if (recording) await stopRecording(); else await startRecording(undefined, fromAppUi);
 }
 
 async function handleAutomaticDictationHotkey(
@@ -1683,7 +1689,7 @@ async function insertRewrite(): Promise<void> {
 async function dictateModeInstruction(mode: "command" | "rewrite"): Promise<void> {
   if (recording) return;
   dictationInstructionTarget = mode;
-  await startRecording();
+  await startRecording(undefined, true);
   if (recording) showNotice("Speak the instruction, then stop dictation.");
 }
 
@@ -2284,7 +2290,7 @@ async function presentAvailableUpdate(update: UpdateCheckResult, canSnooze: bool
 
 async function handleAction(element: HTMLElement): Promise<void> {
   switch (element.dataset.action) {
-    case "toggle-recording": await toggleRecording(); break;
+    case "toggle-recording": await toggleRecording(true); break;
     case "onboarding-voice":
       database.settings = await invoke<Settings>("set_onboarding_step", { step: 1 });
       currentView = "voice";
@@ -2301,7 +2307,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
       render();
       break;
     case "request-mic":
-      await startRecording();
+      await startRecording(undefined, true);
       if (recording) {
         database.settings = await invoke<Settings>("set_onboarding_step", { step: 2 });
         showNotice("Native microphone capture is active. Speak a short phrase, then stop dictation.");
