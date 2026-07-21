@@ -20,7 +20,12 @@ default = []
 # GPU transcription backends for whisper.cpp. Vulkan works on any GPU vendor
 # and needs vulkan-headers, vulkan-loader-devel, and glslc at build time;
 # CUDA needs the NVIDIA CUDA toolkit.
-vulkan = ["whisper-rs/vulkan"]
+#
+# The vulkan feature targets whisper-rs-sys directly: it compiles GGML's
+# Vulkan backend (which whisper.cpp selects automatically at runtime) while
+# skipping whisper-rs 0.16's `vulkan` helper module, which does not compile
+# against the whisper.cpp version its own sys crate bundles.
+vulkan = ["whisper-rs-sys/vulkan"]
 cuda = ["whisper-rs/cuda"]
 
 [build-dependencies]
@@ -54,6 +59,7 @@ thiserror = "2.0.17"
 tokio = { version = "1.53.0", features = ["fs", "io-util", "net", "process", "sync", "time"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 whisper-rs = "0.16.0"
+whisper-rs-sys = "0.15.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,4 +1,6 @@
 use std::{
+    ffi::CStr,
+    os::raw::c_int,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -88,6 +90,52 @@ pub fn transcribe_media_file(
     Ok((text, duration_ms))
 }
 
+/// whisper.cpp's `gpu_device` parameter selects the N-th GPU-type device in
+/// ggml's registry order, and hybrid laptops enumerate the integrated GPU
+/// before the discrete one. Prefer a discrete GPU when both are present,
+/// avoid software rasterizers, and let VOXIDE_GPU_DEVICE override the pick.
+/// Returns None when no GPU backend is compiled in or no device exists.
+fn preferred_gpu_device() -> Option<c_int> {
+    if let Some(index) = std::env::var("VOXIDE_GPU_DEVICE")
+        .ok()
+        .and_then(|value| value.trim().parse::<c_int>().ok())
+    {
+        return Some(index);
+    }
+    let mut best: Option<(i32, c_int)> = None;
+    let mut gpu_index: c_int = 0;
+    unsafe {
+        for device_index in 0..whisper_rs_sys::ggml_backend_dev_count() {
+            let device = whisper_rs_sys::ggml_backend_dev_get(device_index);
+            let device_type = whisper_rs_sys::ggml_backend_dev_type(device);
+            let discrete = device_type
+                == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU;
+            let integrated = device_type
+                == whisper_rs_sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU;
+            if !discrete && !integrated {
+                continue;
+            }
+            let description = CStr::from_ptr(whisper_rs_sys::ggml_backend_dev_description(device))
+                .to_string_lossy()
+                .to_lowercase();
+            let software =
+                description.contains("llvmpipe") || description.contains("swiftshader");
+            let score = if software {
+                -1
+            } else if discrete {
+                2
+            } else {
+                1
+            };
+            if best.map_or(true, |(best_score, _)| score > best_score) {
+                best = Some((score, gpu_index));
+            }
+            gpu_index += 1;
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
 fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     if !model_path.is_file() {
         return Err(format!(
@@ -104,8 +152,17 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
             return Ok(Arc::clone(context));
         }
     }
+    // Ask for GPU inference unconditionally: builds without a GPU backend
+    // (or machines without a usable device) fall back to CPU inside
+    // whisper.cpp. whisper-rs only defaults this on for its own GPU
+    // features, which the vulkan build bypasses (see Cargo.toml).
+    let mut parameters = WhisperContextParameters::default();
+    parameters.use_gpu(true);
+    if let Some(device) = preferred_gpu_device() {
+        parameters.gpu_device(device);
+    }
     let context = Arc::new(
-        WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        WhisperContext::new_with_params(model_path, parameters)
             .map_err(|error| format!("Could not load Whisper model: {error}"))?,
     );
     *cached = Some((model_path.to_path_buf(), Arc::clone(&context)));
