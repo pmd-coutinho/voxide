@@ -1806,15 +1806,27 @@ function showNotice(message: string): void {
 
 function renderOverlay(update: OverlayUpdate, audioLevel = 0): void {
   const status = update.state === "recording" ? "Listening" : update.state === "processing" ? "Processing" : "Complete";
-  const waveform = Array.from({ length: 16 }, (_, index) => {
+  // Mutate the existing nodes instead of rebuilding the subtree: this runs
+  // at audio-level rate while recording, and WebKitGTK never paints frames
+  // for a subtree that is replaced wholesale on every update.
+  let root = appRoot.querySelector<HTMLElement>(".overlay-root");
+  if (!root) {
+    appRoot.innerHTML = `<main class="overlay-root">
+      <div class="overlay-waveform" aria-hidden="true">${"<i></i>".repeat(16)}</div>
+      <div class="overlay-copy"><span></span><strong></strong></div>
+    </main>`;
+    root = appRoot.querySelector<HTMLElement>(".overlay-root");
+    if (!root) return;
+  }
+  root.dataset.state = update.state;
+  root.querySelectorAll<HTMLElement>(".overlay-waveform i").forEach((bar, index) => {
     const variation = 0.25 + ((index * 17) % 7) / 12;
-    const height = Math.max(5, Math.round((audioLevel * 42 + 7) * variation));
-    return `<i style="height:${height}px"></i>`;
-  }).join("");
-  appRoot.innerHTML = `<main class="overlay-root" data-state="${update.state}">
-    <div class="overlay-waveform" aria-hidden="true">${waveform}</div>
-    <div class="overlay-copy"><span>${escapeHtml(status)} · ${escapeHtml(update.mode)}</span><strong>${escapeHtml(update.text || "Listening…")}</strong></div>
-  </main>`;
+    bar.style.height = `${Math.max(5, Math.round((audioLevel * 42 + 7) * variation))}px`;
+  });
+  const copyLabel = root.querySelector<HTMLElement>(".overlay-copy span");
+  if (copyLabel) copyLabel.textContent = `${status} · ${update.mode}`;
+  const copyText = root.querySelector<HTMLElement>(".overlay-copy strong");
+  if (copyText) copyText.textContent = update.text || "Listening…";
 }
 
 let lastOverlayContentHeight = 0;
@@ -1846,7 +1858,12 @@ async function initializeOverlay(): Promise<void> {
     await currentWindow.show();
   });
   await listen<number>("dictation-audio-level", (event) => {
-    audioLevel = event.payload;
+    // Shape the normalized level for display: the exponent keeps small
+    // noises low while speech still peaks, and the asymmetric envelope
+    // rises quickly but falls smoothly so the bars read as a voice, not
+    // as flicker.
+    const shaped = Math.pow(Math.max(0, Math.min(1, event.payload)), 1.6);
+    audioLevel += (shaped - audioLevel) * (shaped > audioLevel ? 0.5 : 0.22);
     if (update.state === "recording") renderOverlay(update, audioLevel);
   });
 }
