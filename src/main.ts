@@ -164,6 +164,14 @@ interface PromptTestState {
   error?: string;
 }
 
+interface EngineTestState {
+  active: boolean;
+  processing: boolean;
+  rawText: string;
+  outputText: string;
+  error?: string;
+}
+
 interface AppPromptBinding {
   id: string;
   application: string;
@@ -512,9 +520,19 @@ let promptTestState: PromptTestState = {
   rawText: "",
   outputText: "",
 };
+let engineTestState: EngineTestState = {
+  active: false,
+  processing: false,
+  rawText: "",
+  outputText: "",
+};
 
 function resetPromptTestState(): void {
   promptTestState = { active: false, draftPrompt: "", processing: false, rawText: "", outputText: "" };
+}
+
+function resetEngineTestState(): void {
+  engineTestState = { active: false, processing: false, rawText: "", outputText: "" };
 }
 
 function canRunDictationPromptTest(promptProfileId?: string): boolean {
@@ -788,6 +806,18 @@ function renderVoiceEngine(): void {
   const storageAction = isParakeet || isNemotron
     ? `<button data-action="open-voice-engine-storage">Open component storage</button>`
     : "";
+  const engineTestAction = selectedEngineAvailable && modelStatus?.installed
+    ? `<button data-action="start-engine-test" ${engineTestState.active ? "disabled" : ""}>${engineTestState.active ? "Engine test active" : "Test engine"}</button>`
+    : "";
+  const engineTest = engineTestState.active
+    ? `<section class="setting-subsection"><div class="card-title"><div><h3>Engine self-test</h3><p>Record a short phrase to test the saved ${escapeHtml(selectedEngineDescriptor?.label ?? "voice engine")} configuration. Results stay on this screen and are never typed, copied, saved to history or audio retention, or counted in analytics.</p></div><button data-action="stop-engine-test" ${recording ? "disabled" : ""}>Close test</button></div>
+      <div class="button-row"><button class="primary" data-action="toggle-recording">${recording ? "Stop engine test" : "Start engine test"}</button></div>
+      ${engineTestState.processing ? `<p class="muted">Transcribing with the selected engine…</p>` : ""}
+      ${engineTestState.error ? `<p class="history-warning">${escapeHtml(engineTestState.error)}</p>` : ""}
+      <label>Raw transcription<textarea rows="4" readonly>${escapeHtml(engineTestState.rawText)}</textarea></label>
+      <label>Cleaned result<textarea rows="6" readonly>${escapeHtml(engineTestState.outputText)}</textarea></label>
+    </section>`
+    : "";
   const engineCapabilities = (engine: VoiceEngineDescriptor): string => {
     const preview = engine.previewMode === "incremental"
       ? "Live streaming preview"
@@ -806,9 +836,10 @@ function renderVoiceEngine(): void {
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
       ${isParakeet || isNemotron ? "" : microphoneInput}
-      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}${verificationAction}${storageAction}</div>
+      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}${verificationAction}${storageAction}${engineTestAction}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
+      ${engineTest}
     </section>`);
 }
 
@@ -1244,6 +1275,10 @@ async function startRecording(promptProfileId?: string, fromAppUi = false): Prom
     && !dictationInstructionTarget
     && !promptProfileId
     && Boolean(promptTestState.profileId);
+  const isEngineTest = engineTestState.active
+    && currentView === "voice"
+    && !dictationInstructionTarget
+    && !promptProfileId;
   const capturePromptProfileId = promptProfileId ?? (isPromptTest ? promptTestState.profileId : undefined);
   liveText = "";
   // Only a dictation started from the app's own UI hides the window (so the
@@ -1251,7 +1286,7 @@ async function startRecording(promptProfileId?: string, fromAppUi = false): Prom
   // afterwards. Hotkey- and tray-initiated dictations must never move the
   // user's focus — GTK's focus report is unreliable on Wayland, so it is not
   // consulted for those.
-  const hideFocusedMainWindow = fromAppUi && !isOverlayWindow && !isPromptTest
+  const hideFocusedMainWindow = fromAppUi && !isOverlayWindow && !isPromptTest && !isEngineTest
     && await currentWindow.isFocused().catch(() => false);
   if (hideFocusedMainWindow) {
     await currentWindow.hide();
@@ -1287,11 +1322,18 @@ async function stopRecording(): Promise<void> {
   recording = false;
   const completedTarget = dictationInstructionTarget;
   const isPromptTest = promptTestState.active && !completedTarget && !dictationPromptProfileId;
+  const isEngineTest = engineTestState.active && currentView === "voice" && !completedTarget && !dictationPromptProfileId;
   if (isPromptTest) {
     promptTestState.processing = true;
     promptTestState.error = undefined;
     promptTestState.outputText = "";
     if (currentView === "enhancement") render();
+  }
+  if (isEngineTest) {
+    engineTestState.processing = true;
+    engineTestState.error = undefined;
+    engineTestState.outputText = "";
+    render();
   }
   let completedWithText = false;
   void playTranscriptionCue("stop");
@@ -1301,6 +1343,7 @@ async function stopRecording(): Promise<void> {
       instructionMode: dictationInstructionTarget,
       promptTestMode: isPromptTest,
       promptTestPrompt: isPromptTest ? promptTestState.draftPrompt : undefined,
+      engineTestMode: isEngineTest,
     });
     const hasTranscription = result.text.trim().length > 0;
     if (isPromptTest) {
@@ -1313,6 +1356,11 @@ async function stopRecording(): Promise<void> {
       } else {
         promptTestState.outputText = result.text;
       }
+    } else if (isEngineTest) {
+      liveText = result.rawText;
+      engineTestState.rawText = result.rawText;
+      engineTestState.processing = false;
+      engineTestState.outputText = result.text;
     } else if (hasTranscription && database.settings.saveTranscriptionHistory) {
       liveText = result.text;
       completedWithText = hasTranscription;
@@ -1334,19 +1382,19 @@ async function stopRecording(): Promise<void> {
       liveText = result.text;
       completedWithText = hasTranscription;
     }
-    if (!isPromptTest && hasTranscription && database.settings.copyToClipboard) {
+    if (!isPromptTest && !isEngineTest && hasTranscription && database.settings.copyToClipboard) {
       try {
         await invoke("copy_completed_dictation", { text: liveText });
       } catch (error) {
         showNotice(`Dictation completed, but could not copy it: ${String(error)}`);
       }
     }
-    if (!isPromptTest && hasTranscription) await refreshStats();
-    if (!isPromptTest && hasTranscription && completedTarget === "rewrite") {
+    if (!isPromptTest && !isEngineTest && hasTranscription) await refreshStats();
+    if (!isPromptTest && !isEngineTest && hasTranscription && completedTarget === "rewrite") {
       rewriteState.draft = result.text;
       rewriteState.sourceApplication = result.sourceApplication ?? pendingDictationContext.sourceApplication;
       currentView = "rewrite";
-    } else if (!isPromptTest && hasTranscription && completedTarget === "command") {
+    } else if (!isPromptTest && !isEngineTest && hasTranscription && completedTarget === "command") {
       commandState.draft = result.text;
       commandState.sourceApplication = result.sourceApplication ?? pendingDictationContext.sourceApplication;
       currentView = "command";
@@ -1355,6 +1403,9 @@ async function stopRecording(): Promise<void> {
     if (isPromptTest) {
       promptTestState.processing = false;
       promptTestState.error = String(error);
+    } else if (isEngineTest) {
+      engineTestState.processing = false;
+      engineTestState.error = String(error);
     } else {
       showNotice(`Dictation could not be transcribed: ${String(error)}`);
     }
@@ -1968,6 +2019,13 @@ function bindCommonEvents(): void {
         return;
       }
       resetPromptTestState();
+    }
+    if (engineTestState.active && nextView !== "voice") {
+      if (recording) {
+        showNotice("Stop the engine self-test recording before leaving Voice Engine.");
+        return;
+      }
+      resetEngineTestState();
     }
     currentView = nextView;
     if (currentView === "dictionary") {
@@ -2731,6 +2789,16 @@ async function handleAction(element: HTMLElement): Promise<void> {
       render();
       break;
     }
+    case "start-engine-test":
+      engineTestState = { active: true, processing: false, rawText: "", outputText: "" };
+      render();
+      break;
+    case "stop-engine-test":
+      if (!recording) {
+        resetEngineTestState();
+        render();
+      }
+      break;
     case "stop-prompt-test":
       if (!recording) {
         resetPromptTestState();

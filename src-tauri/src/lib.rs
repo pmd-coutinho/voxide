@@ -7932,6 +7932,13 @@ async fn finish_nemotron_live(
     result
 }
 
+/// Prompt and engine tests must not deliver or retain ordinary dictation.
+/// Keeping this policy in the backend prevents a frontend mode regression from
+/// typing, saving, or counting a test recording.
+fn is_isolated_dictation_test(prompt_test: bool, engine_test: bool) -> bool {
+    prompt_test || engine_test
+}
+
 #[tauri::command]
 async fn stop_native_dictation(
     app: AppHandle,
@@ -7941,6 +7948,7 @@ async fn stop_native_dictation(
     instruction_mode: Option<DictationMode>,
     prompt_test_mode: Option<bool>,
     prompt_test_prompt: Option<String>,
+    engine_test_mode: Option<bool>,
 ) -> Result<NativeTranscriptionResult, String> {
     let recording_generation = capture_state
         .preview_generation
@@ -8021,11 +8029,13 @@ async fn stop_native_dictation(
         .filter(|prompt| !prompt.is_empty())
         .map(str::to_owned);
     let is_prompt_test = prompt_test_mode.unwrap_or(false);
+    let is_engine_test = engine_test_mode.unwrap_or(false);
+    let is_isolated_test = is_isolated_dictation_test(is_prompt_test, is_engine_test);
     let _overlay_cleanup = OverlayHideOnDrop(app.clone());
     if settings.enable_streaming_preview {
         emit_overlay(&app, "processing", "Transcribing…");
     }
-    let should_save_audio_history = !is_prompt_test
+    let should_save_audio_history = !is_isolated_test
         && settings.save_transcription_history
         && settings.audio_history_enabled
         && settings.audio_history_budget_gb > 0.0;
@@ -8072,10 +8082,11 @@ async fn stop_native_dictation(
         DictationCleanupStyle::Standard
     };
     let post_processing_started = Instant::now();
-    let post_processing = if matches!(
-        instruction_mode,
-        Some(DictationMode::Command | DictationMode::Rewrite)
-    ) {
+    let post_processing = if is_engine_test
+        || matches!(
+            instruction_mode,
+            Some(DictationMode::Command | DictationMode::Rewrite)
+        ) {
         PostProcessOutcome {
             text: deterministic_dictation_cleanup(&state, &raw_text, cleanup_style)?,
             ai_fallback_error: None,
@@ -8121,13 +8132,13 @@ async fn stop_native_dictation(
         )
         .await?
     };
-    if !is_prompt_test && settings.notify_ai_processing_failures {
+    if !is_isolated_test && settings.notify_ai_processing_failures {
         if let Some(error) = post_processing.ai_fallback_error.as_deref() {
             notify_ai_fallback(&app, error);
         }
     }
     let mut text = post_processing.text;
-    if instruction_mode.is_none() && !is_prompt_test {
+    if instruction_mode.is_none() && !is_isolated_test {
         text = formatting::apply_continuous_dictation_formatting(
             &text,
             &context.preceding_text,
@@ -8151,7 +8162,7 @@ async fn stop_native_dictation(
     }
     let insertion_started = Instant::now();
     let inserted_into_active_application =
-        if !is_prompt_test && settings.type_into_active_application {
+        if !is_isolated_test && settings.type_into_active_application {
             typing::type_into_active_application(&text, settings.text_insertion_mode)?;
             true
         } else {
@@ -8202,7 +8213,7 @@ async fn stop_native_dictation(
         _ => "dictation",
     };
     let analytics = app.state::<analytics::AnalyticsService>();
-    if !is_prompt_test {
+    if !is_isolated_test {
         analytics.capture(
             "dictation_post_processing_completed",
             settings.share_anonymous_analytics,
@@ -8248,7 +8259,7 @@ async fn stop_native_dictation(
     } else {
         "history_only"
     };
-    if !is_prompt_test {
+    if !is_isolated_test {
         let timings = whisper_timings.unwrap_or_default();
         let decode_ms = if matches!(settings.selected_voice_engine, VoiceEngine::Whisper) {
             timings.decode_ms
@@ -9422,6 +9433,14 @@ mod tests {
             database.settings.selected_voice_engine,
             VoiceEngine::Whisper
         ));
+    }
+
+    #[test]
+    fn engine_self_test_suppresses_ordinary_dictation_side_effects() {
+        assert!(is_isolated_dictation_test(false, true));
+        assert!(is_isolated_dictation_test(true, false));
+        assert!(is_isolated_dictation_test(true, true));
+        assert!(!is_isolated_dictation_test(false, false));
     }
 
     #[test]

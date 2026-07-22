@@ -550,7 +550,10 @@ endpoints remain intentionally keyless.
 - Perform startup preload only for installed, selected, stable engines and only
   when resource policy permits.
 - Expose `unloaded`, `loading`, `ready`, `degraded`, and `failed` states.
-- Include a manual engine self-test in Settings.
+- [x] Include a manual engine self-test in Settings. It records a short phrase
+  against the saved engine configuration and displays raw/cleaned output in
+  place; test captures cannot type, copy, persist history or audio, or emit
+  ordinary dictation analytics.
 - On memory pressure, evict experimental or inactive engines before the selected
   stable engine.
 
