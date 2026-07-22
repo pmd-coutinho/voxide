@@ -1418,9 +1418,11 @@ without downloading a multi-hundred-megabyte test asset in general CI.
 Local RTX 4080 evidence (CUDA 13.3 compiler, 2026-07-22): the CUDA feature
 suite passed 172 tests with five intentionally unrelated ignored tests, and
 both targeted Parakeet CUDA inference fixtures passed against the pinned local
-model. The optimized `cargo +1.89 build --release --features cuda` also
-completed successfully. The guarded runner still needs to publish the
-equivalent CI result.
+model. The optimized `cargo +1.89 build --release --features cuda` completed,
+but that direct command does not enable Tauri's production asset protocol and
+therefore produces a binary that tries to reach the Vite dev server. Runnable
+release checks now include `custom-protocol`; the guarded runner still needs
+to publish the equivalent CI result.
 
 Only after this deliverable is verified should the engine lifecycle refactor or
 Parakeet Flash experiment become the active implementation focus.

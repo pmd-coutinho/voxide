@@ -55,7 +55,7 @@ jobs:
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
       - name: Compile portable Rust target
         working-directory: src-tauri
-        run: cargo +1.89 build --release --no-default-features
+        run: cargo +1.89 build --release --no-default-features --features custom-protocol
 
   rust-macos:
     name: Rust portable checks (macOS)
@@ -75,7 +75,7 @@ jobs:
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
       - name: Compile portable Rust target
         working-directory: src-tauri
-        run: cargo +1.89 build --release --no-default-features
+        run: cargo +1.89 build --release --no-default-features --features custom-protocol
 
   rust-windows:
     name: Rust portable checks (Windows)
@@ -95,7 +95,7 @@ jobs:
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
       - name: Compile portable Rust target
         working-directory: src-tauri
-        run: cargo +1.89 build --release --no-default-features
+        run: cargo +1.89 build --release --no-default-features --features custom-protocol
 
   cuda-linux-nvidia:
     name: CUDA build checks (Linux/NVIDIA)
@@ -149,4 +149,4 @@ jobs:
         run: cargo +1.89 clippy --lib --features cuda -- -D warnings
       - name: Build CUDA release target
         working-directory: src-tauri
-        run: cargo +1.89 build --release --features cuda
+        run: cargo +1.89 build --release --features cuda,custom-protocol

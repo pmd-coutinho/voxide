@@ -55,7 +55,7 @@ npm exec tauri dev          # run the app for development
 npm exec tauri build -- --no-bundle   # standalone release binary
 ```
 
-> **Note:** a plain `cargo build --release` produces a binary that tries to load the UI from the Vite dev server and shows a connection error — Tauri's `custom-protocol` feature is only enabled by the CLI build. Always build runnable binaries with `npm exec tauri build`.
+> **Note:** a plain `cargo build --release` produces a binary that tries to load the UI from the Vite dev server and shows a connection error. Build runnable binaries with `npm exec tauri build`, or explicitly pass `--features custom-protocol` to Cargo.
 
 `npm run build` builds and type-checks the frontend only; `cargo test` (in `src-tauri/`) runs the backend test suite. Neither validates audio or desktop integration — launch the app natively for that.
 

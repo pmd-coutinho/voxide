@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Enables Tauri's production asset protocol. `tauri build` turns this on
+# automatically, but keeping it explicit makes a direct Cargo release build
+# opt-in and prevents a runnable binary from silently using `devUrl`.
+custom-protocol = ["tauri/custom-protocol"]
 # GPU transcription backends for whisper.cpp. Vulkan works on any GPU vendor
 # and needs vulkan-headers, vulkan-loader-devel, and glslc at build time;
 # CUDA needs the NVIDIA CUDA toolkit.

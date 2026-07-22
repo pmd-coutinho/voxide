@@ -189,7 +189,7 @@ Add stage timing so every later change is measured, not guessed.
 ### Phase 1 — CUDA backend
 
 1. Stage the redist toolkit (section 2) and verify `nvcc --version` runs.
-2. `cargo build --release --features cuda` first (fast fail on nvcc issues),
+2. `cargo build --release --features cuda,custom-protocol` first (fast fail on nvcc issues),
    then the full `npm exec tauri build -- --no-bundle --features cuda`.
 3. Verify via Phase 0 logs: active device = RTX 4080; decode timings on the
    bench WAV: CPU/Vulkan build vs CUDA build vs `dictate.sh` on the same audio.
@@ -307,7 +307,7 @@ Environment notes specific to this machine:
   Voice Engine screen now exposes Auto/Greedy/Beam 2/Beam 5 and q5/q8
   large-v3-turbo downloads.
 - 2026-07-21: Phase 1 verified with the venv-backed CUDA 13.3.1 toolkit.
-  `cargo build --release --features cuda` and `npm exec tauri build --
+  `cargo build --release --features cuda,custom-protocol` and `npm exec tauri build --
   --no-bundle --features cuda` pass. The binary has an sm_89 `libggml-cuda.a`,
   RUNPATH to the user-local toolkit, and resolves cuBLAS/cuDART. On the RTX
   4080 Laptop, `decode_bench` on an 8.0 s espeak WAV using large-v3-turbo
