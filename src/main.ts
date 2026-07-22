@@ -781,10 +781,20 @@ function renderVoiceEngine(): void {
           ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
           : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`)
     : "";
+  const engineCapabilities = (engine: VoiceEngineDescriptor): string => {
+    const preview = engine.previewMode === "incremental"
+      ? "Live streaming preview"
+      : "Snapshot preview";
+    const features = [preview, engine.supportsFiles ? "File transcription" : "Live dictation only"];
+    if (engine.supportsVocabulary) features.push("Custom vocabulary");
+    if (engine.supportsTranslation) features.push("Translation");
+    if (engine.requiresCuda) features.push("NVIDIA CUDA");
+    return features.join(" · ");
+  };
   renderShell(`
     ${pageTitle("Voice Engine", "Choose the transcription runtime used for dictation.")}
     <section class="card"><div class="engine-grid">${engines.map((engine) => `
-      <button class="engine-choice ${database.settings.selectedVoiceEngine === engine.id ? "active" : ""}" data-engine="${engine.id}" ${engine.available ? "" : "disabled"}><div class="engine-choice-title"><strong>${engine.label}</strong><b class="engine-maturity ${engine.maturity === "experimental" ? "experimental" : "stable"}">${engine.maturity === "experimental" ? "Experimental" : "Stable"}</b></div><span>${engine.description}</span><em>${engine.available ? (database.settings.selectedVoiceEngine === engine.id ? "Selected" : "Select") : escapeHtml(engine.unavailableReason ?? "Not available")}</em></button>`).join("")}</div></section>
+      <button class="engine-choice ${database.settings.selectedVoiceEngine === engine.id ? "active" : ""}" data-engine="${engine.id}" ${engine.available ? "" : "disabled"}><div class="engine-choice-title"><strong>${engine.label}</strong><b class="engine-maturity ${engine.maturity === "experimental" ? "experimental" : "stable"}">${engine.maturity === "experimental" ? "Experimental" : "Stable"}</b></div><span>${engine.description}</span><small>${escapeHtml(engineCapabilities(engine))}</small><em>${engine.available ? (database.settings.selectedVoiceEngine === engine.id ? "Selected" : "Select") : escapeHtml(engine.unavailableReason ?? "Not available")}</em></button>`).join("")}</div></section>
     <section class="card form-card"><div class="card-title"><h2>Model configuration</h2>${status}</div>
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}

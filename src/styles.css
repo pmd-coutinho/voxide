@@ -228,6 +228,7 @@ input[type="range"] { padding: 0; }
 .engine-maturity.experimental { color: var(--warn-text); background: var(--warn-bg); }
 .engine-choice.active { border-color: var(--patina-bright); background: var(--patina-soft); box-shadow: inset 0 0 0 1px var(--patina-bright); }
 .engine-choice span { color: var(--muted); font-size: 12px; line-height: 1.45; font-weight: 400; }
+.engine-choice small { color: var(--muted); font-family: var(--font-mono); font-size: 10px; line-height: 1.35; }
 .engine-choice em { margin-top: auto; color: var(--patina); font-family: var(--font-mono); font-size: 11px; font-style: normal; letter-spacing: 0.03em; }
 
 .form-card { display: grid; gap: 15px; margin-top: 16px; }
