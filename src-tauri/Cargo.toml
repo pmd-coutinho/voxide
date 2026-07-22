@@ -49,6 +49,7 @@ futures-util = "0.3.31"
 hound = "3.5.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 regex = "1.13.1"
+rtrb = "0.3.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"], optional = true }

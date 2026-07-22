@@ -6769,7 +6769,27 @@ async fn stop_native_dictation(
         .clone();
     update_tray_status(&app, TrayVisualState::Processing);
     let _reset_tray = ResetTrayWhenDropped { app: app.clone() };
-    let captured = capture.finish()?;
+    let (captured, capture_health) = capture.finish_with_health()?;
+    debug_log::append(&format!(
+        "Capture health (session: {recording_generation}, callbacks: {}, input_samples: {}, accepted_samples: {}, dropped_samples: {}, overflow_blocks: {}, ring_high_water_samples: {}, canonical_samples: {}, stream_errors: {})",
+        capture_health.callback_blocks,
+        capture_health.input_samples,
+        capture_health.accepted_samples,
+        capture_health.dropped_samples,
+        capture_health.overflow_blocks,
+        capture_health.ring_high_water_samples,
+        capture_health.canonical_samples,
+        capture_health.stream_errors,
+    ));
+    if capture_health.dropped_samples != 0 {
+        return Err(format!(
+            "Microphone capture overflowed and lost {} samples. Try closing CPU-intensive applications or selecting another input device, then record again.",
+            capture_health.dropped_samples
+        ));
+    }
+    if capture_health.stream_errors != 0 {
+        return Err("The microphone reported a device error while recording. Reconnect or reselect the input device, then record again.".into());
+    }
     let duration_ms = captured.duration_ms;
     let (settings, custom_words) = {
         let database = state

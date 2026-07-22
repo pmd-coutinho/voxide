@@ -1,6 +1,10 @@
 use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use cpal::{
@@ -34,12 +38,77 @@ pub struct CapturedAudio {
     pub duration_ms: u64,
 }
 
+/// Content-free health data for one microphone capture. These counters make a
+/// full raw-ring condition explicit instead of silently losing an input block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaptureHealth {
+    pub callback_blocks: u64,
+    pub input_samples: u64,
+    pub accepted_samples: u64,
+    pub dropped_samples: u64,
+    pub overflow_blocks: u64,
+    pub ring_high_water_samples: usize,
+    pub canonical_samples: u64,
+    pub stream_errors: u64,
+}
+
+const RAW_RING_MINIMUM_SAMPLES: usize = 16_384;
+const RAW_RING_BUFFER_SECONDS: usize = 2;
+const CAPTURE_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(2);
+
+struct CaptureCounters {
+    callback_blocks: AtomicU64,
+    input_samples: AtomicU64,
+    accepted_samples: AtomicU64,
+    dropped_samples: AtomicU64,
+    overflow_blocks: AtomicU64,
+    queued_samples: AtomicUsize,
+    ring_high_water_samples: AtomicUsize,
+    canonical_samples: AtomicU64,
+    stream_errors: AtomicU64,
+}
+
+impl CaptureCounters {
+    fn health(&self) -> CaptureHealth {
+        CaptureHealth {
+            callback_blocks: self.callback_blocks.load(Ordering::Relaxed),
+            input_samples: self.input_samples.load(Ordering::Relaxed),
+            accepted_samples: self.accepted_samples.load(Ordering::Relaxed),
+            dropped_samples: self.dropped_samples.load(Ordering::Relaxed),
+            overflow_blocks: self.overflow_blocks.load(Ordering::Relaxed),
+            ring_high_water_samples: self.ring_high_water_samples.load(Ordering::Relaxed),
+            canonical_samples: self.canonical_samples.load(Ordering::Relaxed),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for CaptureCounters {
+    fn default() -> Self {
+        Self {
+            callback_blocks: AtomicU64::new(0),
+            input_samples: AtomicU64::new(0),
+            accepted_samples: AtomicU64::new(0),
+            dropped_samples: AtomicU64::new(0),
+            overflow_blocks: AtomicU64::new(0),
+            queued_samples: AtomicUsize::new(0),
+            ring_high_water_samples: AtomicUsize::new(0),
+            canonical_samples: AtomicU64::new(0),
+            stream_errors: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct AudioCapture {
-    _stream: Stream,
-    samples: Arc<Mutex<Vec<f32>>>,
-    sample_rate: u32,
-    channels: u16,
-    started_at: Instant,
+    // The callback is the sole ring producer. It performs only sample
+    // conversion, bounded writes, and atomic counter updates.
+    stream: Option<Stream>,
+    canonical_samples: Arc<Mutex<Vec<f32>>>,
+    device_sample_rate: u32,
+    device_channels: u16,
+    stop_worker: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    counters: Arc<CaptureCounters>,
 }
 
 impl AudioCapture {
@@ -47,27 +116,6 @@ impl AudioCapture {
         requested_device: Option<&str>,
         on_level: Option<LevelCallback>,
     ) -> Result<Self, String> {
-        // Microphones differ wildly in raw gain (built-in DMIC arrays are far
-        // quieter than headset mics), so a fixed scale leaves quiet inputs
-        // showing a flat level meter. Track the session's noise floor and a
-        // slowly-decaying speech peak, and report where the current RMS sits
-        // between them: silence stays near zero and speech reaches the top on
-        // any microphone.
-        let on_level: Option<LevelCallback> = on_level.map(|callback| {
-            let tracker = Mutex::new((0.02f32, 0.002f32));
-            Arc::new(move |rms: f32| {
-                let level = {
-                    let Ok(mut tracker) = tracker.lock() else {
-                        return;
-                    };
-                    let (peak, floor) = &mut *tracker;
-                    *floor = (*floor * 1.01 + 1e-5).min(rms).max(1e-4);
-                    *peak = (*peak * 0.995).max(rms).max(*floor * 3.0);
-                    ((rms - *floor) / (*peak - *floor).max(1e-4)).clamp(0.0, 1.0)
-                };
-                callback(level);
-            }) as LevelCallback
-        });
         let host = cpal::default_host();
         let requested = requested_device.filter(|name| !name.trim().is_empty());
         #[cfg(target_os = "linux")]
@@ -94,9 +142,44 @@ impl AudioCapture {
             .map_err(|error| format!("Could not read microphone configuration: {error}"))?;
         let sample_rate = supported_config.sample_rate();
         let channels = supported_config.channels();
-        let samples = Arc::new(Mutex::new(Vec::new()));
-        let callback_samples = Arc::clone(&samples);
-        let error_callback = |error| eprintln!("Voxide audio capture error: {error}");
+        match supported_config.sample_format() {
+            SampleFormat::I8
+            | SampleFormat::I16
+            | SampleFormat::I24
+            | SampleFormat::I32
+            | SampleFormat::I64
+            | SampleFormat::U8
+            | SampleFormat::U16
+            | SampleFormat::U24
+            | SampleFormat::U32
+            | SampleFormat::U64
+            | SampleFormat::F32
+            | SampleFormat::F64 => {}
+            format => {
+                return Err(format!(
+                    "Microphone sample format {format} is not supported by this desktop audio backend"
+                ));
+            }
+        }
+        let ring_capacity = (sample_rate as usize)
+            .saturating_mul(channels.max(1) as usize)
+            .saturating_mul(RAW_RING_BUFFER_SECONDS)
+            .max(RAW_RING_MINIMUM_SAMPLES);
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
+        let canonical_samples = Arc::new(Mutex::new(Vec::new()));
+        let counters = Arc::new(CaptureCounters::default());
+        let stop_worker = Arc::new(AtomicBool::new(false));
+        let worker = spawn_capture_worker(
+            consumer,
+            Arc::clone(&canonical_samples),
+            Arc::clone(&counters),
+            Arc::clone(&stop_worker),
+            sample_rate,
+            channels,
+            on_level,
+        );
+        let callback_counters = Arc::clone(&counters);
+        let error_counters = Arc::clone(&counters);
         let config = supported_config.config();
 
         macro_rules! build_stream {
@@ -104,14 +187,17 @@ impl AudioCapture {
                 device.build_input_stream(
                     &config,
                     move |data: &[$sample], _| {
-                        append_samples(data, &callback_samples, on_level.as_deref())
+                        append_samples(data, &mut producer, &callback_counters)
                     },
-                    error_callback,
+                    move |error| {
+                        error_counters.stream_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("Voxide audio capture error: {error}");
+                    },
                     None,
                 )
             };
         }
-        let stream = match supported_config.sample_format() {
+        let stream_result = match supported_config.sample_format() {
             SampleFormat::I8 => build_stream!(i8),
             SampleFormat::I16 => build_stream!(i16),
             SampleFormat::I24 => build_stream!(I24),
@@ -124,42 +210,50 @@ impl AudioCapture {
             SampleFormat::U64 => build_stream!(u64),
             SampleFormat::F32 => build_stream!(f32),
             SampleFormat::F64 => build_stream!(f64),
-            format => {
-                return Err(format!(
-                "Microphone sample format {format} is not supported by this desktop audio backend"
-            ))
+            _ => unreachable!("sample format was validated before capture worker startup"),
+        };
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                stop_worker.store(true, Ordering::Release);
+                let _ = worker.join();
+                return Err(format!("Could not start microphone capture: {error}"));
             }
+        };
+        if let Err(error) = stream.play() {
+            drop(stream);
+            stop_worker.store(true, Ordering::Release);
+            let _ = worker.join();
+            return Err(format!("Could not activate microphone capture: {error}"));
         }
-        .map_err(|error| format!("Could not start microphone capture: {error}"))?;
-
-        stream
-            .play()
-            .map_err(|error| format!("Could not activate microphone capture: {error}"))?;
         Ok(Self {
-            _stream: stream,
-            samples,
-            sample_rate,
-            channels,
-            started_at: Instant::now(),
+            stream: Some(stream),
+            canonical_samples,
+            device_sample_rate: sample_rate,
+            device_channels: channels,
+            stop_worker,
+            worker: Some(worker),
+            counters,
         })
     }
 
-    pub fn finish(self) -> Result<CapturedAudio, String> {
+    pub fn finish_with_health(mut self) -> Result<(CapturedAudio, CaptureHealth), String> {
+        self.stop_and_join()?;
         let samples = self.snapshot_samples()?;
-        Ok(CapturedAudio {
+        let captured = CapturedAudio {
             samples,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            duration_ms: self.started_at.elapsed().as_millis() as u64,
-        })
+            sample_rate: WHISPER_SAMPLE_RATE,
+            channels: 1,
+            duration_ms: self.canonical_duration_ms(),
+        };
+        Ok((captured, self.health()))
     }
 
     pub fn snapshot_recent(&self, maximum_duration: Duration) -> Result<CapturedAudio, String> {
-        let maximum_samples = (maximum_duration.as_secs_f64()
-            * self.sample_rate as f64
-            * self.channels as f64) as usize;
+        let maximum_samples =
+            (maximum_duration.as_secs_f64() * WHISPER_SAMPLE_RATE as f64).ceil() as usize;
         let samples = self
-            .samples
+            .canonical_samples
             .lock()
             .map_err(|_| "Audio capture buffer lock was poisoned".to_string())?;
         let samples = if maximum_samples == 0 || samples.len() <= maximum_samples {
@@ -167,12 +261,11 @@ impl AudioCapture {
         } else {
             samples[samples.len() - maximum_samples..].to_vec()
         };
-        let frame_count = samples.len() as u64 / self.channels.max(1) as u64;
         Ok(CapturedAudio {
+            duration_ms: samples.len() as u64 * 1_000 / WHISPER_SAMPLE_RATE as u64,
             samples,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            duration_ms: frame_count.saturating_mul(1_000) / self.sample_rate.max(1) as u64,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            channels: 1,
         })
     }
 
@@ -181,28 +274,59 @@ impl AudioCapture {
     /// microphone stream.
     pub fn snapshot_all(&self) -> Result<CapturedAudio, String> {
         let samples = self.snapshot_samples()?;
-        let frame_count = samples.len() as u64 / self.channels.max(1) as u64;
         Ok(CapturedAudio {
             samples,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            duration_ms: frame_count.saturating_mul(1_000) / self.sample_rate.max(1) as u64,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            channels: 1,
+            duration_ms: self.canonical_duration_ms(),
         })
     }
 
     fn snapshot_samples(&self) -> Result<Vec<f32>, String> {
-        self.samples
+        self.canonical_samples
             .lock()
             .map_err(|_| "Audio capture buffer lock was poisoned".to_string())
             .map(|samples| samples.clone())
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.device_sample_rate
     }
 
     pub fn channels(&self) -> u16 {
-        self.channels
+        self.device_channels
+    }
+
+    pub fn health(&self) -> CaptureHealth {
+        self.counters.health()
+    }
+
+    fn canonical_duration_ms(&self) -> u64 {
+        self.counters
+            .canonical_samples
+            .load(Ordering::Relaxed)
+            .saturating_mul(1_000)
+            / WHISPER_SAMPLE_RATE as u64
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), String> {
+        // Drop the CPAL stream first so it cannot enqueue audio for a session
+        // after its exact stop boundary. The worker then drains packets already
+        // accepted into the ring before it exits.
+        self.stream.take();
+        self.stop_worker.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| "Audio capture worker stopped unexpectedly".to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -376,27 +500,159 @@ fn device_label(device: &cpal::Device) -> Option<String> {
         .map(|description| description.to_string())
 }
 
-fn append_samples<T>(
-    data: &[T],
-    destination: &Arc<Mutex<Vec<f32>>>,
-    on_level: Option<&(dyn Fn(f32) + Send + Sync)>,
-) where
+fn append_samples<T>(data: &[T], producer: &mut rtrb::Producer<f32>, counters: &CaptureCounters)
+where
     T: Sample,
     f32: FromSample<T>,
 {
-    if let Some(on_level) = on_level {
-        let rms = (data
-            .iter()
-            .copied()
-            .map(f32::from_sample)
-            .map(|sample| sample * sample)
-            .sum::<f32>()
-            / data.len().max(1) as f32)
-            .sqrt();
-        on_level(rms);
+    counters.callback_blocks.fetch_add(1, Ordering::Relaxed);
+    counters
+        .input_samples
+        .fetch_add(data.len() as u64, Ordering::Relaxed);
+    let mut overflowed = false;
+    for sample in data.iter().copied().map(f32::from_sample) {
+        match producer.push(sample) {
+            Ok(()) => {
+                counters.accepted_samples.fetch_add(1, Ordering::Relaxed);
+                let queued = counters.queued_samples.fetch_add(1, Ordering::Relaxed) + 1;
+                counters
+                    .ring_high_water_samples
+                    .fetch_max(queued, Ordering::Relaxed);
+            }
+            Err(_) => {
+                counters.dropped_samples.fetch_add(1, Ordering::Relaxed);
+                overflowed = true;
+            }
+        }
     }
-    if let Ok(mut samples) = destination.try_lock() {
-        samples.extend(data.iter().copied().map(f32::from_sample));
+    if overflowed {
+        counters.overflow_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn spawn_capture_worker(
+    mut consumer: rtrb::Consumer<f32>,
+    canonical_samples: Arc<Mutex<Vec<f32>>>,
+    counters: Arc<CaptureCounters>,
+    stop: Arc<AtomicBool>,
+    sample_rate: u32,
+    channels: u16,
+    on_level: Option<LevelCallback>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("voxide-audio-capture".into())
+        .spawn(move || {
+            let mut packet = Vec::with_capacity(4_096);
+            let mut canonical = Vec::with_capacity(2_048);
+            let mut resampler = StatefulMonoResampler::new(sample_rate, channels);
+            let mut level_tracker = LevelTracker::default();
+            loop {
+                packet.clear();
+                while packet.len() < packet.capacity() {
+                    match consumer.pop() {
+                        Ok(sample) => {
+                            packet.push(sample);
+                            counters.queued_samples.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !packet.is_empty() {
+                    canonical.clear();
+                    resampler.push_interleaved(&packet, &mut canonical);
+                    if !canonical.is_empty() {
+                        if let Some(on_level) = on_level.as_ref() {
+                            on_level(level_tracker.observe(&canonical));
+                        }
+                        if let Ok(mut timeline) = canonical_samples.lock() {
+                            timeline.extend_from_slice(&canonical);
+                            counters
+                                .canonical_samples
+                                .fetch_add(canonical.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(CAPTURE_WORKER_IDLE_SLEEP);
+            }
+        })
+        .expect("could not start audio capture worker")
+}
+
+/// Stateful downmixing and linear resampling. The output cursor is retained
+/// across every raw-ring drain, which prevents packet-boundary clicks, gaps,
+/// and sample-count drift at rates such as 44.1 kHz.
+struct StatefulMonoResampler {
+    channels: usize,
+    ratio: f64,
+    pending_frame: Vec<f32>,
+    previous: Option<f32>,
+    source_index: u64,
+    next_output_position: f64,
+}
+
+impl StatefulMonoResampler {
+    fn new(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            channels: channels.max(1) as usize,
+            ratio: sample_rate.max(1) as f64 / WHISPER_SAMPLE_RATE as f64,
+            pending_frame: Vec::with_capacity(channels.max(1) as usize),
+            previous: None,
+            source_index: 0,
+            next_output_position: 0.0,
+        }
+    }
+
+    fn push_interleaved(&mut self, samples: &[f32], destination: &mut Vec<f32>) {
+        for sample in samples {
+            self.pending_frame.push(*sample);
+            if self.pending_frame.len() != self.channels {
+                continue;
+            }
+            let mono = self.pending_frame.iter().sum::<f32>() / self.channels as f32;
+            self.pending_frame.clear();
+            self.push_mono(mono, destination);
+        }
+    }
+
+    fn push_mono(&mut self, current: f32, destination: &mut Vec<f32>) {
+        let current_index = self.source_index;
+        if let Some(previous) = self.previous {
+            while self.next_output_position <= current_index as f64 {
+                let fraction = (self.next_output_position - (current_index - 1) as f64) as f32;
+                destination.push(previous + (current - previous) * fraction.clamp(0.0, 1.0));
+                self.next_output_position += self.ratio;
+            }
+        } else if self.next_output_position == 0.0 {
+            destination.push(current);
+            self.next_output_position += self.ratio;
+        }
+        self.previous = Some(current);
+        self.source_index += 1;
+    }
+}
+
+#[derive(Default)]
+struct LevelTracker {
+    peak: f32,
+    floor: f32,
+}
+
+impl LevelTracker {
+    fn observe(&mut self, samples: &[f32]) -> f32 {
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len().max(1) as f32)
+            .sqrt();
+        if self.peak == 0.0 {
+            self.peak = 0.02;
+            self.floor = 0.002;
+        }
+        self.floor = (self.floor * 1.01 + 1e-5).min(rms).max(1e-4);
+        self.peak = (self.peak * 0.995).max(rms).max(self.floor * 3.0);
+        ((rms - self.floor) / (self.peak - self.floor).max(1e-4)).clamp(0.0, 1.0)
     }
 }
 
@@ -406,6 +662,10 @@ pub fn mono_resample_for_whisper(audio: CapturedAudio) -> Result<Vec<f32>, Strin
     }
     if audio.channels == 0 || audio.sample_rate == 0 {
         return Err("The captured audio has an invalid format".into());
+    }
+
+    if audio.sample_rate == WHISPER_SAMPLE_RATE && audio.channels == 1 {
+        return Ok(audio.samples);
     }
 
     let channel_count = audio.channels as usize;
@@ -510,5 +770,67 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(wav.len(), 48);
+    }
+
+    #[test]
+    fn stateful_resampling_preserves_length_across_common_input_rates() {
+        for sample_rate in [8_000, 16_000, 32_000, 44_100, 48_000, 96_000] {
+            let input = (0..sample_rate)
+                .map(|index| (index % 127) as f32 / 127.0)
+                .collect::<Vec<_>>();
+            let mut resampler = StatefulMonoResampler::new(sample_rate, 1);
+            let mut output = Vec::new();
+            resampler.push_interleaved(&input, &mut output);
+            assert!(
+                output.len().abs_diff(WHISPER_SAMPLE_RATE as usize) <= 1,
+                "{sample_rate} Hz produced {} samples",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_resampling_is_packet_boundary_deterministic() {
+        let input = (0..44_100 * 2)
+            .map(|index| ((index * 17 % 997) as f32 / 997.0) * 2.0 - 1.0)
+            .collect::<Vec<_>>();
+        let mut whole_resampler = StatefulMonoResampler::new(44_100, 1);
+        let mut whole = Vec::new();
+        whole_resampler.push_interleaved(&input, &mut whole);
+
+        let mut packet_resampler = StatefulMonoResampler::new(44_100, 1);
+        let mut packetized = Vec::new();
+        let packet_sizes = [1, 17, 63, 128, 509, 3, 2_047];
+        let mut offset = 0;
+        let mut packet_index = 0;
+        while offset < input.len() {
+            let end = (offset + packet_sizes[packet_index % packet_sizes.len()]).min(input.len());
+            packet_resampler.push_interleaved(&input[offset..end], &mut packetized);
+            offset = end;
+            packet_index += 1;
+        }
+        assert_eq!(whole, packetized);
+    }
+
+    #[test]
+    fn downmixing_retains_incomplete_frames_until_the_next_packet() {
+        let mut resampler = StatefulMonoResampler::new(16_000, 2);
+        let mut output = Vec::new();
+        resampler.push_interleaved(&[0.2, 0.6, 0.1], &mut output);
+        assert_eq!(output, vec![0.4]);
+        resampler.push_interleaved(&[0.9], &mut output);
+        assert_eq!(output, vec![0.4, 0.5]);
+    }
+
+    #[test]
+    fn full_raw_ring_is_counted_instead_of_silently_dropped() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::<f32>::new(2);
+        let counters = CaptureCounters::default();
+        append_samples(&[0.1_f32, 0.2, 0.3], &mut producer, &counters);
+        assert_eq!(counters.health().callback_blocks, 1);
+        assert_eq!(counters.health().accepted_samples, 2);
+        assert_eq!(counters.health().dropped_samples, 1);
+        assert_eq!(counters.health().overflow_blocks, 1);
+        assert_eq!(counters.health().ring_high_water_samples, 2);
     }
 }
