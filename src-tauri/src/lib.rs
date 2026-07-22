@@ -7476,8 +7476,13 @@ async fn stop_native_dictation(
         } else {
             transcription_latency_ms
         };
+        let real_time_factor = if duration_ms == 0 {
+            0.0
+        } else {
+            transcription_latency_ms as f64 / duration_ms as f64
+        };
         debug_log::append(&format!(
-            "Dictation timing (audio_s: {:.1}, lock_wait_ms: {}, vad_ms: {}, state_ms: {}, decode_ms: {}, post_ms: {}, insert_ms: {})",
+            "Dictation timing (session: {recording_generation}, capture_wall_ms: {wall_duration_ms}, audio_s: {:.1}, final_ms: {transcription_latency_ms}, rtf: {real_time_factor:.3}, lock_wait_ms: {}, vad_ms: {}, state_ms: {}, decode_ms: {}, post_ms: {}, insert_ms: {})",
             duration_ms as f64 / 1_000.0,
             timings.lock_wait_ms,
             timings.vad_ms,
