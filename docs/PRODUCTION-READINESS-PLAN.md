@@ -1070,7 +1070,8 @@ the live file is replaced. On malformed current data, startup restores the
 newest valid snapshot only after moving the unreadable original aside under an
 app-owned corrupt-file name. A future-schema database is still rejected and
 never silently replaced. Unix builds also flush the containing directory after
-the atomic live-file rename.
+the atomic live-file rename. The first bootstrap after recovery shows a
+content-free notice; it never exposes the preserved file path.
 
 ### 13.4 Backup format
 

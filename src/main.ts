@@ -208,6 +208,11 @@ interface AppDatabase {
   activeCommandChatId?: string;
 }
 
+interface BootstrapData {
+  database: AppDatabase;
+  recoveryNotice?: string;
+}
+
 interface UsageStats {
   todayDictations: number;
   todayWords: number;
@@ -3039,7 +3044,8 @@ async function handleAction(element: HTMLElement): Promise<void> {
 }
 
 async function initialize(): Promise<void> {
-  database = await invoke<AppDatabase>("bootstrap");
+  const bootstrap = await invoke<BootstrapData>("bootstrap");
+  database = bootstrap.database;
   commandState.chatId = database.activeCommandChatId;
   await refreshStats();
   await refreshVoiceEngineAvailability();
@@ -3050,6 +3056,7 @@ async function initialize(): Promise<void> {
   await refreshLocalApiStatus();
   await refreshAccessibilityPermissionStatus();
   await refreshHotkeyBackendStatus().catch(() => { hotkeyBackendStatus = undefined; });
+  if (bootstrap.recoveryNotice) showNotice(bootstrap.recoveryNotice);
   await listen<HotkeyBackendStatus>("voxide-hotkey-backend", (event) => {
     hotkeyBackendStatus = event.payload;
     if (currentView === "settings") render();

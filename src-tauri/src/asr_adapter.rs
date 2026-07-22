@@ -445,6 +445,7 @@ mod tests {
                 "voxide-asr-adapter-test-{}.json",
                 uuid::Uuid::new_v4()
             )),
+            startup_recovery_notice: Mutex::new(None),
         };
 
         VoiceEngine::Cloud

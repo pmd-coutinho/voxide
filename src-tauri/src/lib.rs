@@ -1458,6 +1458,7 @@ enum DictationMode {
 struct AppState {
     database: Mutex<AppDatabase>,
     path: PathBuf,
+    startup_recovery_notice: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -1497,6 +1498,7 @@ impl AppState {
         let state = Self {
             database: Mutex::new(database),
             path,
+            startup_recovery_notice: Mutex::new(None),
         };
         if let Some(backup) = recovered_from_backup {
             let preserved = quarantine_corrupt_database(&state.path)?;
@@ -1510,6 +1512,13 @@ impl AppState {
                 .lock()
                 .map_err(|_| "Voxide data lock was poisoned".to_string())?;
             state.persist(&database)?;
+            let mut notice = state
+                .startup_recovery_notice
+                .lock()
+                .map_err(|_| "Voxide recovery notice lock was poisoned".to_string())?;
+            *notice = Some(
+                "Voxide restored your data from its newest valid backup. The unreadable database was preserved in Voxide storage for recovery.".into(),
+            );
         } else if needs_schema_migration {
             state.back_up_pre_migration_database()?;
             let database = state
@@ -1519,6 +1528,13 @@ impl AppState {
             state.persist(&database)?;
         }
         Ok(state)
+    }
+
+    fn take_startup_recovery_notice(&self) -> Result<Option<String>, String> {
+        self.startup_recovery_notice
+            .lock()
+            .map(|mut notice| notice.take())
+            .map_err(|_| "Voxide recovery notice lock was poisoned".to_string())
     }
 
     fn persist(&self, database: &AppDatabase) -> Result<(), String> {
@@ -2193,13 +2209,24 @@ fn make_id(prefix: &str) -> String {
     format!("{prefix}-{}", Utc::now().format("%Y%m%d%H%M%S%3f"))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapData {
+    database: AppDatabase,
+    recovery_notice: Option<String>,
+}
+
 #[tauri::command]
-fn bootstrap(state: State<'_, AppState>) -> Result<AppDatabase, String> {
-    state
+fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapData, String> {
+    let database = state
         .database
         .lock()
         .map(|database| database.clone())
-        .map_err(|_| "Voxide data lock was poisoned".to_string())
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+    Ok(BootstrapData {
+        database,
+        recovery_notice: state.take_startup_recovery_notice()?,
+    })
 }
 
 fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<(), String> {
@@ -9444,6 +9471,28 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_notice_is_delivered_only_once() {
+        let state = AppState {
+            database: Mutex::new(AppDatabase::default()),
+            path: std::env::temp_dir().join("voxide-recovery-notice-test.json"),
+            startup_recovery_notice: Mutex::new(Some("Recovered from backup".into())),
+        };
+
+        assert_eq!(
+            state
+                .take_startup_recovery_notice()
+                .expect("recovery notice lock"),
+            Some("Recovered from backup".into())
+        );
+        assert_eq!(
+            state
+                .take_startup_recovery_notice()
+                .expect("recovery notice lock"),
+            None
+        );
+    }
+
+    #[test]
     fn failed_dictation_start_rolls_back_session_context_and_generation() {
         let capture_state = NativeCaptureState::default();
         let session_id = capture_state
@@ -10694,6 +10743,7 @@ mod tests {
         let state = AppState {
             database: Mutex::new(AppDatabase::default()),
             path: root.join("voxide.json"),
+            startup_recovery_notice: Mutex::new(None),
         };
         let directory = state
             .audio_history_directory()
@@ -10812,6 +10862,7 @@ mod tests {
         let state = AppState {
             database: Mutex::new(AppDatabase::default()),
             path: root.join(DATABASE_FILE),
+            startup_recovery_notice: Mutex::new(None),
         };
         let database = state.database.lock().expect("database lock").clone();
         state.persist(&database).expect("database persists");
@@ -10834,6 +10885,7 @@ mod tests {
         let state = AppState {
             database: Mutex::new(AppDatabase::default()),
             path: path.clone(),
+            startup_recovery_notice: Mutex::new(None),
         };
 
         let first = AppDatabase::default();
@@ -11306,6 +11358,7 @@ mod tests {
         let state = AppState {
             database: Mutex::new(AppDatabase::default()),
             path: root.join("voxide.json"),
+            startup_recovery_notice: Mutex::new(None),
         };
         let audio_path = state
             .audio_history_directory()
