@@ -288,6 +288,14 @@ struct BackupArchive {
 }
 
 fn normalize_database(database: &mut AppDatabase) {
+    // A settings backup can be restored onto a platform/build where its
+    // selected engine cannot run (for example a CUDA-only engine in a
+    // portable build). Keep the unavailable engine visible in Settings, but
+    // never leave it as the active selection: every persisted selection must
+    // be immediately usable or fall back to the portable default.
+    if !database.settings.selected_voice_engine.runtime_available() {
+        database.settings.selected_voice_engine = VoiceEngine::Whisper;
+    }
     // A previous Parakeet download path overwrote selected_model with
     // Parakeet's model ID. If that persisted while Whisper was selected,
     // resolving Whisper's model status failed before the user could choose a
@@ -9526,6 +9534,28 @@ mod tests {
         normalize_database(&mut database);
 
         assert_eq!(database.settings.selected_model, "base");
+    }
+
+    #[test]
+    fn unavailable_engine_selection_falls_back_to_a_portable_engine() {
+        let mut database = AppDatabase::default();
+        database.settings.selected_voice_engine = VoiceEngine::Parakeet;
+        database.settings.selected_model = parakeet::MODEL_ID.into();
+
+        normalize_database(&mut database);
+
+        if parakeet::is_compiled() {
+            assert_eq!(
+                database.settings.selected_voice_engine,
+                VoiceEngine::Parakeet
+            );
+        } else {
+            assert_eq!(
+                database.settings.selected_voice_engine,
+                VoiceEngine::Whisper
+            );
+            assert_eq!(database.settings.selected_model, "base");
+        }
     }
 
     #[test]
