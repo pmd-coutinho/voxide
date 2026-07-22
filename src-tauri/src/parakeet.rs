@@ -19,6 +19,44 @@ const REQUIRED_FILES: [&str; 4] = [
     "tokens.txt",
 ];
 
+/// TDT is an offline recognizer, so the newest tokens in a live full-buffer
+/// decode are tentative: the model has not yet seen the following audio that
+/// can disambiguate them. Keep that short tail out of the display only. The
+/// final transcription always decodes and returns the complete recording.
+#[cfg(feature = "parakeet")]
+pub const PREVIEW_TRAILING_GUARD_SECONDS: f32 = 0.75;
+
+/// Builds a display-safe prefix from Sherpa's per-token timing result.
+///
+/// Returning `None` means the runtime did not provide a complete timing map;
+/// callers can then choose their compatibility fallback explicitly. Tokens
+/// are SentencePiece fragments, so concatenating them is the faithful text
+/// reconstruction instead of joining them with spaces.
+#[cfg(any(feature = "parakeet", test))]
+fn stable_preview_text(
+    tokens: &[String],
+    timestamps: Option<&[f32]>,
+    durations: Option<&[f32]>,
+    cutoff_seconds: f32,
+) -> Option<String> {
+    let timestamps = timestamps?;
+    if tokens.len() != timestamps.len()
+        || durations.is_some_and(|durations| durations.len() != tokens.len())
+    {
+        return None;
+    }
+    let durations = durations.unwrap_or(&[]);
+    let stable_token_count = timestamps
+        .iter()
+        .enumerate()
+        .take_while(|(index, timestamp)| {
+            let duration = durations.get(*index).copied().unwrap_or_default();
+            **timestamp + duration <= cutoff_seconds
+        })
+        .count();
+    Some(tokens[..stable_token_count].concat().trim().to_owned())
+}
+
 pub fn is_compiled() -> bool {
     cfg!(feature = "parakeet")
 }
@@ -93,11 +131,16 @@ mod implementation {
         sync::{Arc, Mutex, OnceLock},
     };
 
-    use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig};
+    use sherpa_onnx::{
+        OfflineRecognizer, OfflineRecognizerConfig, OfflineRecognizerResult,
+        OfflineTransducerModelConfig,
+    };
 
     use crate::debug_log;
 
-    use super::{model_is_installed, REQUIRED_FILES};
+    use super::{
+        model_is_installed, stable_preview_text, PREVIEW_TRAILING_GUARD_SECONDS, REQUIRED_FILES,
+    };
 
     #[derive(Clone)]
     struct CachedRecognizer {
@@ -210,7 +253,28 @@ mod implementation {
     }
 
     pub fn transcribe(samples: &[f32], model_directory: &Path) -> Result<String, String> {
-        decode(samples, model_directory, None)
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        decode(samples, model_directory, None).map(|result| result.text.trim().to_owned())
+    }
+
+    /// Decodes a full live snapshot, but returns only tokens that end before
+    /// the unstable tail. This is deliberately display-only: the final pass
+    /// below still receives every captured sample and every decoded token.
+    pub fn transcribe_preview(samples: &[f32], model_directory: &Path) -> Result<String, String> {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        let result = decode(samples, model_directory, None)?;
+        let cutoff_seconds = samples.len() as f32 / 16_000.0 - PREVIEW_TRAILING_GUARD_SECONDS;
+        Ok(stable_preview_text(
+            &result.tokens,
+            result.timestamps.as_deref(),
+            result.durations.as_deref(),
+            cutoff_seconds,
+        )
+        .unwrap_or_else(|| result.text.trim().to_owned()))
     }
 
     /// Uses Sherpa's TDT context graph for FluidVoice-style final vocabulary
@@ -221,11 +285,14 @@ mod implementation {
         model_directory: &Path,
         vocabulary: &[String],
     ) -> Result<String, String> {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
         let Some(hotwords) = vocabulary_hotwords(vocabulary) else {
-            return decode(samples, model_directory, None);
+            return transcribe(samples, model_directory);
         };
         match decode(samples, model_directory, Some(&hotwords)) {
-            Ok(text) => Ok(text),
+            Ok(result) => Ok(result.text.trim().to_owned()),
             Err(error) => {
                 // FluidVoice similarly falls back to its ordinary final
                 // manager if the boosted manager cannot transcribe. A custom
@@ -233,7 +300,7 @@ mod implementation {
                 debug_log::append(&format!(
                     "Parakeet vocabulary boosting failed; retrying the unboosted final decode: {error}"
                 ));
-                decode(samples, model_directory, None)
+                transcribe(samples, model_directory)
             }
         }
     }
@@ -256,10 +323,7 @@ mod implementation {
         samples: &[f32],
         model_directory: &Path,
         hotwords: Option<&str>,
-    ) -> Result<String, String> {
-        if samples.is_empty() {
-            return Ok(String::new());
-        }
+    ) -> Result<OfflineRecognizerResult, String> {
         let recognizer = recognizer(model_directory, hotwords.is_some())?;
         let _inference = INFERENCE_LOCK
             .lock()
@@ -271,7 +335,6 @@ mod implementation {
         recognizer.decode(&stream);
         stream
             .get_result()
-            .map(|result| result.text.trim().to_owned())
             .ok_or_else(|| "Parakeet did not return a transcription result".to_string())
     }
 }
@@ -279,6 +342,7 @@ mod implementation {
 #[cfg(feature = "parakeet")]
 pub use implementation::{
     preload, preload_with_vocabulary, transcribe as transcribe_samples,
+    transcribe_preview as transcribe_preview_samples,
     transcribe_with_vocabulary as transcribe_samples_with_vocabulary,
 };
 
@@ -294,6 +358,11 @@ pub fn preload_with_vocabulary(_: &Path, _: &[String]) -> Result<(), String> {
 
 #[cfg(not(feature = "parakeet"))]
 pub fn transcribe_samples(_: &[f32], _: &Path) -> Result<String, String> {
+    Err("Parakeet is included only in the CUDA build".into())
+}
+
+#[cfg(not(feature = "parakeet"))]
+pub fn transcribe_preview_samples(_: &[f32], _: &Path) -> Result<String, String> {
     Err("Parakeet is included only in the CUDA build".into())
 }
 
@@ -325,6 +394,30 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_omits_only_the_unstable_timed_tail() {
+        let tokens = [" One", " two", " three", " four"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let timestamps = [0.0, 0.25, 0.5, 0.75];
+        let durations = [0.2, 0.2, 0.2, 0.2];
+
+        assert_eq!(
+            stable_preview_text(&tokens, Some(&timestamps), Some(&durations), 0.72),
+            Some("One two three".into())
+        );
+    }
+
+    #[test]
+    fn live_preview_falls_back_when_token_timings_are_incomplete() {
+        let tokens = [" One", " two"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(stable_preview_text(&tokens, Some(&[0.0]), None, 1.0), None);
+    }
+
+    #[test]
     #[ignore = "requires a CUDA build plus VOXIDE_PARAKEET_MODEL_DIR"]
     fn cuda_model_transcribes_its_reference_wav() {
         if !is_compiled() {
@@ -343,6 +436,11 @@ mod tests {
             transcribe_samples(&samples, &directory).expect("decode reference WAV with CUDA");
         println!("Parakeet reference transcript: {text}");
         assert!(!text.trim().is_empty());
+
+        let preview = transcribe_preview_samples(&samples, &directory)
+            .expect("decode a timestamp-guarded Parakeet preview with CUDA");
+        println!("Parakeet timestamp-guarded preview: {preview}");
+        assert!(!preview.trim().is_empty());
     }
 
     #[test]

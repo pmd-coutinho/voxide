@@ -1,6 +1,6 @@
 # Voxide dictation performance plan
 
-Date: 2026-07-21
+Date: 2026-07-22
 Workspace: `/home/pedrocoutinho/dev/dictation-app`
 Goal: close the perceived stop→text latency gap between Voxide and the user's
 faster-whisper script (`~/.local/share/dictation/dictate.sh`), and reach a
@@ -63,8 +63,8 @@ models — natively CUDA-friendly) plus portable architecture:
 - timer-driven growing-buffer preview with per-model cadence and backpressure
   (skip tick while busy / when inference > interval),
 - dual fast/quality manager instances (preview vs final),
-- true delta-feeding streaming engines (Parakeet EOU) so the final pass only
-  processes the tail,
+- true delta-feeding streaming engines so the final pass only processes the
+  tail,
 - clipboard-free chunked text insertion, stage-by-stage benchmarks
   (`ASR_BENCH`).
 
@@ -72,10 +72,15 @@ models — natively CUDA-friendly) plus portable architecture:
 
 - **sherpa-onnx**: Rust API + official Tauri support; model
   **`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`** (25 European languages,
-  incl. PT + EN), onnxruntime CUDA provider, bundled Silero VAD. No EOU
-  token-streaming Parakeet in sherpa-onnx → VAD-segmented pseudo-streaming is
-  the equivalent. Parakeet is **transcribe-only** (no PT→EN translate task —
-  Whisper stays for translate).
+  incl. PT + EN), onnxruntime CUDA provider. It is an offline decoder, so
+  Voxide uses FluidVoice-style complete-buffer preview snapshots and an
+  independent complete-buffer final decode. Parakeet is **transcribe-only**
+  (no PT→EN translate task — Whisper stays for translate).
+- **NVIDIA Nemotron 3.5 ASR Streaming 0.6B**: official Transformers RNN-T
+  implementation with a cache-aware generator, CUDA PyTorch, language prompts
+  (`auto` or BCP-47), and fixed streaming chunks. This supplies the genuine
+  delta-fed option on Linux/NVIDIA; Voxide defaults to the 6-token, 560 ms
+  balanced profile and exposes 320 ms and 1.12 s alternatives.
 - whisper-rs 0.16 exposes everything needed: `set_n_threads`, its raw abort
   callback API (cancel in-flight decode), `set_single_segment`,
   `set_temperature(_inc)`, VAD context reuse. The convenience
@@ -232,20 +237,29 @@ Add stage timing so every later change is measured, not guessed.
   version).
 - Fire the stop-cue sound at capture-stop (before decode), not after text.
 
-### Phase 6 — Parakeet engine via sherpa-onnx (endgame)
+### Phase 6 — Parakeet engine via sherpa-onnx
 
 - New `parakeet` voice engine alongside whisper/cloud; sherpa-onnx Rust API,
   onnxruntime CUDA provider (no nvcc needed; runtime libs already installed).
 - Model: `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` (25 European languages,
   PT+EN) managed in the existing model-download UI.
-- Port FluidVoice's architecture: VAD-segmented pseudo-streaming with a warm
-  recognizer; decode completed VAD segments during recording; the final pass at
-  stop only decodes the tail → near-zero stop→text latency; segment results
-  drive the overlay preview.
-- Caveats: transcribe-only (Whisper stays for PT→EN translate); no EOU
-  token-streaming variant in sherpa-onnx.
+- Port FluidVoice's full-buffer preview architecture: re-decode the growing
+  capture at a bounded cadence, reconcile the display, and run a separate
+  complete-buffer final decode at stop.
+- Caveat: transcribe-only (Whisper stays for PT→EN translate); sherpa-onnx
+  does not expose a cache-aware token-streaming Parakeet path.
 - Re-assess priority after Phase 2 measurements — with CUDA Whisper the
   remaining win is streaming UX, not raw speed.
+
+### Phase 7 — Nemotron true streaming
+
+- Add the official `nvidia/nemotron-3.5-asr-streaming-0.6b` CUDA path as a
+  persistent local sidecar. Feed only new 16 kHz PCM into its cache-aware
+  generator; preview and final text must come from one session.
+- Keep runtime setup and model download independent in Voice Engine. The
+  PyTorch CUDA environment is user-local; the model remains removable.
+- Verify model loading, partial emission, tail flushing, file transcription,
+  cancellation, and input/language configuration on a CUDA release build.
 
 ---
 
@@ -306,11 +320,10 @@ Environment notes specific to this machine:
   13 toolkit; the final Linux binary embeds their RPATHs. Parakeet is exposed
   in Voice Engine only in a CUDA build, has visible model-download progress
   and removal, and is routed through dictation, file transcription, and the
-  loopback API. Its offline decoder is made live by shared Silero VAD: complete
-  utterances are committed exactly once, the active utterance remains
-  provisional, and stopping decodes only the final VAD tail. Runtime verified
-  on the RTX 4080 Laptop with the model's reference WAV: `Ask not what your
-  country can do for you. Ask what you can do for your country.`
+  loopback API. Its offline decoder is made live by complete-capture preview
+  snapshots and a separate final decode, without app-level VAD segmentation.
+  Runtime verified on the RTX 4080 Laptop with the model's reference WAV:
+  `Ask not what your country can do for you. Ask what you can do for your country.`
 - 2026-07-21: Live preview regression fixed. The `whisper-rs` 0.16
   `set_abort_callback_safe` helper made every CUDA snapshot abort during
   encoder setup, while its errors were silently discarded. Voxide now uses a
@@ -323,5 +336,12 @@ Environment notes specific to this machine:
   strips long internal silence before decode to avoid repeated pause
   hallucinations. The CUDA bench now verifies 1–8 s growing snapshots
   (228–296 ms) and cancellation of a stale generation.
-- Status: Phases 0–6 are complete. CUDA Whisper reaches the raw-decode target;
-  CUDA Parakeet is now the VAD-segmented local streaming option on Linux x64.
+- 2026-07-22: Phase 7 landed. The CUDA build exposes Nemotron Speech alongside
+  Whisper and Parakeet. Voxide installs a user-local CUDA 12.8 PyTorch runtime,
+  downloads the 2.55 GB official model, and drives its FastConformer/RNN-T
+  cache-aware generator through a persistent JSON-lines sidecar. The verified
+  reference WAV emitted incremental partials and finalized as: `Ask not what
+  your country can do for you. Ask what you can do for your country`.
+- Status: Phases 0–7 are complete. CUDA Whisper reaches the raw-decode target;
+  CUDA Parakeet provides FluidVoice-style full-buffer preview and CUDA Nemotron
+  provides the true-streaming local option on Linux x64.

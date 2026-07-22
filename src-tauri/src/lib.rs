@@ -33,6 +33,7 @@ mod debug_log;
 mod formatting;
 mod local_api;
 mod media;
+mod nemotron;
 mod parakeet;
 mod permissions;
 #[cfg(target_os = "linux")]
@@ -50,6 +51,10 @@ const TRANSCRIPTION_PREVIEW_MIN_CHARACTERS: usize = 50;
 const TRANSCRIPTION_PREVIEW_MAX_CHARACTERS: usize = 800;
 const TRANSCRIPTION_PREVIEW_CHARACTER_STEP: usize = 50;
 const DEFAULT_TRANSCRIPTION_PREVIEW_CHARACTERS: usize = 150;
+const NEMOTRON_RUNTIME_ID: &str = "nemotron-cuda-runtime";
+const NEMOTRON_MODEL_DOWNLOAD_ID: &str = "nemotron-3.5-asr-streaming-0.6b";
+const NEMOTRON_SERVER_SOURCE: &str = include_str!("../scripts/nemotron_cuda_server.py");
+const NEMOTRON_SETUP_SOURCE: &str = include_str!("../../scripts/setup-nemotron-cuda-runtime.sh");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -533,6 +538,8 @@ struct Settings {
     selected_model: String,
     #[serde(default)]
     whisper_beam_size: speech::BeamSize,
+    #[serde(default)]
+    nemotron_streaming_mode: NemotronStreamingMode,
     local_model_path: Option<String>,
     selected_input_device: Option<String>,
     cloud_transcription_model: String,
@@ -625,6 +632,7 @@ impl Default for Settings {
             selected_voice_engine: VoiceEngine::Whisper,
             selected_model: "base".into(),
             whisper_beam_size: speech::BeamSize::Auto,
+            nemotron_streaming_mode: NemotronStreamingMode::Balanced,
             local_model_path: None,
             selected_input_device: None,
             cloud_transcription_model: "gpt-4o-mini-transcribe".into(),
@@ -1205,6 +1213,29 @@ enum VoiceEngine {
     Cloud,
 }
 
+/// Nemotron's cache-aware encoder supports fixed right-context choices.
+/// Balanced matches NVIDIA's streaming example: it remains responsive while
+/// giving the RNN-T decoder substantially more acoustic context than the
+/// lowest-latency profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+enum NemotronStreamingMode {
+    Fast,
+    #[default]
+    Balanced,
+    Quality,
+}
+
+impl NemotronStreamingMode {
+    fn lookahead_tokens(self) -> u8 {
+        match self {
+            Self::Fast => 3,
+            Self::Balanced => nemotron::DEFAULT_LOOKAHEAD_TOKENS,
+            Self::Quality => 13,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum OverlaySize {
@@ -1281,6 +1312,13 @@ impl AppState {
         Ok(directory)
     }
 
+    fn data_directory(&self) -> Result<PathBuf, String> {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("Could not determine the local application-data directory".into())
+    }
+
     fn audio_history_directory(&self) -> Result<PathBuf, String> {
         let directory = self
             .path
@@ -1307,13 +1345,26 @@ impl AppState {
     }
 }
 
-#[derive(Default)]
 struct NativeCaptureState {
     capture: Mutex<Option<audio::AudioCapture>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
     preview_generation: Arc<AtomicU64>,
     parakeet_live: Mutex<ParakeetLiveState>,
+    nemotron_live: Arc<tokio::sync::Mutex<NemotronLiveState>>,
+}
+
+impl Default for NativeCaptureState {
+    fn default() -> Self {
+        Self {
+            capture: Mutex::new(None),
+            context: Mutex::new(DictationContext::default()),
+            continuous_context: Mutex::new(ContinuousDictationContext::default()),
+            preview_generation: Arc::new(AtomicU64::new(0)),
+            parakeet_live: Mutex::new(ParakeetLiveState::default()),
+            nemotron_live: Arc::new(tokio::sync::Mutex::new(NemotronLiveState::default())),
+        }
+    }
 }
 
 /// Display-only state for Parakeet's full-buffer live preview.
@@ -1325,6 +1376,18 @@ struct NativeCaptureState {
 struct ParakeetLiveState {
     generation: u64,
     previous_full_text: String,
+}
+
+/// State held across Nemotron's native cache-aware stream. The child process
+/// survives successful recordings so the CUDA model stays warm; each stream
+/// itself is reset by the Python service after `finish`.
+#[derive(Default)]
+struct NemotronLiveState {
+    generation: u64,
+    fed_samples: usize,
+    session_started: bool,
+    server: Option<nemotron::Server>,
+    start_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1818,6 +1881,19 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
                 return Err("Download the Parakeet model before completing setup".into());
             }
         }
+        VoiceEngine::Nemotron => {
+            if !nemotron::is_compiled() {
+                return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+            }
+            let runtime = nemotron_runtime_path(&state)?;
+            if !nemotron::runtime_is_installed(&runtime) {
+                return Err("Install the Nemotron CUDA runtime before completing setup".into());
+            }
+            let model = nemotron_model_path(&state)?;
+            if !nemotron::model_is_installed(&model) {
+                return Err("Download the Nemotron model before completing setup".into());
+            }
+        }
         VoiceEngine::Cloud => {
             if settings.cloud_transcription_model.trim().is_empty() {
                 return Err(
@@ -1847,12 +1923,6 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
                         .into(),
                 );
             }
-        }
-        _ => {
-            return Err(
-                "Select Whisper or configure a compatible cloud provider before completing setup"
-                    .into(),
-            )
         }
     }
     state.update(|database| {
@@ -2415,6 +2485,61 @@ fn save_file_transcription(
     })
 }
 
+/// Feeds a media file through the same native cache-aware Nemotron stream as
+/// microphone dictation. This avoids a second, non-streaming file-only model
+/// path and keeps memory bounded for long recordings.
+async fn transcribe_nemotron_media_file(
+    state: &AppState,
+    path: &Path,
+    language: &str,
+    lookahead_tokens: u8,
+    progress: Option<speech::ProgressCallback>,
+) -> Result<(String, u64), String> {
+    const FILE_CHUNK_SECONDS: f64 = 10.0;
+    if !nemotron::is_compiled() {
+        return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+    }
+    let model = nemotron_model_path(state)?;
+    let runtime = nemotron_runtime_path(state)?;
+    if !nemotron::runtime_is_installed(&runtime) {
+        return Err("Install the Nemotron CUDA runtime before transcribing a file".into());
+    }
+    if !nemotron::model_is_installed(&model) {
+        return Err("Download the Nemotron model before transcribing a file".into());
+    }
+    let script = ensure_nemotron_server_script(&runtime)?;
+    let mut server =
+        nemotron::Server::launch(&nemotron::python_path(&runtime), &script, &model).await?;
+    server.start(language, lookahead_tokens).await?;
+    let duration_ms = media::file_duration_ms(path)?;
+    let total_chunks = ((duration_ms as f64 / 1_000.0) / FILE_CHUNK_SECONDS)
+        .ceil()
+        .max(1.0) as usize;
+    for chunk in 0..total_chunks {
+        let start_seconds = chunk as f64 * FILE_CHUNK_SECONDS;
+        let remaining_seconds = (duration_ms as f64 / 1_000.0 - start_seconds).max(0.0);
+        let file = path.to_path_buf();
+        let audio = tauri::async_runtime::spawn_blocking(move || {
+            media::decode_audio_segment(
+                &file,
+                start_seconds,
+                remaining_seconds.min(FILE_CHUNK_SECONDS),
+            )
+        })
+        .await
+        .map_err(|error| format!("Nemotron file decode task failed: {error}"))??;
+        let samples = audio::mono_resample_for_whisper(audio)?;
+        if !samples.is_empty() {
+            let _ = server.append(&samples).await?;
+        }
+        if let Some(progress) = &progress {
+            progress(chunk + 1, total_chunks);
+        }
+    }
+    let text = server.finish(&[]).await?;
+    Ok((text, duration_ms))
+}
+
 #[tauri::command]
 async fn transcribe_file(
     app: AppHandle,
@@ -2479,7 +2604,9 @@ async fn transcribe_file(
             }
             let model_path = parakeet_model_path(&state)?;
             if !parakeet::model_is_installed(&model_path) {
-                return Err("The Parakeet model is missing. Download it before transcribing a file.".into());
+                return Err(
+                    "The Parakeet model is missing. Download it before transcribing a file.".into(),
+                );
             }
             let media_path = path.clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -2487,6 +2614,16 @@ async fn transcribe_file(
             })
             .await
             .map_err(|error| format!("Parakeet file transcription task failed: {error}"))??
+        }
+        VoiceEngine::Nemotron => {
+            transcribe_nemotron_media_file(
+                &state,
+                &path,
+                &settings.language,
+                settings.nemotron_streaming_mode.lookahead_tokens(),
+                Some(progress),
+            )
+            .await?
         }
         VoiceEngine::Cloud => {
             let profile = {
@@ -2516,7 +2653,6 @@ async fn transcribe_file(
             .await
             .map_err(|error| format!("Apple Speech task failed: {error}"))??
         }
-        _ => return Err("This voice engine is not available in the portable runtime yet. Select Whisper or configure a compatible cloud provider.".into()),
     };
     // Meeting/file transcription is intentionally separate from live
     // dictation. Voxide returns the ASR provider's file result directly,
@@ -4833,12 +4969,15 @@ struct VoiceModelStatus {
     id: String,
     installed: bool,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_installed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VoiceEngineAvailability {
     parakeet: bool,
+    nemotron: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5013,6 +5152,57 @@ fn parakeet_model_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(parakeet::model_directory(&state.models_directory()?))
 }
 
+fn nemotron_model_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(nemotron::model_directory(&state.models_directory()?))
+}
+
+fn nemotron_runtime_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(nemotron::runtime_directory(&state.data_directory()?))
+}
+
+/// Materialize the embedded sidecar beside the user-local Python environment.
+/// This lets an installed app run the exact server it was built with, while a
+/// source checkout needs no fragile path assumptions in development.
+fn ensure_nemotron_server_script(runtime_directory: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(runtime_directory)
+        .map_err(|error| format!("Could not create the Nemotron runtime directory: {error}"))?;
+    let script = runtime_directory.join("nemotron_cuda_server.py");
+    let should_write = fs::read_to_string(&script)
+        .map(|current| current != NEMOTRON_SERVER_SOURCE)
+        .unwrap_or(true);
+    if should_write {
+        fs::write(&script, NEMOTRON_SERVER_SOURCE)
+            .map_err(|error| format!("Could not install the Nemotron CUDA service: {error}"))?;
+    }
+    Ok(script)
+}
+
+fn nemotron_status(state: &AppState) -> Result<VoiceModelStatus, String> {
+    let model = nemotron_model_path(state)?;
+    let runtime = nemotron_runtime_path(state)?;
+    let runtime_installed = nemotron::runtime_is_installed(&runtime);
+    let model_installed = nemotron::model_is_installed(&model);
+    let ready = nemotron::is_compiled() && runtime_installed && model_installed;
+    let path = if !nemotron::is_compiled() {
+        "Nemotron is included in Voxide's CUDA build for Linux/NVIDIA".into()
+    } else if !runtime_installed {
+        format!(
+            "Install the user-local CUDA runtime at {} before downloading or using the model",
+            runtime.display()
+        )
+    } else if !model_installed {
+        format!("Download the Nemotron model to {}", model.display())
+    } else {
+        model.display().to_string()
+    };
+    Ok(VoiceModelStatus {
+        id: nemotron::MODEL_ID.into(),
+        installed: ready,
+        path,
+        runtime_installed: Some(runtime_installed),
+    })
+}
+
 /// Decodes common desktop media formats into short WAV-sized Speech.framework
 /// requests. Apple documents an approximately one-minute recognition limit,
 /// so long files are chunked before they reach the native API.
@@ -5068,6 +5258,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
             id: settings.cloud_transcription_model,
             installed: true,
             path: "Configured cloud transcription endpoint".into(),
+            runtime_installed: None,
         }),
         VoiceEngine::AppleSpeech => Ok(VoiceModelStatus {
             id: "apple-speech".into(),
@@ -5077,6 +5268,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
             } else {
                 "Apple Speech is available only on macOS".into()
             },
+            runtime_installed: None,
         }),
         VoiceEngine::Whisper => {
             let path = whisper_model_path(&settings, &state)?;
@@ -5084,6 +5276,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
                 id: settings.selected_model,
                 installed: valid_whisper_model_file(&path),
                 path: path.display().to_string(),
+                runtime_installed: None,
             })
         }
         VoiceEngine::Parakeet => {
@@ -5096,13 +5289,10 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
                 } else {
                     "Parakeet is included in the CUDA build".into()
                 },
+                runtime_installed: None,
             })
         }
-        VoiceEngine::Nemotron => Ok(VoiceModelStatus {
-            id: "Nemotron".into(),
-            installed: false,
-            path: "This engine is not available in the portable runtime yet".into(),
-        }),
+        VoiceEngine::Nemotron => nemotron_status(&state),
     }
 }
 
@@ -5110,6 +5300,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
 fn voice_engine_availability() -> VoiceEngineAvailability {
     VoiceEngineAvailability {
         parakeet: parakeet::is_compiled(),
+        nemotron: nemotron::is_compiled(),
     }
 }
 
@@ -5134,6 +5325,7 @@ fn delete_whisper_model(
         id: model_id,
         installed: false,
         path: path.display().to_string(),
+        runtime_installed: None,
     })
 }
 
@@ -5152,7 +5344,211 @@ fn delete_parakeet_model(state: State<'_, AppState>) -> Result<VoiceModelStatus,
         id: parakeet::MODEL_ID.into(),
         installed: false,
         path: path.display().to_string(),
+        runtime_installed: None,
     })
+}
+
+#[tauri::command]
+fn delete_nemotron_model(state: State<'_, AppState>) -> Result<VoiceModelStatus, String> {
+    let path = nemotron_model_path(&state)?;
+    if !path.exists() {
+        return Err("The downloaded Nemotron model is not installed".into());
+    }
+    if !path.is_dir() {
+        return Err("The Nemotron model path is not a directory".into());
+    }
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Could not remove the Nemotron model: {error}"))?;
+    nemotron_status(&state)
+}
+
+#[tauri::command]
+async fn install_nemotron_cuda_runtime(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    if !nemotron::is_compiled() {
+        return Err("Nemotron is included in Voxide's CUDA build for Linux/NVIDIA. Install a CUDA build first.".into());
+    }
+    let runtime = nemotron_runtime_path(&state)?;
+    fs::create_dir_all(&runtime)
+        .map_err(|error| format!("Could not create the Nemotron runtime directory: {error}"))?;
+    let setup = runtime.join("setup-nemotron-cuda-runtime.sh");
+    fs::write(&setup, NEMOTRON_SETUP_SOURCE).map_err(|error| {
+        format!("Could not prepare the Nemotron CUDA runtime installer: {error}")
+    })?;
+    let _ = app.emit(
+        "model-download-progress",
+        ModelDownloadProgress {
+            id: NEMOTRON_RUNTIME_ID.into(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+        },
+    );
+    let output = tokio::process::Command::new("bash")
+        .arg(&setup)
+        .arg(&runtime)
+        .output()
+        .await
+        .map_err(|error| format!("Could not run the Nemotron CUDA runtime installer: {error}"))?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if details.is_empty() {
+            "The Nemotron CUDA runtime installer failed".into()
+        } else {
+            format!("The Nemotron CUDA runtime installer failed: {details}")
+        });
+    }
+    ensure_nemotron_server_script(&runtime)?;
+    if !nemotron::runtime_is_installed(&runtime) {
+        return Err(
+            "The Nemotron CUDA runtime installer finished without creating its Python environment"
+                .into(),
+        );
+    }
+    nemotron_status(&state)
+}
+
+const NEMOTRON_MODEL_FILES: [&str; 6] = [
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+fn nemotron_model_url(file: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{file}?download=true",
+        nemotron::MODEL_REPOSITORY
+    )
+}
+
+async fn nemotron_download_size(client: &reqwest::Client, file: &str) -> Option<u64> {
+    let response = client.head(nemotron_model_url(file)).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.content_length().or_else(|| {
+        response
+            .headers()
+            .get("x-linked-size")
+            .and_then(|size| size.to_str().ok())
+            .and_then(|size| size.parse().ok())
+    })
+}
+
+#[tauri::command]
+async fn download_nemotron_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    if !nemotron::is_compiled() {
+        return Err("Nemotron is included in Voxide's CUDA build for Linux/NVIDIA. Install a CUDA build first.".into());
+    }
+    let runtime = nemotron_runtime_path(&state)?;
+    if !nemotron::runtime_is_installed(&runtime) {
+        return Err("Install the Nemotron CUDA runtime before downloading the model.".into());
+    }
+    let models = state.models_directory()?;
+    let destination = nemotron::model_directory(&models);
+    if nemotron::model_is_installed(&destination) {
+        return nemotron_status(&state);
+    }
+    let staging = models.join(format!(
+        ".{}-download-{}",
+        nemotron::MODEL_ID,
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|error| format!("Could not prepare the Nemotron model download: {error}"))?;
+    let client = reqwest::Client::new();
+    let sizes = futures_util::future::join_all(
+        NEMOTRON_MODEL_FILES
+            .iter()
+            .map(|file| nemotron_download_size(&client, file)),
+    )
+    .await;
+    let total_bytes = sizes
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(|sizes| sizes.into_iter().sum());
+    let download_result = async {
+        let mut downloaded_bytes = 0_u64;
+        for file in NEMOTRON_MODEL_FILES {
+            let response = client
+                .get(nemotron_model_url(file))
+                .send()
+                .await
+                .map_err(|error| format!("Could not download Nemotron {file}: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!("Could not download Nemotron {file}: HTTP {}", response.status()));
+            }
+            if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+                return Err(format!("Could not download Nemotron {file}: the server returned HTML or XML instead of model data."));
+            }
+            let output_path = staging.join(file);
+            let mut output = tokio::fs::File::create(&output_path)
+                .await
+                .map_err(|error| format!("Could not create the Nemotron {file} download: {error}"))?;
+            use tokio::io::AsyncWriteExt;
+            let mut stream = response.bytes_stream();
+            let mut file_bytes = 0_u64;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| format!("The Nemotron {file} download was interrupted: {error}"))?;
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|error| format!("Could not save the Nemotron {file} download: {error}"))?;
+                let count = chunk.len() as u64;
+                downloaded_bytes += count;
+                file_bytes += count;
+                let _ = app.emit(
+                    "model-download-progress",
+                    ModelDownloadProgress {
+                        id: NEMOTRON_MODEL_DOWNLOAD_ID.into(),
+                        downloaded_bytes,
+                        total_bytes,
+                    },
+                );
+            }
+            output
+                .flush()
+                .await
+                .map_err(|error| format!("Could not finalize the Nemotron {file} download: {error}"))?;
+            if file_bytes == 0 {
+                return Err(format!("The Nemotron {file} download was empty"));
+            }
+            if file == "model.safetensors" && file_bytes < 1_000_000_000 {
+                return Err("The Nemotron model download is unexpectedly small; refusing to install it.".into());
+            }
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = download_result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+    if !nemotron::model_is_installed(&staging) {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err("The Nemotron model download is incomplete".into());
+    }
+    if destination.exists() {
+        tokio::fs::remove_dir_all(&destination)
+            .await
+            .map_err(|error| format!("Could not replace the existing Nemotron model: {error}"))?;
+    }
+    tokio::fs::rename(&staging, &destination)
+        .await
+        .map_err(|error| format!("Could not install the Nemotron model: {error}"))?;
+    state.update(|database| {
+        database.settings.selected_voice_engine = VoiceEngine::Nemotron;
+        database.settings.local_model_path = None;
+    })?;
+    nemotron_status(&state)
 }
 
 #[tauri::command]
@@ -5268,6 +5664,7 @@ async fn download_whisper_model(
         id: model_id,
         installed: true,
         path: destination.display().to_string(),
+        runtime_installed: None,
     })
 }
 
@@ -5424,6 +5821,7 @@ async fn download_parakeet_model(
         id: parakeet::MODEL_ID.into(),
         installed: true,
         path: destination.display().to_string(),
+        runtime_installed: None,
     })
 }
 
@@ -5492,6 +5890,22 @@ fn start_native_dictation(
             database.dictionary.clone(),
         )
     };
+    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
+        if !nemotron::is_compiled() {
+            return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+        }
+        let runtime = nemotron_runtime_path(&state)?;
+        if !nemotron::runtime_is_installed(&runtime) {
+            return Err(
+                "Install the Nemotron CUDA runtime from Voice Engine before dictating.".into(),
+            );
+        }
+        let model = nemotron_model_path(&state)?;
+        if !nemotron::model_is_installed(&model) {
+            return Err("Download the Nemotron model from Voice Engine before dictating.".into());
+        }
+        ensure_nemotron_server_script(&runtime)?;
+    }
     if let Err(error) = apply_overlay_window_layout(&app, &settings) {
         debug_log::append(&format!(
             "Could not apply dictation overlay layout: {error}"
@@ -5501,6 +5915,23 @@ fn start_native_dictation(
         "Dictation capture started (engine: {:?}, streaming preview: {})",
         settings.selected_voice_engine, settings.enable_streaming_preview
     ));
+    let preview_generation = capture_state
+        .preview_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    // Reserve the single cache-aware stream before opening the microphone. If
+    // a previous Nemotron finalization is still running, fail cleanly instead
+    // of leaving an otherwise invisible capture active.
+    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
+        let mut live = capture_state
+            .nemotron_live
+            .try_lock()
+            .map_err(|_| "Nemotron is still finishing the previous dictation".to_string())?;
+        live.generation = preview_generation;
+        live.fed_samples = 0;
+        live.session_started = false;
+        live.start_error = None;
+    }
     let started = audio::AudioCapture::start(
         settings.selected_input_device.as_deref(),
         Some(Arc::new(move |level| {
@@ -5518,10 +5949,6 @@ fn start_native_dictation(
     *capture = Some(started);
     drop(capture);
     update_tray_status(&app, TrayVisualState::Recording);
-    let preview_generation = capture_state
-        .preview_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
     if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
         *capture_state
             .parakeet_live
@@ -5570,6 +5997,22 @@ fn start_native_dictation(
                 );
             }
         }
+    }
+    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
+        let runtime = nemotron_runtime_path(&state)?;
+        let model = nemotron_model_path(&state)?;
+        let script = ensure_nemotron_server_script(&runtime)?;
+        spawn_live_nemotron_stream(
+            app.clone(),
+            preview_generation,
+            runtime,
+            script,
+            model,
+            settings.language.clone(),
+            settings.nemotron_streaming_mode.lookahead_tokens(),
+            settings.enable_streaming_preview,
+            settings.transcription_preview_char_limit,
+        );
     }
     if settings.enable_streaming_preview
         && matches!(&settings.selected_voice_engine, VoiceEngine::Cloud)
@@ -5833,11 +6276,12 @@ fn spawn_live_whisper_preview(
     });
 }
 
-/// Mirrors FluidVoice's Parakeet TDT v3 preview path. TDT is an offline model,
-/// so every snapshot is a fresh decode of the complete capture—not VAD-sliced
-/// audio and not a stateful streaming decoder. FluidVoice runs this once every
-/// 600 ms after one second of audio, skips one tick after a slow decode, and
-/// reconciles successive full hypotheses before updating the overlay.
+/// Mirrors FluidVoice's Parakeet TDT v3 preview cadence. TDT is an offline
+/// model, so every snapshot is a fresh decode of the complete capture—not
+/// VAD-sliced audio and not a stateful streaming decoder. Voxide additionally
+/// hides the timestamped, still-tentative tail of each CUDA hypothesis before
+/// showing it, because Sherpa's INT8 ONNX decoder can otherwise invent words
+/// at the live endpoint that disappear in the final full decode.
 fn spawn_live_parakeet_preview(
     app: AppHandle,
     preview_generation: u64,
@@ -5886,7 +6330,7 @@ fn spawn_live_parakeet_preview(
             let started = Instant::now();
             let model_path = model_path.clone();
             let result = tauri::async_runtime::spawn_blocking(move || {
-                parakeet::transcribe_samples(&samples, &model_path)
+                parakeet::transcribe_preview_samples(&samples, &model_path)
             })
             .await
             .map_err(|error| format!("preview task failed: {error}"))
@@ -5929,6 +6373,150 @@ fn spawn_live_parakeet_preview(
                     "Live Parakeet preview skipped (audio_ms: {}): {error}",
                     (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64
                 )),
+            }
+        }
+    });
+}
+
+/// Drives NVIDIA's cache-aware FastConformer stream. Unlike the Parakeet TDT
+/// preview above, this never re-decodes a growing recording: every successful
+/// poll sends only the samples captured since the previous poll to the Python
+/// sidecar, whose encoder/decoder caches retain the prior context.
+fn spawn_live_nemotron_stream(
+    app: AppHandle,
+    preview_generation: u64,
+    runtime_directory: PathBuf,
+    script: PathBuf,
+    model_directory: PathBuf,
+    language: String,
+    lookahead_tokens: u8,
+    show_preview: bool,
+    preview_char_limit: usize,
+) {
+    tauri::async_runtime::spawn(async move {
+        const POLL_INTERVAL: Duration = Duration::from_millis(80);
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let captured = capture_state.capture.lock().ok().and_then(|capture| {
+                capture
+                    .as_ref()
+                    .and_then(|capture| capture.snapshot_all().ok())
+            });
+            let Some(captured) = captured else {
+                return;
+            };
+            let samples = match audio::mono_resample_for_whisper(captured) {
+                Ok(samples) => samples,
+                Err(error) => {
+                    debug_log::append(&format!(
+                        "Live Nemotron preview could not resample audio: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let result = {
+                let mut live = capture_state.nemotron_live.lock().await;
+                if live.generation != preview_generation {
+                    return;
+                }
+                if let Some(error) = &live.start_error {
+                    Err(error.clone())
+                } else {
+                    if live.server.is_none() {
+                        let server = nemotron::Server::launch(
+                            &nemotron::python_path(&runtime_directory),
+                            &script,
+                            &model_directory,
+                        )
+                        .await;
+                        match server {
+                            Ok(server) => live.server = Some(server),
+                            Err(error) => {
+                                live.start_error = Some(error.clone());
+                                return debug_log::append(&format!(
+                                    "Live Nemotron stream could not start: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    if !live.session_started {
+                        let started = live
+                            .server
+                            .as_mut()
+                            .expect("Nemotron server was just initialized")
+                            .start(&language, lookahead_tokens)
+                            .await;
+                        if let Err(error) = started {
+                            live.start_error = Some(error.clone());
+                            Err(error)
+                        } else {
+                            live.session_started = true;
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|()| {
+                        let start = live.fed_samples.min(samples.len());
+                        if start == samples.len() {
+                            return Ok(None);
+                        }
+                        Ok(Some(samples[start..].to_vec()))
+                    })
+                }
+            };
+            let delta = match result {
+                Ok(Some(delta)) => delta,
+                Ok(None) => continue,
+                Err(error) => {
+                    debug_log::append(&format!("Live Nemotron stream stopped: {error}"));
+                    let mut live = capture_state.nemotron_live.lock().await;
+                    if live.generation == preview_generation {
+                        live.start_error = Some(error);
+                    }
+                    return;
+                }
+            };
+            let partial = {
+                let mut live = capture_state.nemotron_live.lock().await;
+                if live.generation != preview_generation {
+                    return;
+                }
+                let result = live
+                    .server
+                    .as_mut()
+                    .expect("Nemotron server was initialized before appending")
+                    .append(&delta)
+                    .await;
+                if result.is_ok() {
+                    live.fed_samples = samples.len();
+                }
+                result
+            };
+            match partial {
+                Ok(text) if show_preview && !text.trim().is_empty() => {
+                    if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation
+                    {
+                        emit_overlay(
+                            &app,
+                            "recording",
+                            tail_characters(&text, preview_char_limit),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    debug_log::append(&format!("Live Nemotron audio append failed: {error}"));
+                    let mut live = capture_state.nemotron_live.lock().await;
+                    if live.generation == preview_generation {
+                        live.start_error = Some(error);
+                    }
+                    return;
+                }
             }
         }
     });
@@ -6101,6 +6689,60 @@ fn transcribe_parakeet_final(
     parakeet::transcribe_samples_with_vocabulary(samples, model_path, vocabulary)
 }
 
+/// Flushes the active Nemotron stream with the capture tail that the 80 ms
+/// polling task has not observed yet. When a user stops immediately after
+/// recording starts, this lazily creates the same stream and feeds the whole
+/// recording, so final transcription never depends on preview timing.
+async fn finish_nemotron_live(
+    capture_state: &NativeCaptureState,
+    recording_generation: u64,
+    samples: &[f32],
+    runtime_directory: &Path,
+    script: &Path,
+    model_directory: &Path,
+    language: &str,
+    lookahead_tokens: u8,
+) -> Result<String, String> {
+    let mut live = capture_state.nemotron_live.lock().await;
+    if let Some(error) = live.start_error.take() {
+        return Err(format!("Nemotron CUDA stream could not start: {error}"));
+    }
+    if live.generation != recording_generation {
+        live.generation = recording_generation;
+        live.fed_samples = 0;
+        live.session_started = false;
+    }
+    if live.server.is_none() {
+        live.server = Some(
+            nemotron::Server::launch(
+                &nemotron::python_path(runtime_directory),
+                script,
+                model_directory,
+            )
+            .await?,
+        );
+    }
+    if !live.session_started {
+        live.server
+            .as_mut()
+            .expect("Nemotron server was initialized")
+            .start(language, lookahead_tokens)
+            .await?;
+        live.session_started = true;
+    }
+    let start = live.fed_samples.min(samples.len());
+    let result = live
+        .server
+        .as_mut()
+        .expect("Nemotron streaming session was initialized")
+        .finish(&samples[start..])
+        .await;
+    live.fed_samples = 0;
+    live.session_started = false;
+    live.generation = 0;
+    result
+}
+
 #[tauri::command]
 async fn stop_native_dictation(
     app: AppHandle,
@@ -6111,7 +6753,7 @@ async fn stop_native_dictation(
     prompt_test_mode: Option<bool>,
     prompt_test_prompt: Option<String>,
 ) -> Result<NativeTranscriptionResult, String> {
-    capture_state
+    let recording_generation = capture_state
         .preview_generation
         .fetch_add(1, Ordering::SeqCst);
     let capture = capture_state
@@ -6194,8 +6836,7 @@ async fn stop_native_dictation(
                 )
             })
             .await
-                .map_err(|error| format!("Voice engine task failed: {error}"))??
-                ;
+            .map_err(|error| format!("Voice engine task failed: {error}"))??;
             (result.text, Some(result.timings))
         }
         VoiceEngine::Parakeet => {
@@ -6211,6 +6852,32 @@ async fn stop_native_dictation(
             })
             .await
             .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
+            (text, None)
+        }
+        VoiceEngine::Nemotron => {
+            if !nemotron::is_compiled() {
+                return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+            }
+            let runtime = nemotron_runtime_path(&state)?;
+            if !nemotron::runtime_is_installed(&runtime) {
+                return Err("Install the Nemotron CUDA runtime before recording.".into());
+            }
+            let model = nemotron_model_path(&state)?;
+            if !nemotron::model_is_installed(&model) {
+                return Err("Download the Nemotron model before recording.".into());
+            }
+            let script = ensure_nemotron_server_script(&runtime)?;
+            let text = finish_nemotron_live(
+                &capture_state,
+                recording_generation,
+                &samples,
+                &runtime,
+                &script,
+                &model,
+                &settings.language,
+                settings.nemotron_streaming_mode.lookahead_tokens(),
+            )
+            .await?;
             (text, None)
         }
         VoiceEngine::Cloud => {
@@ -6242,7 +6909,6 @@ async fn stop_native_dictation(
             .map_err(|error| format!("Apple Speech task failed: {error}"))??;
             (text, None)
         }
-        _ => return Err("This voice engine is not available in the portable runtime yet. Select Whisper or configure a compatible cloud provider.".into()),
     };
     let transcription_latency_ms = transcription_started.elapsed().as_millis() as u64;
     let cleanup_style = if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
@@ -6815,6 +7481,24 @@ fn cancel_native_dictation(
         .take();
     let cancelled = capture.is_some();
     if cancelled {
+        let nemotron_live = Arc::clone(&capture_state.nemotron_live);
+        tauri::async_runtime::spawn(async move {
+            let mut live = nemotron_live.lock().await;
+            if live.session_started {
+                if let Some(server) = live.server.as_mut() {
+                    if let Err(error) = server.abort().await {
+                        debug_log::append(&format!(
+                            "Could not cancel the Nemotron stream cleanly: {error}"
+                        ));
+                        server.terminate();
+                    }
+                }
+            }
+            live.fed_samples = 0;
+            live.session_started = false;
+            live.generation = 0;
+            live.start_error = None;
+        });
         *capture_state
             .context
             .lock()
@@ -7569,11 +8253,14 @@ pub fn run() {
             voice_engine_availability,
             delete_whisper_model,
             delete_parakeet_model,
+            delete_nemotron_model,
             audio_input_devices,
             accessibility_permission_status,
             open_accessibility_settings,
             download_whisper_model,
             download_parakeet_model,
+            install_nemotron_cuda_runtime,
+            download_nemotron_model,
             start_native_dictation,
             stop_native_dictation,
             cancel_native_dictation,

@@ -9,6 +9,7 @@ type DictationMode = "dictate" | "prompt" | "rewrite" | "command" | "file";
 type TranscriptionSound = "none" | "cue_1" | "cue_2" | "cue_3" | "cue_4" | "cue_5";
 type TextInsertionMode = "standard" | "reliablePaste";
 type WhisperBeamSize = "auto" | "greedy" | "beam2" | "beam5";
+type NemotronStreamingMode = "fast" | "balanced" | "quality";
 const builtInProviderIds = new Set(["openai", "anthropic", "xai", "groq", "cerebras", "google", "openrouter", "ollama", "lmstudio"]);
 const providerSetupLabels: Record<string, string> = {
   openai: "Get API key", anthropic: "Get API key", xai: "Get API key", groq: "Get API key",
@@ -65,6 +66,7 @@ interface Settings {
   selectedVoiceEngine: "whisper" | "parakeet" | "nemotron" | "appleSpeech" | "cloud";
   selectedModel: string;
   whisperBeamSize: WhisperBeamSize;
+  nemotronStreamingMode: NemotronStreamingMode;
   localModelPath?: string;
   selectedInputDevice?: string;
   cloudTranscriptionModel: string;
@@ -231,10 +233,12 @@ interface VoiceModelStatus {
   id: string;
   installed: boolean;
   path: string;
+  runtimeInstalled?: boolean;
 }
 
 interface VoiceEngineAvailability {
   parakeet: boolean;
+  nemotron: boolean;
 }
 
 interface ModelDownloadProgress {
@@ -457,7 +461,7 @@ let currentView = "welcome";
 let recording = false;
 let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
-let voiceEngineAvailability: VoiceEngineAvailability = { parakeet: false };
+let voiceEngineAvailability: VoiceEngineAvailability = { parakeet: false, nemotron: false };
 let modelDownloadProgress: ModelDownloadProgress | undefined;
 let audioDevices: string[] = [];
 let providers: AiProviderView[] = [];
@@ -714,24 +718,28 @@ function renderVoiceEngine(): void {
   const engines: [Settings["selectedVoiceEngine"], string, string, boolean][] = [
     ["whisper", "Whisper", "Local models with broad language support", true],
     ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with FluidVoice-style full-buffer preview", voiceEngineAvailability.parakeet],
-    ["nemotron", "Nemotron Speech", "Apple Silicon-only runtime — portable implementation pending", false],
+    ["nemotron", "Nemotron Speech", "Local NVIDIA CUDA true-streaming transcription", voiceEngineAvailability.nemotron],
     ["appleSpeech", "System speech", "Use the operating system speech service", true],
     ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", true],
   ];
   const selectedEngine = database.settings.selectedVoiceEngine;
   const isWhisper = selectedEngine === "whisper";
   const isParakeet = selectedEngine === "parakeet";
+  const isNemotron = selectedEngine === "nemotron";
   const isCloud = selectedEngine === "cloud";
   const isAppleSpeech = selectedEngine === "appleSpeech";
   const status = modelStatus?.installed
     ? `<span class="status done">Installed</span>`
-    : `<span class="status pending">${isParakeet && !voiceEngineAvailability.parakeet ? "CUDA build required" : "Not installed"}</span>`;
-  const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v3-int8" : "";
+    : `<span class="status pending">${(isParakeet && !voiceEngineAvailability.parakeet) || (isNemotron && !voiceEngineAvailability.nemotron) ? "CUDA build required" : "Not installed"}</span>`;
+  const nemotronRuntimeReady = modelStatus?.runtimeInstalled === true;
+  const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v3-int8" : isNemotron ? (nemotronRuntimeReady ? "nemotron-3.5-asr-streaming-0.6b" : "nemotron-cuda-runtime") : "";
   const downloading = downloadId && modelDownloadProgress?.id === downloadId ? modelDownloadProgress : undefined;
   const downloadDetail = downloading
-    ? `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
+    ? downloadId === "nemotron-cuda-runtime"
+      ? "Installing the local CUDA runtime…"
+      : `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
     : "";
-  const canDeleteDownloadedModel = (isWhisper && !database.settings.localModelPath || isParakeet) && modelStatus?.installed;
+  const canDeleteDownloadedModel = (isWhisper && !database.settings.localModelPath || isParakeet || isNemotron) && modelStatus?.installed;
   const selectedInputDeviceUnavailable = Boolean(
     database.settings.selectedInputDevice && !audioDevices.includes(database.settings.selectedInputDevice),
   );
@@ -743,6 +751,8 @@ function renderVoiceEngine(): void {
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isParakeet
       ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v3 (INT8) automatically detects the spoken language. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      : isNemotron
+        ? `<section class="setting-subsection"><h3>Nemotron input</h3>${microphoneInput}<label>Streaming profile<select id="nemotron-streaming-mode"><option value="fast" ${database.settings.nemotronStreamingMode === "fast" ? "selected" : ""}>Fast — 320 ms chunks</option><option value="balanced" ${database.settings.nemotronStreamingMode === "balanced" ? "selected" : ""}>Balanced — 560 ms chunks (recommended)</option><option value="quality" ${database.settings.nemotronStreamingMode === "quality" ? "selected" : ""}>Quality — 1.12 s chunks</option></select><small>Larger chunks give the model more right-context and generally improve recognition accuracy; all three remain true cache-aware streams.</small></label><small>Nemotron 3.5 ASR Streaming 0.6B feeds new microphone audio through its CUDA encoder cache and emits incremental text. The final transcript flushes that same stream; it does not use VAD segmentation.</small></section><p class="muted">Runs locally on Linux/NVIDIA CUDA. First install the user-local PyTorch CUDA runtime, then download the 2.6 GB model. The runtime and model are separate so the model can be removed from this screen.</p>`
       : isCloud
       ? `<label>Cloud transcription model<input id="cloud-transcription-model" value="${escapeHtml(database.settings.cloudTranscriptionModel)}" placeholder="gpt-4o-mini-transcribe"></label><p class="muted">Uses the enabled OpenAI-compatible AI provider and its stored API key.</p>`
       : isAppleSpeech
@@ -752,6 +762,10 @@ function renderVoiceEngine(): void {
     ? `<button data-action="download-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download selected model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
     : isParakeet && voiceEngineAvailability.parakeet
       ? `<button data-action="download-parakeet-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Parakeet model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-parakeet-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
+      : isNemotron && voiceEngineAvailability.nemotron
+        ? (!nemotronRuntimeReady
+          ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
+          : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`)
     : "";
   renderShell(`
     ${pageTitle("Voice Engine", "Choose the transcription runtime used for dictation.")}
@@ -759,8 +773,8 @@ function renderVoiceEngine(): void {
       <button class="engine-choice ${database.settings.selectedVoiceEngine === id ? "active" : ""}" data-engine="${id}" ${available ? "" : "disabled"}><strong>${name}</strong><span>${description}</span><em>${available ? (database.settings.selectedVoiceEngine === id ? "Selected" : "Select") : "Not available"}</em></button>`).join("")}</div></section>
     <section class="card form-card"><div class="card-title"><h2>Model configuration</h2>${status}</div>
       ${engineConfiguration}
-      ${isWhisper || isCloud ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"></label>` : ""}
-      ${isParakeet ? "" : microphoneInput}
+      ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
+      ${isParakeet || isNemotron ? "" : microphoneInput}
       <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
@@ -2377,6 +2391,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
     case "save-engine": {
       const model = readInput("selected-model")?.value.trim();
       const whisperBeamSize = readInput("whisper-beam-size")?.value as WhisperBeamSize | undefined;
+      const nemotronStreamingMode = readInput("nemotron-streaming-mode")?.value as NemotronStreamingMode | undefined;
       const language = readInput("language")?.value.trim();
       const appleSpeechLocale = readInput("apple-speech-locale")?.value.trim();
       const localModelPath = readInput("local-model-path")?.value.trim();
@@ -2384,6 +2399,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
       const cloudTranscriptionModel = readInput("cloud-transcription-model")?.value.trim();
       if (model) database.settings.selectedModel = model;
       if (whisperBeamSize) database.settings.whisperBeamSize = whisperBeamSize;
+      if (nemotronStreamingMode) database.settings.nemotronStreamingMode = nemotronStreamingMode;
       if (language) database.settings.language = language;
       if (appleSpeechLocale) database.settings.appleSpeechLocale = appleSpeechLocale;
       database.settings.localModelPath = localModelPath || undefined;
@@ -2471,6 +2487,49 @@ async function handleAction(element: HTMLElement): Promise<void> {
         render();
       } catch (error) {
         showNotice(`Could not remove Parakeet: ${String(error)}`);
+      }
+      break;
+    }
+    case "install-nemotron-runtime": {
+      showNotice("Installing the local PyTorch CUDA runtime for Nemotron. This downloads several GB once and may take a few minutes.");
+      modelDownloadProgress = { id: "nemotron-cuda-runtime", downloadedBytes: 0 };
+      render();
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("install_nemotron_cuda_runtime");
+        showNotice("Nemotron CUDA runtime is ready. Download the model to finish setup.");
+      } catch (error) {
+        showNotice(`Could not install the Nemotron CUDA runtime: ${String(error)}`);
+      } finally {
+        modelDownloadProgress = undefined;
+        render();
+      }
+      break;
+    }
+    case "download-nemotron-model": {
+      showNotice("Downloading Nemotron 3.5 ASR Streaming 0.6B. The model weights are about 2.6 GB and may take a few minutes.");
+      modelDownloadProgress = { id: "nemotron-3.5-asr-streaming-0.6b", downloadedBytes: 0 };
+      render();
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("download_nemotron_model");
+        database.settings.selectedVoiceEngine = "nemotron";
+        database.settings.localModelPath = undefined;
+        showNotice("Nemotron is ready for local CUDA dictation.");
+      } catch (error) {
+        showNotice(`Could not download Nemotron: ${String(error)}`);
+      } finally {
+        modelDownloadProgress = undefined;
+        render();
+      }
+      break;
+    }
+    case "delete-nemotron-model": {
+      if (!window.confirm("Remove the downloaded Nemotron model? The CUDA runtime will remain installed, and you can download the model again later.")) break;
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("delete_nemotron_model");
+        showNotice("Nemotron model was removed.");
+        render();
+      } catch (error) {
+        showNotice(`Could not remove Nemotron: ${String(error)}`);
       }
       break;
     }
