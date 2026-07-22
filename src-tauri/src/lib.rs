@@ -10385,6 +10385,40 @@ mod tests {
     }
 
     #[test]
+    fn pause_heavy_preview_fixture_updates_after_each_spoken_section() {
+        let mut preview = WhisperPreviewStability::default();
+        let mut updates = Vec::new();
+
+        updates.push(
+            preview
+                .observe("one two three")
+                .expect("first spoken section"),
+        );
+        updates.push(preview.observe_silence().expect("first pause retains text"));
+        updates.push(
+            preview
+                .observe("one two three test again")
+                .expect("second spoken section"),
+        );
+        updates.push(
+            preview
+                .observe_silence()
+                .expect("second pause retains text"),
+        );
+        updates.push(
+            preview
+                .observe("one two three test again final words")
+                .expect("third spoken section"),
+        );
+
+        assert_eq!(updates[0], "one two three");
+        assert_eq!(updates[1], "one two three");
+        assert_eq!(updates[2], "one two three test again");
+        assert_eq!(updates[3], "one two three");
+        assert_eq!(updates[4], "one two three test again final words");
+    }
+
+    #[test]
     fn parakeet_preview_matches_fluidvoice_full_snapshot_reconciliation() {
         assert_eq!(
             fluidvoice_preview_reconcile("", "one two three"),
