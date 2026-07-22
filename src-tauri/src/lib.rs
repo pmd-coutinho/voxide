@@ -5556,8 +5556,7 @@ fn replace_component_directory(staging: &Path, destination: &Path) -> Result<(),
     if had_previous {
         if let Err(error) = fs::remove_dir_all(&backup) {
             debug_log::append(&format!(
-                "Could not remove superseded component backup {}: {error}",
-                backup.display()
+                "Could not remove superseded component backup: {error}"
             ));
         }
     }
