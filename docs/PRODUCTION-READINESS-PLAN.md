@@ -1331,7 +1331,7 @@ Completion checklist:
 - [x] Capture health appears in redacted diagnostics.
 - [x] 44.1 and 48 kHz fixture tests pass.
 - [ ] Pause-heavy dictation fixture produces multiple preview updates.
-- [ ] Silence-only suffix does not append preview text in the behavioral test.
+- [x] Silence-only suffix does not append preview text in the behavioral test.
 - [x] Existing final transcription tests remain green.
 - [ ] Frontend build and portable/CUDA feature builds remain green.
 
