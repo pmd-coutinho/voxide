@@ -1459,11 +1459,31 @@ impl Default for NativeCaptureState {
 }
 
 fn begin_preview(capture_state: &NativeCaptureState, session_id: u64) -> bool {
-    capture_state
+    let admission = capture_state
         .session
         .lock()
-        .map(|mut coordinator| coordinator.begin_preview(session_id))
-        .unwrap_or(false)
+        .map(|mut coordinator| coordinator.begin_preview(session_id));
+    match admission {
+        Ok(session::PreviewAdmission::Admitted) => true,
+        Ok(session::PreviewAdmission::Busy) => {
+            debug_log::append(&format!(
+                "Preview skipped (session: {session_id}, reason: busy)"
+            ));
+            false
+        }
+        Ok(session::PreviewAdmission::Inactive) => {
+            debug_log::append(&format!(
+                "Preview skipped (session: {session_id}, reason: finalizing_or_stale)"
+            ));
+            false
+        }
+        Err(_) => {
+            debug_log::append(&format!(
+                "Preview skipped (session: {session_id}, reason: coordinator_lock)"
+            ));
+            false
+        }
+    }
 }
 
 fn finish_preview(capture_state: &NativeCaptureState, session_id: u64) {

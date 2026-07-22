@@ -10,6 +10,13 @@ pub enum SessionState {
     Finalizing { id: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewAdmission {
+    Admitted,
+    Busy,
+    Inactive,
+}
+
 #[derive(Debug, Default)]
 pub struct Coordinator {
     next_id: u64,
@@ -50,12 +57,15 @@ impl Coordinator {
     /// Admits at most one display-only preview task for the active recording.
     /// Finalization changes the state before it begins final inference, so no
     /// newly admitted preview can delay or overwrite a terminal result.
-    pub fn begin_preview(&mut self, id: u64) -> bool {
-        if self.state != (SessionState::Recording { id }) || self.preview_in_flight.is_some() {
-            return false;
+    pub fn begin_preview(&mut self, id: u64) -> PreviewAdmission {
+        if self.state != (SessionState::Recording { id }) {
+            return PreviewAdmission::Inactive;
+        }
+        if self.preview_in_flight.is_some() {
+            return PreviewAdmission::Busy;
         }
         self.preview_in_flight = Some(id);
-        true
+        PreviewAdmission::Admitted
     }
 
     pub fn finish_preview(&mut self, id: u64) -> bool {
@@ -121,10 +131,10 @@ mod tests {
     fn finalization_stops_new_previews_without_waiting_for_the_old_one() {
         let mut coordinator = Coordinator::default();
         let id = coordinator.start().expect("session starts");
-        assert!(coordinator.begin_preview(id));
-        assert!(!coordinator.begin_preview(id));
+        assert_eq!(coordinator.begin_preview(id), PreviewAdmission::Admitted);
+        assert_eq!(coordinator.begin_preview(id), PreviewAdmission::Busy);
         assert!(coordinator.begin_finalizing(id));
-        assert!(!coordinator.begin_preview(id));
+        assert_eq!(coordinator.begin_preview(id), PreviewAdmission::Inactive);
         assert!(coordinator.finish_preview(id));
         assert!(coordinator.finish(id));
     }
