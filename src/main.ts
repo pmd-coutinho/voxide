@@ -243,6 +243,21 @@ interface ModelDownloadProgress {
   totalBytes?: number;
 }
 
+const whisperModelIds = new Set([
+  "tiny",
+  "base",
+  "small",
+  "medium",
+  "large-v3-turbo",
+  "large-v3-turbo-q5_0",
+  "large-v3-turbo-q8_0",
+  "large-v3",
+  "tiny.en",
+  "base.en",
+  "small.en",
+  "medium.en",
+]);
+
 interface NativeTranscriptionResult {
   text: string;
   rawText: string;
@@ -721,12 +736,13 @@ function renderVoiceEngine(): void {
     database.settings.selectedInputDevice && !audioDevices.includes(database.settings.selectedInputDevice),
   );
   const deviceOptions = [`<option value="" ${!database.settings.selectedInputDevice || selectedInputDeviceUnavailable ? "selected" : ""}>System default${selectedInputDeviceUnavailable ? " (preferred device unavailable)" : ""}</option>`, ...audioDevices.map((device) => `<option value="${escapeHtml(device)}" ${database.settings.selectedInputDevice === device ? "selected" : ""}>${escapeHtml(device)}</option>`)].join("");
+  const microphoneInput = `<label>Microphone input<select id="input-device">${deviceOptions}</select><small>${audioDevices.length ? "Choose the microphone used for every local dictation engine." : "No individual devices are available right now; Voxide will use the system default microphone."}</small></label>`;
   const engineConfiguration = isWhisper
     ? `<label>Selected Whisper model<select id="selected-model"><option value="tiny" ${database.settings.selectedModel === "tiny" ? "selected" : ""}>Tiny — multilingual, fastest</option><option value="base" ${database.settings.selectedModel === "base" ? "selected" : ""}>Base — multilingual, default</option><option value="small" ${database.settings.selectedModel === "small" ? "selected" : ""}>Small — multilingual, higher accuracy</option><option value="medium" ${database.settings.selectedModel === "medium" ? "selected" : ""}>Medium — multilingual</option><option value="large-v3-turbo" ${database.settings.selectedModel === "large-v3-turbo" ? "selected" : ""}>Large v3 Turbo — multilingual</option><option value="large-v3-turbo-q5_0" ${database.settings.selectedModel === "large-v3-turbo-q5_0" ? "selected" : ""}>Large v3 Turbo Q5 — smaller local fallback</option><option value="large-v3-turbo-q8_0" ${database.settings.selectedModel === "large-v3-turbo-q8_0" ? "selected" : ""}>Large v3 Turbo Q8 — smaller local fallback</option><option value="large-v3" ${database.settings.selectedModel === "large-v3" ? "selected" : ""}>Large v3 — multilingual</option><optgroup label="Legacy English-only Whisper models"><option value="tiny.en" ${database.settings.selectedModel === "tiny.en" ? "selected" : ""}>Tiny English</option><option value="base.en" ${database.settings.selectedModel === "base.en" ? "selected" : ""}>Base English</option><option value="small.en" ${database.settings.selectedModel === "small.en" ? "selected" : ""}>Small English</option><option value="medium.en" ${database.settings.selectedModel === "medium.en" ? "selected" : ""}>Medium English</option></optgroup></select></label>
       <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isParakeet
-      ? `<p class="muted">Parakeet TDT 0.6B v3 (INT8) runs locally through the CUDA build. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v3 (INT8) automatically detects the spoken language. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
       : isCloud
       ? `<label>Cloud transcription model<input id="cloud-transcription-model" value="${escapeHtml(database.settings.cloudTranscriptionModel)}" placeholder="gpt-4o-mini-transcribe"></label><p class="muted">Uses the enabled OpenAI-compatible AI provider and its stored API key.</p>`
       : isAppleSpeech
@@ -743,8 +759,8 @@ function renderVoiceEngine(): void {
       <button class="engine-choice ${database.settings.selectedVoiceEngine === id ? "active" : ""}" data-engine="${id}" ${available ? "" : "disabled"}><strong>${name}</strong><span>${description}</span><em>${available ? (database.settings.selectedVoiceEngine === id ? "Selected" : "Select") : "Not available"}</em></button>`).join("")}</div></section>
     <section class="card form-card"><div class="card-title"><h2>Model configuration</h2>${status}</div>
       ${engineConfiguration}
-      ${isAppleSpeech ? "" : `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"></label>`}
-      <label>Microphone input<select id="input-device">${deviceOptions}</select></label>
+      ${isWhisper || isCloud ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"></label>` : ""}
+      ${isParakeet ? "" : microphoneInput}
       <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
@@ -1932,8 +1948,21 @@ function bindCommonEvents(): void {
     }
   }));
   document.querySelectorAll<HTMLElement>("[data-engine]").forEach((element) => element.addEventListener("click", () => {
-    database.settings.selectedVoiceEngine = element.dataset.engine as Settings["selectedVoiceEngine"];
-    void saveSettings().then(async () => { await refreshModelStatus(); render(); });
+    const engine = element.dataset.engine as Settings["selectedVoiceEngine"] | undefined;
+    if (!engine) return;
+    // Earlier CUDA builds stored Parakeet's model ID in selectedModel. That
+    // is not a valid Whisper model, so recover to the default before asking
+    // the backend for Whisper's model status.
+    if (engine === "whisper" && !database.settings.localModelPath && !whisperModelIds.has(database.settings.selectedModel)) {
+      database.settings.selectedModel = "base";
+    }
+    database.settings.selectedVoiceEngine = engine;
+    void saveSettings()
+      .then(async () => { await refreshModelStatus(); render(); })
+      .catch((error) => {
+        showNotice(`Could not switch voice engine: ${String(error)}`);
+        render();
+      });
   }));
   document.querySelectorAll<HTMLElement>("[data-delete-entry]").forEach((element) => element.addEventListener("click", () => {
     void deleteHistoryEntry(element.dataset.deleteEntry ?? "");
@@ -2424,7 +2453,6 @@ async function handleAction(element: HTMLElement): Promise<void> {
       try {
         modelStatus = await invoke<VoiceModelStatus>("download_parakeet_model");
         database.settings.selectedVoiceEngine = "parakeet";
-        database.settings.selectedModel = "parakeet-tdt-0.6b-v3-int8";
         database.settings.localModelPath = undefined;
         showNotice("Parakeet is ready for local CUDA dictation.");
       } catch (error) {

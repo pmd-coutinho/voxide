@@ -225,6 +225,22 @@ struct BackupArchive {
 }
 
 fn normalize_database(database: &mut AppDatabase) {
+    // A previous Parakeet download path overwrote selected_model with
+    // Parakeet's model ID. If that persisted while Whisper was selected,
+    // resolving Whisper's model status failed before the user could choose a
+    // valid model. Preserve custom local model paths, otherwise repair it.
+    if matches!(
+        database.settings.selected_voice_engine,
+        VoiceEngine::Whisper
+    ) && database
+        .settings
+        .local_model_path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+        && whisper_model_filename(&database.settings.selected_model).is_err()
+    {
+        database.settings.selected_model = "base".into();
+    }
     database.settings.user_typing_wpm = database.settings.user_typing_wpm.clamp(1, 200);
     database.settings.transcription_sound_volume =
         database.settings.transcription_sound_volume.clamp(0.0, 1.0);
@@ -7658,6 +7674,17 @@ mod tests {
 
         assert_eq!(database.settings.transcription_start_sound, "cue_1");
         assert_eq!(database.settings.transcription_sound_volume, 1.0);
+    }
+
+    #[test]
+    fn invalid_whisper_model_from_legacy_parakeet_selection_is_repaired() {
+        let mut database = AppDatabase::default();
+        database.settings.selected_voice_engine = VoiceEngine::Whisper;
+        database.settings.selected_model = parakeet::MODEL_ID.into();
+
+        normalize_database(&mut database);
+
+        assert_eq!(database.settings.selected_model, "base");
     }
 
     #[test]
