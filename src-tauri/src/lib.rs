@@ -1563,6 +1563,7 @@ fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
                 "error",
                 "Microphone connection lost. Reconnect or reselect the input device.",
             );
+            let _ = app.emit("dictation-capture-failed", CaptureFailure { session_id });
             update_tray_status(&app, TrayVisualState::Ready);
             return;
         }
@@ -5060,6 +5061,12 @@ struct OverlayUpdate {
     state: String,
     mode: String,
     text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureFailure {
+    session_id: u64,
 }
 
 /// Hides the dictation overlay when dropped. Held across the fallible span

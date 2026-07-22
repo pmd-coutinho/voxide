@@ -307,6 +307,10 @@ interface OverlayUpdate {
   text: string;
 }
 
+interface CaptureFailure {
+  sessionId: number;
+}
+
 interface HotkeyEvent {
   action: "dictate" | "prompt" | "command" | "rewrite" | "cancel" | "pasteLast";
   phase: "pressed" | "released";
@@ -2927,6 +2931,19 @@ async function initialize(): Promise<void> {
       liveText = event.payload.text;
       if (currentView === "welcome") render();
     }
+  });
+  await listen<CaptureFailure>("dictation-capture-failed", async () => {
+    if (!recording) return;
+    recording = false;
+    liveText = "";
+    dictationInstructionTarget = undefined;
+    dictationPromptProfileId = undefined;
+    automaticHotkeyTarget = undefined;
+    automaticHotkeyStartedAt = undefined;
+    pendingDictationContext = {};
+    await restoreMainWindowAfterDictation();
+    showNotice("Microphone capture stopped. Reconnect or reselect the input device before recording again.");
+    render();
   });
   await listen<HotkeyEvent>("voxide-hotkey", (event) => { void handleGlobalHotkey(event.payload); });
   await listen<TrayAction>("voxide-tray-action", (event) => { void handleTrayAction(event.payload); });
