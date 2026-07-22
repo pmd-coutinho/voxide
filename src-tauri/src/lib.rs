@@ -1341,6 +1341,13 @@ impl VoiceEngine {
         }
     }
 
+    fn diagnostic_model_id(self, settings: &Settings) -> String {
+        let model = self.audio_model_id(settings);
+        diagnostic_version_value(&Value::String(model.clone()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| "<redacted-model-id>".into())
+    }
+
     fn runtime_available(self) -> bool {
         match self {
             Self::Parakeet => parakeet::is_compiled(),
@@ -3123,7 +3130,7 @@ fn feedback_debug_information(state: State<'_, AppState>) -> String {
         Utc::now().to_rfc3339(),
         asr::SpeechEngine::engine_id(&engine),
         engine.diagnostic_runtime_version(&state),
-        engine.audio_model_id(&settings),
+        engine.diagnostic_model_id(&settings),
     );
     let recent_log_entries = debug_log::recent_lines(30);
     if !recent_log_entries.is_empty() {
@@ -10867,6 +10874,21 @@ mod tests {
         assert!(diagnostic_version_value(&Value::String("/home/alice/secret".into())).is_none());
         assert!(diagnostic_version_value(&Value::String("version\nsecret".into())).is_none());
         assert!(diagnostic_version_value(&Value::String("x".repeat(65))).is_none());
+    }
+
+    #[test]
+    fn diagnostic_model_id_redacts_untrusted_cloud_configuration() {
+        let mut settings = Settings::default();
+        settings.cloud_transcription_model = "gpt-4o-mini-transcribe".into();
+        assert_eq!(
+            VoiceEngine::Cloud.diagnostic_model_id(&settings),
+            "gpt-4o-mini-transcribe"
+        );
+        settings.cloud_transcription_model = "https://example.test?api_key=secret".into();
+        assert_eq!(
+            VoiceEngine::Cloud.diagnostic_model_id(&settings),
+            "<redacted-model-id>"
+        );
     }
 
     #[test]
