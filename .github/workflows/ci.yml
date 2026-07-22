@@ -96,3 +96,36 @@ jobs:
       - name: Compile portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 build --release --no-default-features
+
+  cuda-linux-nvidia:
+    name: CUDA build checks (Linux/NVIDIA)
+    # Self-hosted runners must never execute code supplied by an untrusted
+    # fork. Repository PRs and trusted pushes still receive the GPU gate.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, x64, nvidia-cuda]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify NVIDIA/CUDA runner contract
+        run: |
+          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+          nvcc --version
+          pkg-config --modversion alsa
+          pkg-config --modversion gtk+-3.0
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo +1.89 fmt --check
+      - name: Audit resolved CUDA dependency graph
+        working-directory: src-tauri
+        run: cargo +1.89 tree --locked --features cuda --edges normal,build
+      - name: Run CUDA Rust lifecycle tests
+        working-directory: src-tauri
+        run: cargo +1.89 test --lib --features cuda
+      - name: Lint CUDA Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 clippy --lib --features cuda -- -D warnings
+      - name: Build CUDA release target
+        working-directory: src-tauri
+        run: cargo +1.89 build --release --features cuda

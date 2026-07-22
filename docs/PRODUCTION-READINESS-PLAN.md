@@ -714,6 +714,13 @@ Run every engine adapter against a fake engine/timeline harness:
 Pin action versions and toolchains, cache only safe build inputs, and retain test
 reports, benchmark traces, artifact manifests, and checksums.
 
+Current workflow status: the portable Linux/macOS/Windows jobs and a guarded
+`self-hosted, linux, x64, nvidia-cuda` CUDA compile/lint/test gate are checked
+in. The CUDA runner must provide a compatible NVIDIA driver, `nvcc`, ALSA, and
+GTK development packages. That gate proves feature compilation and lifecycle
+tests only; model-backed golden-audio, health, performance, signed-bundle, and
+clean-machine checks remain required before a GPU release is approved.
+
 ### 10.3 Quality gates
 
 No merge to the release branch if:
