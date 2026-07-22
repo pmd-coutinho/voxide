@@ -6776,9 +6776,14 @@ fn spawn_live_nemotron_stream(
                     return;
                 }
             };
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
             let partial = {
                 let mut live = capture_state.nemotron_live.lock().await;
                 if live.generation != preview_generation {
+                    drop(live);
+                    finish_preview(&capture_state, preview_generation);
                     return;
                 }
                 let result = live
@@ -6792,6 +6797,7 @@ fn spawn_live_nemotron_stream(
                 }
                 result
             };
+            finish_preview(&capture_state, preview_generation);
             match partial {
                 Ok(text) if show_preview && !text.trim().is_empty() => {
                     if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation
