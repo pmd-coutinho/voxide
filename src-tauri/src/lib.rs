@@ -1716,9 +1716,20 @@ fn quarantine_corrupt_database(path: &Path) -> Result<PathBuf, String> {
     Ok(preserved)
 }
 
+/// A prewarmed capture target cached between recordings, tagged with the input
+/// device it was resolved for so a stale entry (e.g. after a mic-preference
+/// change) is re-resolved instead of reused.
+struct PreparedCapture {
+    device_key: Option<String>,
+    prepared: audio::PreparedInput,
+}
+
 struct NativeCaptureState {
     capture: Mutex<Option<audio::AudioCapture>>,
     capture_started_at: Mutex<Option<Instant>>,
+    // Device + config + routing resolved off the record hotkey path so a press
+    // only opens hardware. Populated at startup and refreshed on a cold miss.
+    prepared_input: Mutex<Option<PreparedCapture>>,
     session: Arc<Mutex<session::Coordinator>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
@@ -1732,6 +1743,7 @@ impl Default for NativeCaptureState {
         Self {
             capture: Mutex::new(None),
             capture_started_at: Mutex::new(None),
+            prepared_input: Mutex::new(None),
             session: Arc::new(Mutex::new(session::Coordinator::default())),
             context: Mutex::new(DictationContext::default()),
             continuous_context: Mutex::new(ContinuousDictationContext::default()),
@@ -2018,6 +2030,22 @@ struct ResetTrayWhenDropped {
 impl Drop for ResetTrayWhenDropped {
     fn drop(&mut self) {
         update_tray_status(&self.app, TrayVisualState::Ready);
+    }
+}
+
+/// Re-resolves and re-caches the prewarmed capture target once a dictation
+/// finishes and frees the microphone. This keeps the cached device/config/
+/// routing fresh — so a source whose sound-server node name changed under an
+/// unchanged description is picked up before the next recording — while still
+/// forking `pactl` off the record hotkey path (at the same once-per-recording
+/// cadence the pre-prewarm code used, just after the fact instead of before).
+struct RefreshCapturePrewarmWhenDropped {
+    app: AppHandle,
+}
+
+impl Drop for RefreshCapturePrewarmWhenDropped {
+    fn drop(&mut self) {
+        spawn_capture_prewarm(self.app.clone());
     }
 }
 
@@ -7081,6 +7109,84 @@ async fn download_parakeet_model(
     })
 }
 
+/// Resolves the current input device (device handle, negotiated config, and
+/// sound-server routing) off the record hotkey path and caches it so the next
+/// press only opens the stream. Safe to call whenever no capture is active —
+/// at startup and after a dictation frees the microphone — because it only
+/// queries device metadata and sets routing env vars; it never opens a stream
+/// (so idle prewarm shows no microphone indicator).
+fn spawn_capture_prewarm(handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let selected_device = handle
+            .state::<AppState>()
+            .database
+            .lock()
+            .ok()
+            .and_then(|database| database.settings.selected_input_device.clone());
+        let prewarm_device = selected_device.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            audio::AudioCapture::prepare(prewarm_device.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(prepared)) => {
+                let capture_state = handle.state::<NativeCaptureState>();
+                if let Ok(mut guard) = capture_state.prepared_input.lock() {
+                    *guard = Some(PreparedCapture {
+                        device_key: selected_device,
+                        prepared,
+                    });
+                }
+                debug_log::append(
+                    "Audio capture input prewarmed (device, config, and routing resolved)",
+                );
+            }
+            Ok(Err(error)) => debug_log::append(&format!("Audio capture prewarm failed: {error}")),
+            Err(error) => debug_log::append(&format!("Audio capture prewarm task failed: {error}")),
+        }
+    });
+}
+
+/// Opens the microphone for dictation, preferring the prewarmed target that
+/// was resolved off the hotkey path. On a cache hit the press only builds and
+/// plays the stream; a miss — or a stale entry after a mic-preference change —
+/// resolves fresh, caches it for next time, and starts from it. A prewarmed
+/// target that fails to open (e.g. the device was unplugged since prewarm)
+/// falls back to a fresh resolution rather than failing the recording.
+fn start_dictation_capture(
+    capture_state: &NativeCaptureState,
+    selected_device: Option<&str>,
+    on_level: audio::LevelCallback,
+) -> Result<audio::AudioCapture, String> {
+    let cached = capture_state.prepared_input.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|prepared| prepared.device_key.as_deref() == selected_device)
+            .map(|prepared| prepared.prepared.clone())
+    });
+    if let Some(prepared) = cached {
+        match audio::AudioCapture::start_prepared(&prepared, Some(on_level.clone())) {
+            Ok(capture) => return Ok(capture),
+            Err(error) => {
+                debug_log::append(&format!(
+                    "Prewarmed microphone failed to open ({error}); re-resolving the input device"
+                ));
+                if let Ok(mut guard) = capture_state.prepared_input.lock() {
+                    *guard = None;
+                }
+            }
+        }
+    }
+    let prepared = audio::AudioCapture::prepare(selected_device)?;
+    if let Ok(mut guard) = capture_state.prepared_input.lock() {
+        *guard = Some(PreparedCapture {
+            device_key: selected_device.map(str::to_owned),
+            prepared: prepared.clone(),
+        });
+    }
+    audio::AudioCapture::start_prepared(&prepared, Some(on_level))
+}
+
 #[tauri::command]
 fn start_native_dictation(
     app: AppHandle,
@@ -7181,17 +7287,19 @@ fn start_native_dictation(
         rollback_native_dictation_start(&capture_state, preview_generation);
         return Err(error);
     }
-    let started = match audio::AudioCapture::start(
+    let level_callback: audio::LevelCallback = Arc::new(move |level| {
+        let Ok(mut last_emit) = last_emit.lock() else {
+            return;
+        };
+        if last_emit.elapsed() >= Duration::from_millis(33) {
+            *last_emit = Instant::now();
+            let _ = app_for_levels.emit("dictation-audio-level", level);
+        }
+    });
+    let started = match start_dictation_capture(
+        &capture_state,
         settings.selected_input_device.as_deref(),
-        Some(Arc::new(move |level| {
-            let Ok(mut last_emit) = last_emit.lock() else {
-                return;
-            };
-            if last_emit.elapsed() >= Duration::from_millis(33) {
-                *last_emit = Instant::now();
-                let _ = app_for_levels.emit("dictation-audio-level", level);
-            }
-        })),
+        level_callback,
     ) {
         Ok(capture) => capture,
         Err(error) => {
@@ -7999,6 +8107,9 @@ async fn stop_native_dictation(
         .map_err(|_| "Audio capture lock was poisoned".to_string())?
         .take()
         .ok_or("Dictation is not recording")?;
+    // Once this recording releases the microphone, re-prewarm the next one off
+    // the hotkey path (fires on every exit path below, including errors).
+    let _refresh_prewarm = RefreshCapturePrewarmWhenDropped { app: app.clone() };
     let capture_started_at = capture_state
         .capture_started_at
         .lock()
@@ -9331,23 +9442,12 @@ pub fn run() {
                     .preload(&state, &settings, vocabulary)
                     .await;
             });
-            let capture_prewarm_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                match tauri::async_runtime::spawn_blocking(audio::prewarm_input_devices).await {
-                    Ok(Ok(count)) => debug_log::append(&format!(
-                        "Audio capture devices prewarmed ({count} available)"
-                    )),
-                    Ok(Err(error)) => {
-                        debug_log::append(&format!("Audio capture prewarm failed: {error}"))
-                    }
-                    Err(error) => {
-                        debug_log::append(&format!("Audio capture prewarm task failed: {error}"))
-                    }
-                }
-                // Keep the handle alive through the background task on
-                // platforms where Tauri releases app state on shutdown.
-                let _ = capture_prewarm_handle;
-            });
+            // Resolve the current input device (device handle, config, and
+            // sound-server routing) so the first record action only opens the
+            // stream instead of enumerating, negotiating, and forking `pactl`
+            // on the hotkey path. Refreshed after each dictation and on a cold
+            // miss inside start_dictation_capture.
+            spawn_capture_prewarm(app.handle().clone());
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Defer the first check so startup remains responsive, then mirror the reference

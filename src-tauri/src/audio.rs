@@ -128,15 +128,39 @@ pub struct AudioCapture {
     counters: Arc<CaptureCounters>,
 }
 
+/// A microphone target resolved ahead of the latency-sensitive record path:
+/// the device handle, its negotiated config, and (on Linux) the sound-server
+/// routing decision. Cheap to clone, so a prewarmed instance can be cached and
+/// reused across recordings. `AudioCapture::start_prepared` turns it into a
+/// running capture with only a stream build + play — no device enumeration,
+/// config negotiation, or `pactl` fork on the hotkey path.
+#[derive(Clone)]
+pub struct PreparedInput {
+    device: cpal::Device,
+    supported_config: cpal::SupportedStreamConfig,
+    #[cfg(target_os = "linux")]
+    routing: pulse::Routing,
+}
+
 impl AudioCapture {
-    pub fn start(
-        requested_device: Option<&str>,
-        on_level: Option<LevelCallback>,
-    ) -> Result<Self, String> {
+    /// Everything the record hotkey should NOT have to do on the critical path:
+    /// enumerate devices, negotiate the stream config, and (on Linux) fork
+    /// `pactl` to resolve sound-server routing. The result is cheap to clone
+    /// and cache, so a prewarmed instance can be reused across recordings.
+    pub fn prepare(requested_device: Option<&str>) -> Result<PreparedInput, String> {
         let host = cpal::default_host();
         let requested = requested_device.filter(|name| !name.trim().is_empty());
+        // Decide routing (may fork `pactl`) before touching the environment,
+        // then apply it under the lock so a concurrent prewarm/record cannot
+        // interleave env-var writes with the config query and stream open.
         #[cfg(target_os = "linux")]
-        let requested = pulse::route_to_requested_source(requested);
+        let routing = pulse::resolve_routing(requested);
+        #[cfg(target_os = "linux")]
+        let _routing_guard = pulse::routing_lock();
+        #[cfg(target_os = "linux")]
+        pulse::apply_routing(&routing);
+        #[cfg(target_os = "linux")]
+        let requested = routing.fallback_label();
         #[cfg(target_os = "linux")]
         let requested = requested.as_deref();
         let preferred_device = if let Some(requested) = requested {
@@ -157,8 +181,6 @@ impl AudioCapture {
         let supported_config = device
             .default_input_config()
             .map_err(|error| format!("Could not read microphone configuration: {error}"))?;
-        let sample_rate = supported_config.sample_rate();
-        let channels = supported_config.channels();
         match supported_config.sample_format() {
             SampleFormat::I8
             | SampleFormat::I16
@@ -178,6 +200,33 @@ impl AudioCapture {
                 ));
             }
         }
+        Ok(PreparedInput {
+            device,
+            supported_config,
+            #[cfg(target_os = "linux")]
+            routing,
+        })
+    }
+
+    /// Opens the microphone from an already-`prepare`d target. This is the only
+    /// step that touches hardware, so it is all the record hotkey must run on
+    /// the latency-sensitive path.
+    pub fn start_prepared(
+        prepared: &PreparedInput,
+        on_level: Option<LevelCallback>,
+    ) -> Result<Self, String> {
+        // Re-assert routing right before opening: another `prepare` may have
+        // run since this target was resolved, and the pipewire/pulse ALSA
+        // plugins read these env vars when the stream is opened below. Held
+        // under the lock through play() so the env cannot shift mid-open.
+        #[cfg(target_os = "linux")]
+        let _routing_guard = pulse::routing_lock();
+        #[cfg(target_os = "linux")]
+        pulse::apply_routing(&prepared.routing);
+        let device = prepared.device.clone();
+        let supported_config = prepared.supported_config.clone();
+        let sample_rate = supported_config.sample_rate();
+        let channels = supported_config.channels();
         let ring_capacity = (sample_rate as usize)
             .saturating_mul(channels.max(1) as usize)
             .saturating_mul(RAW_RING_BUFFER_SECONDS)
@@ -380,12 +429,6 @@ pub fn input_device_names() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Performs the one-time device and sound-server discovery during startup so
-/// the first record action only needs to configure and start its stream.
-pub fn prewarm_input_devices() -> Result<usize, String> {
-    input_device_names().map(|devices| devices.len())
-}
-
 /// Friendly microphone selection on Linux sound servers (PipeWire or
 /// PulseAudio) via `pactl`. Capture still runs through the ALSA "default"
 /// device; its pipewire/pulse plugin routes to the requested source through
@@ -465,33 +508,80 @@ mod pulse {
         Some(sources)
     }
 
-    /// Points the ALSA default device at the requested sound-server source.
-    /// Returns the device name CPAL should still try to match itself (only
-    /// when no sound server is available to do the routing).
-    pub fn route_to_requested_source(requested: Option<&str>) -> Option<String> {
-        let Some(sources) = sources().filter(|sources| !sources.is_empty()) else {
+    /// The sound-server routing decision for a requested microphone, resolved
+    /// once (possibly forking `pactl`) so it can be cached and re-applied
+    /// cheaply. Applying it only sets/clears the env vars the ALSA
+    /// pipewire/pulse plugins read when the capture stream is opened.
+    #[derive(Clone, Debug)]
+    pub enum Routing {
+        /// Route the ALSA default device to this sound-server source name.
+        Source(String),
+        /// No routing: record from the system default. `fallback` carries a raw
+        /// ALSA device name for CPAL to match itself when no sound server is
+        /// present to route on our behalf.
+        Default { fallback: Option<String> },
+    }
+
+    impl Routing {
+        /// The device name CPAL should still try to match itself (only set when
+        /// no sound server is available to route on our behalf).
+        pub fn fallback_label(&self) -> Option<String> {
+            match self {
+                Routing::Source(_) => None,
+                Routing::Default { fallback } => fallback.clone(),
+            }
+        }
+    }
+
+    /// Serializes environment-based routing so a background prewarm and a
+    /// record action cannot interleave PIPEWIRE_NODE/PULSE_SOURCE writes with
+    /// each other's config query and stream open.
+    static ROUTING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub fn routing_lock() -> std::sync::MutexGuard<'static, ()> {
+        ROUTING_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Decides how the requested microphone should be routed, without touching
+    /// the environment. May fork `pactl` (through the cached `sources`).
+    pub fn resolve_routing(requested: Option<&str>) -> Routing {
+        match sources().filter(|sources| !sources.is_empty()) {
+            Some(sources) => decide_routing(&sources, requested),
             // No sound server: keep the raw ALSA device-name matching.
-            clear_routing();
-            return requested.map(str::to_string);
-        };
-        let selected = requested.and_then(|requested| {
+            None => Routing::Default {
+                fallback: requested.map(str::to_string),
+            },
+        }
+    }
+
+    /// The pure source-list decision, split out so it is testable without a
+    /// sound server. Matches the requested device by its human-readable
+    /// description (the value the picker persists).
+    fn decide_routing(sources: &[Source], requested: Option<&str>) -> Routing {
+        match requested.and_then(|requested| {
             sources
                 .iter()
                 .find(|source| source.description == requested)
-        });
-        match selected {
-            Some(source) => {
-                // The pipewire ALSA plugin honors PIPEWIRE_NODE and the pulse
-                // ALSA plugin honors PULSE_SOURCE; set both so the default
-                // device records from the chosen source on either server.
-                std::env::set_var("PIPEWIRE_NODE", &source.name);
-                std::env::set_var("PULSE_SOURCE", &source.name);
-            }
+        }) {
+            Some(source) => Routing::Source(source.name.clone()),
             // Unset selection (or a source that is currently unavailable,
             // e.g. headphones powered off) records from the system default.
-            None => clear_routing(),
+            None => Routing::Default { fallback: None },
         }
-        None
+    }
+
+    /// Applies a previously resolved routing decision to the environment.
+    pub fn apply_routing(routing: &Routing) {
+        match routing {
+            Routing::Source(name) => {
+                std::env::set_var("PIPEWIRE_NODE", name);
+                std::env::set_var("PULSE_SOURCE", name);
+            }
+            Routing::Default { .. } => clear_routing(),
+        }
     }
 
     fn clear_routing() {
@@ -512,6 +602,44 @@ mod pulse {
             assert_eq!(sources.len(), 2);
             assert_eq!(sources[0].description, "Bluetooth Headset");
             assert_eq!(sources[1].name, "alsa_input.pci.HiFi__Mic1__source");
+        }
+
+        fn fixture_sources() -> Vec<super::Source> {
+            vec![
+                super::Source {
+                    name: "bluez_input.AA:BB:CC:11:22:33".into(),
+                    description: "Bluetooth Headset".into(),
+                },
+                super::Source {
+                    name: "alsa_input.pci.HiFi__Mic1__source".into(),
+                    description: "Digital Microphone".into(),
+                },
+            ]
+        }
+
+        #[test]
+        fn routing_selects_the_source_matching_the_requested_description() {
+            let sources = fixture_sources();
+            match super::decide_routing(&sources, Some("Digital Microphone")) {
+                super::Routing::Source(name) => {
+                    assert_eq!(name, "alsa_input.pci.HiFi__Mic1__source")
+                }
+                super::Routing::Default { .. } => panic!("expected a routed source"),
+            }
+        }
+
+        #[test]
+        fn routing_falls_back_to_system_default_when_the_request_is_unmatched_or_empty() {
+            let sources = fixture_sources();
+            // A description no source advertises (e.g. a powered-off mic) and an
+            // unset selection both record from the system default with no raw
+            // ALSA fallback, because a sound server is present to route.
+            for requested in [Some("Unplugged Mic"), None] {
+                match super::decide_routing(&sources, requested) {
+                    super::Routing::Default { fallback: None } => {}
+                    other => panic!("expected system-default routing, got {other:?}"),
+                }
+            }
         }
     }
 }

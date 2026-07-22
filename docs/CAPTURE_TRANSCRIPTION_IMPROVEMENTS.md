@@ -50,6 +50,13 @@ respect them:
 
 ### 1. Prewarm capture *resolution* off the hotkey path
 - **Category:** capture · **Impact:** high · **Effort:** medium · **Verdict:** CONFIRMED (cheap subset)
+- **Status:** ✅ Implemented. `AudioCapture::start` split into `prepare`
+  (device/config/`pactl` routing) + `start_prepared` (build+play only); a
+  `PreparedInput` is cached in `NativeCaptureState.prepared_input` at startup,
+  reused on the hotkey path via `start_dictation_capture`, and re-prewarmed
+  after each dictation frees the mic (`RefreshCapturePrewarmWhenDropped`).
+  Routing env-var writes serialized by `pulse::routing_lock`. Idle prewarm
+  opens no stream (no mic indicator). Reviewed clean for concurrency/parity.
 - **Gap:** `AudioCapture::start` (`audio.rs:132-261`) does everything on the
   hotkey press — `default_host()`, a synchronous `pactl` subprocess for
   routing, device enumeration, `default_input_config()`, ring alloc, worker
@@ -72,6 +79,10 @@ respect them:
 
 ### 2. Bound the Parakeet live-preview to a recent window
 - **Category:** engines · **Impact:** high · **Effort:** small (~1 line) · **Verdict:** CONFIRMED (primary)
+- **Status:** ✅ Implemented. `spawn_live_parakeet_preview` now snapshots a 20 s
+  trailing window (`PARAKEET_PREVIEW_WINDOW`) instead of `snapshot_all()`. The
+  final decode still uses the complete capture; the nemotron stream keeps
+  `snapshot_all()` (needs the full buffer for deltas).
 - **Gap:** `spawn_live_parakeet_preview` calls `snapshot_all()` every 600 ms
   (`lib.rs:7510`) and re-decodes the *entire growing buffer* — O(total) work
   that holds `INFERENCE_LOCK` progressively longer, delaying the final decode.
