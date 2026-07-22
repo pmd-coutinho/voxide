@@ -319,7 +319,7 @@ structured category.
 {
   "schema": 1,
   "session_id": "random-id",
-  "engine": "parakeet-tdt-v3-int8",
+  "engine": "parakeet-tdt-v2-int8",
   "engine_maturity": "stable",
   "runtime_version": "sherpa-onnx-1.13.4-cuda12-cudnn9",
   "capture": {
@@ -906,10 +906,12 @@ larger change and should follow the common engine contract.
 
 ## 12. Phase 6: engine roadmap and maturity policy
 
-### 12.1 Stable default: Parakeet TDT v3 CUDA
+### 12.1 Stable default: Parakeet TDT v2 CUDA
 
-Keep Parakeet TDT as the preferred production CUDA transcription engine while
-its measured final accuracy remains best for the target use case.
+Keep the English-only Parakeet TDT v2 as the preferred production CUDA
+transcription engine while its measured final accuracy remains best for the
+target use case. Parakeet TDT v3 remains a multilingual alternative, not the
+default, because FluidAudio identifies v2 as its higher-recall English model.
 
 Required hardening:
 

@@ -7474,7 +7474,7 @@ fn spawn_live_whisper_preview(
     });
 }
 
-/// Mirrors FluidVoice's Parakeet TDT v3 preview cadence. TDT is an offline
+/// Mirrors FluidVoice's Parakeet TDT v2 preview cadence. TDT is an offline
 /// model, so every snapshot is a fresh decode of the complete capture—not
 /// VAD-sliced audio and not a stateful streaming decoder. Voxide additionally
 /// hides the timestamped, still-tentative tail of each CUDA hypothesis before

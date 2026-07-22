@@ -71,7 +71,7 @@ models — natively CUDA-friendly) plus portable architecture:
 ### Linux equivalents (verified to exist)
 
 - **sherpa-onnx**: Rust API + official Tauri support; model
-  **`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`** (25 European languages,
+  **`sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8`** (English-only,
   incl. PT + EN), onnxruntime CUDA provider. It is an offline decoder, so
   Voxide uses FluidVoice-style complete-buffer preview snapshots and an
   independent complete-buffer final decode. Parakeet is **transcribe-only**
@@ -241,7 +241,7 @@ Add stage timing so every later change is measured, not guessed.
 
 - New `parakeet` voice engine alongside whisper/cloud; sherpa-onnx Rust API,
   onnxruntime CUDA provider (no nvcc needed; runtime libs already installed).
-- Model: `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` (25 European languages,
+- Model: `sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8` (English-only,
   PT+EN) managed in the existing model-download UI.
 - Port FluidVoice's full-buffer preview architecture: re-decode the growing
   capture at a bounded cadence, reconcile the display, and run a separate
@@ -315,7 +315,7 @@ Environment notes specific to this machine:
   confirmed `using CUDA0 backend`.
 - 2026-07-21: Phase 6 landed. The CUDA feature now brings in sherpa-onnx
   1.13.4's official **GPU** `cuda-12.x-cudnn-9.x` runtime and the
-  `parakeet-tdt-0.6b-v3-int8` model manager. A no-sudo setup helper stages the
+  `parakeet-tdt-0.6b-v2-int8` model manager. A no-sudo setup helper stages the
   runtime and CUDA 12/cuDNN 9 wheel libraries separately from Whisper's CUDA
   13 toolkit; the final Linux binary embeds their RPATHs. Parakeet is exposed
   in Voice Engine only in a CUDA build, has visible model-download progress

@@ -770,7 +770,7 @@ function renderVoiceEngine(): void {
     ? `<span class="status done">Installed</span>`
     : `<span class="status pending">${selectedEngineDescriptor?.unavailableReason ?? "Not installed"}</span>`;
   const nemotronRuntimeReady = modelStatus?.runtimeInstalled === true;
-  const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v3-int8" : isNemotron ? (nemotronRuntimeReady ? "nemotron-3.5-asr-streaming-0.6b" : "nemotron-cuda-runtime") : "";
+  const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v2-int8" : isNemotron ? (nemotronRuntimeReady ? "nemotron-3.5-asr-streaming-0.6b" : "nemotron-cuda-runtime") : "";
   const downloading = downloadId && modelDownloadProgress?.id === downloadId ? modelDownloadProgress : undefined;
   const downloadDetail = downloading
     ? downloadId === "nemotron-cuda-runtime"
@@ -788,7 +788,7 @@ function renderVoiceEngine(): void {
       <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isParakeet
-      ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v3 (INT8) automatically detects the spoken language. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v2 (INT8) is the English higher-recall Parakeet model. Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 500 MB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
       : isNemotron
         ? `<section class="setting-subsection"><h3>Nemotron input</h3>${microphoneInput}<label>Streaming profile<select id="nemotron-streaming-mode"><option value="fast" ${database.settings.nemotronStreamingMode === "fast" ? "selected" : ""}>Fast — 320 ms chunks</option><option value="balanced" ${database.settings.nemotronStreamingMode === "balanced" ? "selected" : ""}>Balanced — 560 ms chunks (recommended)</option><option value="quality" ${database.settings.nemotronStreamingMode === "quality" ? "selected" : ""}>Quality — 1.12 s chunks</option></select><small>Larger chunks give the model more right-context and generally improve recognition accuracy; all three remain true cache-aware streams.</small></label><small>Nemotron 3.5 ASR Streaming 0.6B feeds new microphone audio through its CUDA encoder cache and emits incremental text. The final transcript flushes that same stream; it does not use VAD segmentation.</small></section><p class="muted">Runs locally on Linux/NVIDIA CUDA. First install the user-local PyTorch CUDA runtime, then download the 2.6 GB model. The runtime and model are separate so the model can be removed from this screen.</p>`
       : isCloud
@@ -2561,7 +2561,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
     }
     case "download-parakeet-model": {
       showNotice("Downloading Parakeet TDT 0.6B. This is about 500 MB and may take a few minutes.");
-      modelDownloadProgress = { id: "parakeet-tdt-0.6b-v3-int8", downloadedBytes: 0 };
+      modelDownloadProgress = { id: "parakeet-tdt-0.6b-v2-int8", downloadedBytes: 0 };
       render();
       try {
         modelStatus = await invoke<VoiceModelStatus>("download_parakeet_model");

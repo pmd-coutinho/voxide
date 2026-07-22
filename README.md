@@ -19,9 +19,9 @@ Voxide is a cross-platform desktop dictation app. Speech is transcribed locally 
 
 ## Features
 
-- **Local-first transcription** — downloadable Whisper models from Tiny to Large v3 Turbo, plus Parakeet TDT 0.6B v3 INT8 and Nemotron 3.5 ASR Streaming 0.6B on Linux/NVIDIA CUDA builds. No audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
+- **Local-first transcription** — downloadable Whisper models from Tiny to Large v3 Turbo, plus the English higher-recall Parakeet TDT 0.6B v2 INT8 and Nemotron 3.5 ASR Streaming 0.6B on Linux/NVIDIA CUDA builds. No audio leaves your machine unless you opt into a cloud engine. macOS system speech and OpenAI-compatible transcription endpoints are also supported.
 - **Global dictation from any app** — press your hotkey, speak, and the result is typed into whatever has focus, without stealing it. Toggle, hold-to-record, and automatic activation modes; a compact overlay shows the live transcription and microphone level while you speak.
-- **FluidVoice-style Parakeet dictation** — Parakeet TDT v3 re-decodes the growing audio buffer every 600 ms after the first second, reconciles each full hypothesis with the prior preview, and applies deterministic cleanup before display. Its final dictation is a separate full-audio decode; neither path uses app-level VAD segmentation. When Vocabulary Boosting is enabled, only that final pass applies the local vocabulary context graph.
+- **FluidVoice-style Parakeet dictation** — Parakeet TDT v2 re-decodes the growing audio buffer every 600 ms after the first second, reconciles each full hypothesis with the prior preview, and applies deterministic cleanup before display. Its final dictation is a separate full-audio decode; neither path uses app-level VAD segmentation. When Vocabulary Boosting is enabled, only that final pass applies the local vocabulary context graph.
 - **True-streaming Nemotron dictation** — Nemotron feeds each new 16 kHz microphone chunk once through NVIDIA's cache-aware FastConformer/RNN-T decoder on CUDA. Partial text comes from that single stream and stopping flushes its tail, rather than launching a second full-buffer decode.
 - **Speech in, speech out — nothing else** — a voice-activity gate rejects silence and noise before decoding, so Whisper's infamous hallucinations ("Thank you for watching!") never reach your text, and noise annotations like `[door slams]` are stripped from what does.
 - **AI enhancement (optional)** — post-process transcriptions with any OpenAI-compatible or Anthropic-style provider. Per-mode providers, reusable prompt profiles, per-profile model routing, and per-application prompt overrides.
@@ -90,7 +90,7 @@ On hybrid laptops Voxide automatically prefers the discrete GPU over the integra
 
 #### Parakeet on Linux/NVIDIA CUDA
 
-The `cuda` feature also enables the local **Parakeet TDT 0.6B v3 INT8** engine. It uses the official sherpa-onnx CUDA 12/cuDNN 9 shared runtime; this is separate from the CUDA toolkit used to compile Whisper. On a Linux x86_64 build host, set it up once without sudo:
+The `cuda` feature also enables the local **Parakeet TDT 0.6B v2 INT8** engine. It uses the official sherpa-onnx CUDA 12/cuDNN 9 shared runtime; this is separate from the CUDA toolkit used to compile Whisper. On a Linux x86_64 build host, set it up once without sudo:
 
 ```sh
 ./scripts/setup-parakeet-cuda-runtime.sh

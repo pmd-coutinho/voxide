@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 
 use crate::{audio, media};
 
-pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
-pub const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2";
+pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v2-int8";
+pub const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
 /// GitHub release asset digest verified on 2026-07-22. The release tag is a
 /// mutable URL, so installation must authenticate the downloaded archive.
 pub const MODEL_ARCHIVE_SHA256: &str =
-    "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf";
-pub const MODEL_ARCHIVE_BYTES: u64 = 487_170_055;
-const MODEL_ARCHIVE_ROOT: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+    "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad";
+pub const MODEL_ARCHIVE_BYTES: u64 = 482_468_385;
+const MODEL_ARCHIVE_ROOT: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
 const REQUIRED_FILES: [&str; 4] = [
     "encoder.int8.onnx",
     "decoder.int8.onnx",
