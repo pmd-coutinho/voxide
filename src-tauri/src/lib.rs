@@ -2054,6 +2054,13 @@ fn invalidate_preview_generation(capture_state: &NativeCaptureState, session_id:
         .is_ok()
 }
 
+fn reset_dictation_context(capture_state: &NativeCaptureState) {
+    let _ = capture_state
+        .context
+        .lock()
+        .map(|mut context| *context = DictationContext::default());
+}
+
 /// Makes every failure between coordinator admission and a usable capture
 /// indistinguishable from a cancelled recording. This path is deliberately
 /// idempotent: an engine reservation, microphone start, or preview setup may
@@ -2075,10 +2082,7 @@ fn rollback_native_dictation_start(capture_state: &NativeCaptureState, session_i
         .session
         .lock()
         .map(|mut session| session.cancel(session_id));
-    let _ = capture_state
-        .context
-        .lock()
-        .map(|mut context| *context = DictationContext::default());
+    reset_dictation_context(capture_state);
 }
 
 /// CPAL reports device and route failures on a callback that must stay
@@ -2106,6 +2110,9 @@ fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
             if stream_errors == 0 {
                 continue;
             }
+            if !invalidate_preview_generation(&capture_state, session_id) {
+                return;
+            }
 
             let capture = capture_state
                 .capture
@@ -2123,9 +2130,7 @@ fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
                 .session
                 .lock()
                 .map(|mut coordinator| coordinator.cancel(session_id));
-            capture_state
-                .preview_generation
-                .fetch_add(1, Ordering::SeqCst);
+            reset_dictation_context(&capture_state);
             drop(capture);
             let nemotron_live = Arc::clone(&capture_state.nemotron_live);
             tauri::async_runtime::spawn(async move {
@@ -2170,6 +2175,21 @@ impl Drop for FinishDictationSession {
     fn drop(&mut self) {
         if let Ok(mut coordinator) = self.coordinator.lock() {
             coordinator.finish(self.id);
+        }
+    }
+}
+
+/// The focused application/window and preceding text are session-scoped input
+/// to formatting. Do not retain that transient context after a final result or
+/// any error path has completed.
+struct ResetDictationContextWhenDropped<'a> {
+    context: &'a Mutex<DictationContext>,
+}
+
+impl Drop for ResetDictationContextWhenDropped<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut context) = self.context.lock() {
+            *context = DictationContext::default();
         }
     }
 }
@@ -7285,10 +7305,6 @@ fn start_native_dictation(
     settings
         .selected_voice_engine
         .prepare_live_capture(&settings, &state)?;
-    *capture_state
-        .context
-        .lock()
-        .map_err(|_| "Dictation context lock was poisoned".to_string())? = dictation_context;
     if let Err(error) = apply_overlay_window_layout(&app, &settings) {
         debug_log::append(&format!(
             "Could not apply dictation overlay layout: {error}"
@@ -7303,6 +7319,15 @@ fn start_native_dictation(
     capture_state
         .preview_generation
         .store(preview_generation, Ordering::SeqCst);
+    if let Err(error) = capture_state
+        .context
+        .lock()
+        .map(|mut context| *context = dictation_context)
+        .map_err(|_| "Dictation context lock was poisoned".to_string())
+    {
+        rollback_native_dictation_start(&capture_state, preview_generation);
+        return Err(error);
+    }
     // Reserve the selected engine before opening the microphone. This is
     // especially important for cache-aware engines whose prior finalization
     // may still own their single stream.
@@ -8132,6 +8157,9 @@ async fn stop_native_dictation(
         .lock()
         .map_err(|_| "Dictation context lock was poisoned".to_string())?
         .clone();
+    let _reset_context = ResetDictationContextWhenDropped {
+        context: &capture_state.context,
+    };
     update_tray_status(&app, TrayVisualState::Processing);
     let _reset_tray = ResetTrayWhenDropped { app: app.clone() };
     let (captured, capture_health) = capture.finish_with_health()?;
@@ -8817,11 +8845,7 @@ fn cancel_native_dictation(
             live.generation = 0;
             live.start_error = None;
         });
-        *capture_state
-            .context
-            .lock()
-            .map_err(|_| "Dictation context lock was poisoned".to_string())? =
-            DictationContext::default();
+        reset_dictation_context(&capture_state);
         emit_overlay(&app, "hidden", "");
         update_tray_status(&app, TrayVisualState::Ready);
     }
@@ -9671,6 +9695,29 @@ mod tests {
                 .as_deref(),
             Some("Example")
         );
+    }
+
+    #[test]
+    fn finalization_context_guard_clears_transient_application_data() {
+        let capture_state = NativeCaptureState::default();
+        *capture_state.context.lock().expect("context lock") = DictationContext {
+            source_application: Some("Example".into()),
+            source_window_title: Some("Draft".into()),
+            prompt_profile_id: Some("profile".into()),
+            preceding_text: "sensitive preceding text".into(),
+        };
+
+        {
+            let _reset_context = ResetDictationContextWhenDropped {
+                context: &capture_state.context,
+            };
+        }
+
+        let context = capture_state.context.lock().expect("context lock");
+        assert!(context.source_application.is_none());
+        assert!(context.source_window_title.is_none());
+        assert!(context.prompt_profile_id.is_none());
+        assert!(context.preceding_text.is_empty());
     }
 
     #[test]

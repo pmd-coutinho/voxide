@@ -523,6 +523,9 @@ Startup failures now use generation-guarded rollback: an engine reservation,
 microphone-start, or preview-setup error clears the admitted coordinator
 session and preserved application context only if it still owns that generation.
 The regression tests also prove an old failure cannot roll back a newer session.
+Focused-window context and preceding text are cleared whenever finalization
+leaves scope, including failure paths, and capture-device failure uses the same
+generation guard before it cleans up.
 
 ### 8.3 Model readiness
 
