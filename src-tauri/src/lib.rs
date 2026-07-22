@@ -1879,21 +1879,49 @@ impl AppState {
         fs::create_dir_all(&root)
             .map_err(|error| format!("Could not create application-data directory: {error}"))?;
         let path = root.join(DATABASE_FILE);
-        let (mut database, needs_schema_migration) = match fs::read_to_string(&path) {
-            Ok(contents) => decode_persisted_database(&contents)
-                .map_err(|error| format!("Could not read Voxide data: {error}"))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (AppDatabase::default(), false)
-            }
-            Err(error) => return Err(format!("Could not open Voxide data: {error}")),
-        };
+        let (mut database, needs_schema_migration, recovered_from_backup) =
+            match fs::read_to_string(&path) {
+                Ok(contents) => match decode_persisted_database(&contents) {
+                    Ok((database, needs_schema_migration)) => {
+                        (database, needs_schema_migration, None)
+                    }
+                    Err(error) if database_declares_future_schema(&contents) => {
+                        return Err(format!("Could not read Voxide data: {error}"));
+                    }
+                    Err(primary_error) => {
+                        let (database, needs_schema_migration, backup) =
+                            newest_valid_database_backup(&path).map_err(|backup_error| {
+                                format!(
+                                    "Could not read Voxide data: {primary_error}. {backup_error}"
+                                )
+                            })?;
+                        (database, needs_schema_migration, Some(backup))
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (AppDatabase::default(), false, None)
+                }
+                Err(error) => return Err(format!("Could not open Voxide data: {error}")),
+            };
         normalize_database(&mut database);
 
         let state = Self {
             database: Mutex::new(database),
             path,
         };
-        if needs_schema_migration {
+        if let Some(backup) = recovered_from_backup {
+            let preserved = quarantine_corrupt_database(&state.path)?;
+            eprintln!(
+                "Recovered Voxide data from {}; preserved unreadable data at {}",
+                backup.display(),
+                preserved.display()
+            );
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+            state.persist(&database)?;
+        } else if needs_schema_migration {
             state.back_up_pre_migration_database()?;
             let database = state
                 .database
@@ -2020,6 +2048,47 @@ fn database_backup_path(path: &Path, index: usize) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(DATABASE_FILE);
     path.with_file_name(format!("{filename}.backup-{index}"))
+}
+
+fn newest_valid_database_backup(path: &Path) -> Result<(AppDatabase, bool, PathBuf), String> {
+    for index in 0..DATABASE_BACKUP_COUNT {
+        let backup = database_backup_path(path, index);
+        let Ok(contents) = fs::read_to_string(&backup) else {
+            continue;
+        };
+        if let Ok((database, needs_schema_migration)) = decode_persisted_database(&contents) {
+            return Ok((database, needs_schema_migration, backup));
+        }
+    }
+    Err(format!(
+        "No valid Voxide database backup was found beside {}",
+        path.display()
+    ))
+}
+
+fn database_declares_future_schema(contents: &str) -> bool {
+    serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|value| value.get("schemaVersion").and_then(Value::as_u64))
+        .is_some_and(|version| version > DATABASE_SCHEMA_VERSION as u64)
+}
+
+/// Keep unreadable data intact for manual inspection before restoring a known
+/// good snapshot. The name is app-owned and collision-resistant, so recovery
+/// never overwrites a user-selected file.
+fn quarantine_corrupt_database(path: &Path) -> Result<PathBuf, String> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DATABASE_FILE);
+    let preserved = path.with_file_name(format!("{filename}.corrupt-{}", uuid::Uuid::new_v4()));
+    fs::rename(path, &preserved).map_err(|error| {
+        format!(
+            "Could not preserve unreadable Voxide data at {}: {error}",
+            preserved.display()
+        )
+    })?;
+    Ok(preserved)
 }
 
 struct NativeCaptureState {
@@ -11159,6 +11228,61 @@ mod tests {
             "initial snapshot"
         );
         assert!(!database_backup_path(&path, DATABASE_BACKUP_COUNT).exists());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn newest_valid_database_backup_skips_corrupt_newer_snapshots() {
+        let directory = std::env::temp_dir().join(format!(
+            "voxide-database-recovery-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join(DATABASE_FILE);
+        fs::write(database_backup_path(&path, 0), "{not valid JSON")
+            .expect("corrupt newest backup");
+        let expected = AppDatabase::default();
+        fs::write(
+            database_backup_path(&path, 1),
+            serde_json::to_string(&PersistedDatabase {
+                schema_version: DATABASE_SCHEMA_VERSION,
+                data: expected.clone(),
+            })
+            .expect("backup serializes"),
+        )
+        .expect("valid older backup");
+
+        let (recovered, needs_migration, source) =
+            newest_valid_database_backup(&path).expect("older backup recovers");
+        assert!(!needs_migration);
+        assert_eq!(source, database_backup_path(&path, 1));
+        assert_eq!(
+            recovered.settings.selected_voice_engine,
+            expected.settings.selected_voice_engine
+        );
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_database_is_quarantined_without_overwriting_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "voxide-database-quarantine-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join(DATABASE_FILE);
+        fs::write(&path, "unreadable data").expect("corrupt database");
+
+        let preserved = quarantine_corrupt_database(&path).expect("database is quarantined");
+
+        assert!(!path.exists());
+        assert!(preserved.is_file());
+        assert_eq!(
+            fs::read_to_string(preserved).expect("preserved data"),
+            "unreadable data"
+        );
 
         let _ = fs::remove_dir_all(directory);
     }

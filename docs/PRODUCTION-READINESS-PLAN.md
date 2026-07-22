@@ -1053,8 +1053,10 @@ Requirements:
 
 Every persisted database replacement now retains the prior version in a
 three-slot, same-directory backup rotation and flushes the newest backup before
-the live file is replaced. Startup recovery selection remains a separate
-follow-up so a future-schema database is never silently replaced.
+the live file is replaced. On malformed current data, startup restores the
+newest valid snapshot only after moving the unreadable original aside under an
+app-owned corrupt-file name. A future-schema database is still rejected and
+never silently replaced.
 
 ### 13.4 Backup format
 
