@@ -58,7 +58,9 @@ const DEFAULT_TRANSCRIPTION_PREVIEW_CHARACTERS: usize = 150;
 const NEMOTRON_RUNTIME_ID: &str = "nemotron-cuda-runtime";
 const NEMOTRON_MODEL_DOWNLOAD_ID: &str = "nemotron-3.5-asr-streaming-0.6b";
 const NEMOTRON_SERVER_SOURCE: &str = include_str!("../scripts/nemotron_cuda_server.py");
-const NEMOTRON_SETUP_SOURCE: &str = include_str!("../../scripts/setup-nemotron-cuda-runtime.sh");
+const NEMOTRON_RUNTIME_VERSION: &str = "1";
+const NEMOTRON_RUNTIME_HEALTH_FILE: &str = "runtime-health.json";
+const NEMOTRON_RUNTIME_MARKER_FILE: &str = ".voxide-nemotron-runtime-v1";
 const COMPONENT_RECEIPT_FILE: &str = ".voxide-component-receipt.json";
 const COMPONENT_RECEIPT_SCHEMA: u32 = 1;
 
@@ -1376,7 +1378,7 @@ impl VoiceEngine {
                     return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
                 }
                 let runtime = nemotron_runtime_path(state)?;
-                if !nemotron::runtime_is_installed(&runtime) {
+                if !nemotron_runtime_is_verified(&runtime) {
                     return Err("Install the Nemotron CUDA runtime from Voice Engine before dictating.".into());
                 }
                 let model = nemotron_model_path(state)?;
@@ -2618,7 +2620,7 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
                 return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
             }
             let runtime = nemotron_runtime_path(&state)?;
-            if !nemotron::runtime_is_installed(&runtime) {
+            if !nemotron_runtime_is_verified(&runtime) {
                 return Err("Install the Nemotron CUDA runtime before completing setup".into());
             }
             let model = nemotron_model_path(&state)?;
@@ -3233,7 +3235,7 @@ async fn transcribe_nemotron_media_file(
     }
     let model = nemotron_model_path(state)?;
     let runtime = nemotron_runtime_path(state)?;
-    if !nemotron::runtime_is_installed(&runtime) {
+    if !nemotron_runtime_is_verified(&runtime) {
         return Err("Install the Nemotron CUDA runtime before transcribing a file".into());
     }
     if !nemotron::model_is_installed(&model) {
@@ -5881,7 +5883,7 @@ fn ensure_nemotron_server_script(runtime_directory: &Path) -> Result<PathBuf, St
 fn nemotron_status(state: &AppState) -> Result<VoiceModelStatus, String> {
     let model = nemotron_model_path(state)?;
     let runtime = nemotron_runtime_path(state)?;
-    let runtime_installed = nemotron::runtime_is_installed(&runtime);
+    let runtime_installed = nemotron_runtime_is_verified(&runtime);
     let model_installed = nemotron::model_is_installed(&model);
     let ready = nemotron::is_compiled() && runtime_installed && model_installed;
     let path = if !nemotron::is_compiled() {
@@ -6074,12 +6076,17 @@ async fn install_nemotron_cuda_runtime(
         return Err("Nemotron is included in Voxide's CUDA build for Linux/NVIDIA. Install a CUDA build first.".into());
     }
     let runtime = nemotron_runtime_path(&state)?;
-    fs::create_dir_all(&runtime)
+    let runtime_parent = runtime
+        .parent()
+        .ok_or("Could not determine the Nemotron runtime directory")?;
+    fs::create_dir_all(runtime_parent)
         .map_err(|error| format!("Could not create the Nemotron runtime directory: {error}"))?;
-    let setup = runtime.join("setup-nemotron-cuda-runtime.sh");
-    fs::write(&setup, NEMOTRON_SETUP_SOURCE).map_err(|error| {
-        format!("Could not prepare the Nemotron CUDA runtime installer: {error}")
-    })?;
+    let staging = runtime_parent.join(format!(
+        ".nemotron-runtime-install-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("Could not stage the Nemotron CUDA runtime: {error}"))?;
     let _ = app.emit(
         "model-download-progress",
         ModelDownloadProgress {
@@ -6088,28 +6095,179 @@ async fn install_nemotron_cuda_runtime(
             total_bytes: None,
         },
     );
-    let output = tokio::process::Command::new("bash")
-        .arg(&setup)
-        .arg(&runtime)
-        .output()
-        .await
-        .map_err(|error| format!("Could not run the Nemotron CUDA runtime installer: {error}"))?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if details.is_empty() {
-            "The Nemotron CUDA runtime installer failed".into()
-        } else {
-            format!("The Nemotron CUDA runtime installer failed: {details}")
-        });
+    if let Err(error) = install_nemotron_runtime_staging(&staging).await {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+    let staged_component = staging.clone();
+    let destination = runtime.clone();
+    let activation = tauri::async_runtime::spawn_blocking(move || {
+        replace_component_directory(&staged_component, &destination)
+    })
+    .await
+    .map_err(|error| format!("Nemotron runtime activation task failed: {error}"))?;
+    if let Err(error) = activation {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
     }
     ensure_nemotron_server_script(&runtime)?;
-    if !nemotron::runtime_is_installed(&runtime) {
-        return Err(
-            "The Nemotron CUDA runtime installer finished without creating its Python environment"
-                .into(),
-        );
+    if !nemotron_runtime_is_verified(&runtime) {
+        return Err("The Nemotron CUDA runtime did not pass its verified health check".into());
     }
     nemotron_status(&state)
+}
+
+/// Builds and checks a runtime inside a unique staging directory. A failed pip
+/// command or GPU health check therefore cannot corrupt the active runtime.
+async fn install_nemotron_runtime_staging(staging: &Path) -> Result<(), String> {
+    fs::create_dir(staging.join("tmp")).map_err(|error| {
+        format!("Could not prepare the Nemotron runtime work directory: {error}")
+    })?;
+    let python = find_nemotron_python().await?;
+    let venv = staging.join("venv");
+    run_nemotron_runtime_command(
+        &python,
+        vec!["-m".into(), "venv".into(), venv.as_os_str().to_owned()],
+        staging,
+        "create the Python environment",
+    )
+    .await?;
+    let venv_python = nemotron::python_path(staging);
+    run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--disable-pip-version-check".into(),
+            "--no-input".into(),
+            "--upgrade".into(),
+            "pip".into(),
+        ],
+        staging,
+        "prepare pip",
+    )
+    .await?;
+    run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--disable-pip-version-check".into(),
+            "--no-input".into(),
+            "--upgrade".into(),
+            "--index-url".into(),
+            "https://download.pytorch.org/whl/cu128".into(),
+            "torch".into(),
+        ],
+        staging,
+        "install PyTorch CUDA",
+    )
+    .await?;
+    run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--disable-pip-version-check".into(),
+            "--no-input".into(),
+            "--upgrade".into(),
+            "transformers>=5.14,<5.15".into(),
+            "librosa>=0.11".into(),
+            "numpy>=2.0".into(),
+        ],
+        staging,
+        "install Nemotron dependencies",
+    )
+    .await?;
+    let health = run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-c".into(),
+            "import json, sys, torch, transformers, librosa, numpy; from importlib.metadata import distributions; assert sys.version_info >= (3, 10), 'Python 3.10 or newer is required'; assert torch.cuda.is_available(), 'PyTorch cannot access an NVIDIA CUDA device'; packages = sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in distributions() if d.metadata.get(\"Name\")); print(json.dumps({'python': sys.version.split()[0], 'torch': torch.__version__, 'cuda': torch.version.cuda, 'transformers': transformers.__version__, 'librosa': librosa.__version__, 'numpy': numpy.__version__, 'packages': packages}, sort_keys=True))".into(),
+        ],
+        staging,
+        "run the CUDA health check",
+    )
+    .await?;
+    let health: serde_json::Value = serde_json::from_slice(&health.stdout)
+        .map_err(|_| "The Nemotron CUDA health check returned invalid metadata".to_string())?;
+    if health["torch"].as_str().is_none() || health["cuda"].as_str().is_none() {
+        return Err(
+            "The Nemotron CUDA health check did not report PyTorch and CUDA versions".into(),
+        );
+    }
+    fs::write(
+        staging.join(NEMOTRON_RUNTIME_HEALTH_FILE),
+        serde_json::to_vec_pretty(&health)
+            .map_err(|error| format!("Could not encode Nemotron runtime metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Could not save Nemotron runtime metadata: {error}"))?;
+    fs::write(
+        staging.join(NEMOTRON_RUNTIME_MARKER_FILE),
+        format!("Nemotron CUDA runtime v{NEMOTRON_RUNTIME_VERSION}\n"),
+    )
+    .map_err(|error| format!("Could not finalize the Nemotron runtime marker: {error}"))?;
+    write_component_receipt(
+        staging,
+        &ComponentReceipt {
+            schema: COMPONENT_RECEIPT_SCHEMA,
+            id: NEMOTRON_RUNTIME_ID.into(),
+            version: NEMOTRON_RUNTIME_VERSION.into(),
+            source: "https://download.pytorch.org/whl/cu128; PyPI".into(),
+            files: component_file_hashes(
+                staging,
+                [NEMOTRON_RUNTIME_HEALTH_FILE, NEMOTRON_RUNTIME_MARKER_FILE],
+            )?,
+        },
+    )
+}
+
+async fn find_nemotron_python() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("VOXIDE_NEMOTRON_PYTHON") {
+        candidates.push(PathBuf::from(configured));
+    }
+    candidates.extend([PathBuf::from("python3.12"), PathBuf::from("python3")]);
+    for candidate in candidates {
+        let output = tokio::process::Command::new(&candidate)
+            .args([
+                "-c",
+                "import sys; raise SystemExit(sys.version_info < (3, 10))",
+            ])
+            .output()
+            .await;
+        if output.is_ok_and(|output| output.status.success()) {
+            return Ok(candidate);
+        }
+    }
+    Err("Nemotron requires Python 3.10 or newer (Python 3.12 is recommended).".into())
+}
+
+async fn run_nemotron_runtime_command(
+    program: &Path,
+    arguments: Vec<std::ffi::OsString>,
+    working_directory: &Path,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    let output = tokio::process::Command::new(program)
+        .args(arguments)
+        .current_dir(working_directory)
+        .env("PIP_NO_CACHE_DIR", "1")
+        .env("TMPDIR", working_directory.join("tmp"))
+        .output()
+        .await
+        .map_err(|error| format!("Could not {operation}: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "Could not {operation} (exit status {})",
+            output.status
+        ))
+    }
 }
 
 const NEMOTRON_MODEL_FILES: [&str; 6] = [
@@ -6525,6 +6683,50 @@ fn write_component_receipt(directory: &Path, receipt: &ComponentReceipt) -> Resu
         .map_err(|error| format!("Could not write the component receipt: {error}"))?;
     fs::rename(&temporary, directory.join(COMPONENT_RECEIPT_FILE))
         .map_err(|error| format!("Could not finalize the component receipt: {error}"))
+}
+
+/// A receipt is meaningful only while every named artifact still matches its
+/// recorded digest. Reject non-normal relative paths as receipts live in a
+/// user-writable directory and must never direct verification outside the
+/// component root.
+fn component_receipt_is_verified(
+    directory: &Path,
+    expected_id: &str,
+    expected_version: &str,
+) -> bool {
+    let receipt = fs::read(directory.join(COMPONENT_RECEIPT_FILE))
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<ComponentReceipt>(&contents).ok());
+    let Some(receipt) = receipt else {
+        return false;
+    };
+    if receipt.schema != COMPONENT_RECEIPT_SCHEMA
+        || receipt.id != expected_id
+        || receipt.version != expected_version
+        || receipt.files.is_empty()
+    {
+        return false;
+    }
+    receipt
+        .files
+        .into_iter()
+        .all(|(relative, expected_digest)| {
+            let path = Path::new(&relative);
+            path.components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && sha256_file(&directory.join(path))
+                    .map(|actual_digest| actual_digest == expected_digest)
+                    .unwrap_or(false)
+        })
+}
+
+fn nemotron_runtime_is_verified(runtime_directory: &Path) -> bool {
+    nemotron::runtime_is_installed(runtime_directory)
+        && component_receipt_is_verified(
+            runtime_directory,
+            NEMOTRON_RUNTIME_ID,
+            NEMOTRON_RUNTIME_VERSION,
+        )
 }
 
 fn install_parakeet_archive(
@@ -10323,6 +10525,54 @@ mod tests {
         assert!(!directory
             .join(format!("{COMPONENT_RECEIPT_FILE}.tmp"))
             .exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn component_receipts_detect_tampering_and_reject_unsafe_paths() {
+        let directory =
+            std::env::temp_dir().join(format!("voxide-component-verify-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("receipt directory creates");
+        fs::write(directory.join("runtime-health.json"), b"verified")
+            .expect("component fixture writes");
+        write_component_receipt(
+            &directory,
+            &ComponentReceipt {
+                schema: COMPONENT_RECEIPT_SCHEMA,
+                id: NEMOTRON_RUNTIME_ID.into(),
+                version: NEMOTRON_RUNTIME_VERSION.into(),
+                source: "https://example.invalid/runtime".into(),
+                files: component_file_hashes(&directory, ["runtime-health.json"])
+                    .expect("component fixture hashes"),
+            },
+        )
+        .expect("receipt writes");
+        assert!(component_receipt_is_verified(
+            &directory,
+            NEMOTRON_RUNTIME_ID,
+            NEMOTRON_RUNTIME_VERSION,
+        ));
+
+        fs::write(directory.join("runtime-health.json"), b"tampered")
+            .expect("component fixture tampers");
+        assert!(!component_receipt_is_verified(
+            &directory,
+            NEMOTRON_RUNTIME_ID,
+            NEMOTRON_RUNTIME_VERSION,
+        ));
+
+        let mut receipt: ComponentReceipt = serde_json::from_slice(
+            &fs::read(directory.join(COMPONENT_RECEIPT_FILE)).expect("receipt reads"),
+        )
+        .expect("receipt parses");
+        receipt.files.clear();
+        receipt.files.insert("../outside".into(), "anything".into());
+        write_component_receipt(&directory, &receipt).expect("unsafe receipt writes");
+        assert!(!component_receipt_is_verified(
+            &directory,
+            NEMOTRON_RUNTIME_ID,
+            NEMOTRON_RUNTIME_VERSION,
+        ));
         let _ = fs::remove_dir_all(directory);
     }
 

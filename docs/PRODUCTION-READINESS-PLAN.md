@@ -803,6 +803,14 @@ signature rooted in the application release key.
     real engine health check.
 12. Clean staging on failure/cancellation/startup recovery.
 
+Current implementation: the Nemotron runtime installer builds its Python
+environment in an application-owned staging directory, runs a CUDA health
+probe, records the resolved package set in a receipt-backed manifest, and only
+then replaces the active runtime. The previous runtime remains intact when
+installation or activation fails. Immutable wheel manifests and signatures are
+still required before treating that Python runtime as a release-grade,
+reproducible artifact.
+
 ### 11.4 Runtime loading
 
 - Prefer bundle-relative or component-root-relative library lookup.
