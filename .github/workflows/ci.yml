@@ -107,17 +107,29 @@ jobs:
     env:
       # A repository variable points only at a runner-local, pinned Parakeet
       # test model. It is intentionally not a user model directory or secret.
+      VOXIDE_CUDA_HOME: ${{ vars.VOXIDE_CUDA_HOME }}
       VOXIDE_PARAKEET_MODEL_DIR: ${{ vars.VOXIDE_PARAKEET_MODEL_DIR }}
+      VOXIDE_SHERPA_ONNX_LIB_DIR: ${{ vars.VOXIDE_SHERPA_ONNX_LIB_DIR }}
+      VOXIDE_PARAKEET_CUDA_LIB_DIRS: ${{ vars.VOXIDE_PARAKEET_CUDA_LIB_DIRS }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Verify NVIDIA/CUDA runner contract
         run: |
-          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-          nvcc --version
+          test -x "$VOXIDE_CUDA_HOME/bin/nvcc"
+          "$VOXIDE_CUDA_HOME/bin/nvcc" --version
           pkg-config --modversion alsa
           pkg-config --modversion gtk+-3.0
           test -n "$VOXIDE_PARAKEET_MODEL_DIR"
           test -f "$VOXIDE_PARAKEET_MODEL_DIR/test_wavs/en.wav"
+          test -d "$VOXIDE_SHERPA_ONNX_LIB_DIR"
+          test -n "$VOXIDE_PARAKEET_CUDA_LIB_DIRS"
+      - name: Configure CUDA build environment
+        run: |
+          echo "CUDA_HOME=$VOXIDE_CUDA_HOME" >> "$GITHUB_ENV"
+          echo "CUDAToolkit_ROOT=$VOXIDE_CUDA_HOME" >> "$GITHUB_ENV"
+          echo "SHERPA_ONNX_LIB_DIR=$VOXIDE_SHERPA_ONNX_LIB_DIR" >> "$GITHUB_ENV"
+          echo "PARAKEET_CUDA_LIB_DIRS=$VOXIDE_PARAKEET_CUDA_LIB_DIRS" >> "$GITHUB_ENV"
+          echo "$VOXIDE_CUDA_HOME/bin" >> "$GITHUB_PATH"
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
       - name: Check formatting

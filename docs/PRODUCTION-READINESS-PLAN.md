@@ -1409,9 +1409,16 @@ Completion checklist:
 
 The guarded runner also requires the repository variable
 `VOXIDE_PARAKEET_MODEL_DIR` to identify its runner-local, pinned Parakeet test
-model. Its CUDA gate runs the normal feature test suite and the two targeted
+model, plus `VOXIDE_CUDA_HOME`, `VOXIDE_SHERPA_ONNX_LIB_DIR`, and
+`VOXIDE_PARAKEET_CUDA_LIB_DIRS` for the user-local compiler and CUDA 12
+runtime libraries. Its CUDA gate runs the normal feature test suite and the two targeted
 ignored model-inference fixtures; this keeps hardware/model evidence explicit
 without downloading a multi-hundred-megabyte test asset in general CI.
+
+Local RTX 4080 evidence (CUDA 13.3 compiler, 2026-07-22): the CUDA feature
+suite passed 172 tests with five intentionally unrelated ignored tests, and
+both targeted Parakeet CUDA inference fixtures passed against the pinned local
+model. The guarded runner still needs to publish the equivalent CI result.
 
 Only after this deliverable is verified should the engine lifecycle refactor or
 Parakeet Flash experiment become the active implementation focus.
