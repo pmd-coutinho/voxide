@@ -34,6 +34,8 @@ from typing import Any, Iterator
 
 MODEL_ID = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 SAMPLE_RATE = 16_000
+PROTOCOL_VERSION = 1
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 # The model accepts 0, 3, 6, or 13 lookahead tokens. NVIDIA's streaming
 # example uses six (560 ms), a practical accuracy/latency default for desktop
 # dictation; Voxide can request a different supported profile per session.
@@ -313,10 +315,16 @@ def main() -> int:
     session: StreamingSession | None = None
     for raw_line in sys.stdin:
         try:
+            if len(raw_line.encode("utf-8")) > MAX_MESSAGE_BYTES:
+                raise ValueError("Nemotron request exceeds the service safety limit")
             request = json.loads(raw_line)
+            if not isinstance(request, dict):
+                raise ValueError("Nemotron request must be a JSON object")
             action = request.get("action")
             if action == "ping":
-                respond({"type": "ready", "modelId": MODEL_ID})
+                if request.get("protocolVersion") != PROTOCOL_VERSION:
+                    raise ValueError("Incompatible Nemotron protocol version")
+                respond({"type": "ready", "modelId": MODEL_ID, "protocolVersion": PROTOCOL_VERSION})
             elif action == "start":
                 language = str(request.get("language") or "auto")
                 lookahead_tokens = int(request.get("lookaheadTokens", DEFAULT_LOOKAHEAD_TOKENS))

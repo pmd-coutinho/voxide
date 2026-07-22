@@ -31,6 +31,8 @@ pub const MODEL_REPOSITORY: &str = "nvidia/nemotron-3.5-asr-streaming-0.6b";
 pub const MODEL_REVISION: &str = "f3d333391852ba876df169dcc9ba902d25b6ab0b";
 /// NVIDIA's documented balanced streaming configuration (560 ms chunks).
 pub const DEFAULT_LOOKAHEAD_TOKENS: u8 = 6;
+pub const PROTOCOL_VERSION: u32 = 1;
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const RUNTIME_MARKER: &str = ".voxide-nemotron-runtime-v1";
 const REQUIRED_MODEL_FILES: [&str; 5] = [
     "config.json",
@@ -79,6 +81,8 @@ struct Response {
     text: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    protocol_version: Option<u32>,
 }
 
 /// One persistent Python process. Requests are intentionally serialized: one
@@ -140,10 +144,10 @@ impl Server {
             stdin,
             stdout: BufReader::new(stdout).lines(),
         };
-        let response = server.request(json!({ "action": "ping" })).await?;
-        if response.kind != "ready" {
-            return Err("The Nemotron CUDA service did not complete startup.".into());
-        }
+        let response = server
+            .request(json!({ "action": "ping", "protocolVersion": PROTOCOL_VERSION }))
+            .await?;
+        validate_handshake(&response)?;
         Ok(server)
     }
 
@@ -199,6 +203,9 @@ impl Server {
     async fn request(&mut self, request: Value) -> Result<Response, String> {
         let encoded = serde_json::to_string(&request)
             .map_err(|error| format!("Could not encode a Nemotron request: {error}"))?;
+        if encoded.len() > MAX_MESSAGE_BYTES {
+            return Err("Nemotron audio request exceeds the service safety limit".into());
+        }
         self.stdin
             .write_all(encoded.as_bytes())
             .await
@@ -216,6 +223,9 @@ impl Server {
             .map_err(|_| "Nemotron CUDA service timed out".to_string())?
             .map_err(|error| format!("Could not read the Nemotron CUDA service response: {error}"))?
             .ok_or("Nemotron CUDA service stopped unexpectedly")?;
+        if line.len() > MAX_MESSAGE_BYTES {
+            return Err("Nemotron CUDA service returned an oversized response".into());
+        }
         let response: Response = serde_json::from_str(&line)
             .map_err(|error| format!("Nemotron CUDA service returned invalid JSON: {error}"))?;
         if response.kind == "error" {
@@ -233,6 +243,16 @@ impl Server {
     pub fn terminate(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+fn validate_handshake(response: &Response) -> Result<(), String> {
+    if response.kind != "ready" {
+        return Err("The Nemotron CUDA service did not complete startup.".into());
+    }
+    if response.protocol_version != Some(PROTOCOL_VERSION) {
+        return Err("The Nemotron CUDA service is incompatible with this Voxide version. Reinstall the CUDA runtime.".into());
+    }
+    Ok(())
 }
 
 impl Drop for Server {
@@ -281,5 +301,21 @@ mod tests {
         }
         assert!(model_is_installed(&temporary));
         std::fs::remove_dir_all(temporary).expect("remove temporary model directory");
+    }
+
+    #[test]
+    fn handshake_requires_the_exact_sidecar_protocol_version() {
+        let ready = Response {
+            kind: "ready".into(),
+            text: String::new(),
+            message: String::new(),
+            protocol_version: Some(PROTOCOL_VERSION),
+        };
+        assert!(validate_handshake(&ready).is_ok());
+        assert!(validate_handshake(&Response {
+            protocol_version: Some(PROTOCOL_VERSION + 1),
+            ..ready
+        })
+        .is_err());
     }
 }
