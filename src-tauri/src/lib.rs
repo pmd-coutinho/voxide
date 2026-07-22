@@ -1492,6 +1492,83 @@ fn finish_preview(capture_state: &NativeCaptureState, session_id: u64) {
     }
 }
 
+/// CPAL reports device and route failures on a callback that must stay
+/// lock-free and UI-free. Poll its atomic health counter from the async side
+/// instead, then end the affected generation exactly once with a visible,
+/// actionable state.
+fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != session_id {
+                return;
+            }
+            let stream_errors = capture_state
+                .capture
+                .lock()
+                .ok()
+                .and_then(|capture| {
+                    capture
+                        .as_ref()
+                        .map(|capture| capture.health().stream_errors)
+                })
+                .unwrap_or_default();
+            if stream_errors == 0 {
+                continue;
+            }
+
+            let capture = capture_state
+                .capture
+                .lock()
+                .ok()
+                .and_then(|mut capture| capture.take());
+            if capture.is_none() {
+                return;
+            }
+            let _ = capture_state
+                .capture_started_at
+                .lock()
+                .map(|mut started_at| started_at.take());
+            let _ = capture_state
+                .session
+                .lock()
+                .map(|mut coordinator| coordinator.cancel(session_id));
+            capture_state
+                .preview_generation
+                .fetch_add(1, Ordering::SeqCst);
+            drop(capture);
+            let nemotron_live = Arc::clone(&capture_state.nemotron_live);
+            tauri::async_runtime::spawn(async move {
+                let mut live = nemotron_live.lock().await;
+                if live.generation == session_id && live.session_started {
+                    if let Some(server) = live.server.as_mut() {
+                        if server.abort().await.is_err() {
+                            server.terminate();
+                        }
+                    }
+                }
+                if live.generation == session_id {
+                    live.fed_samples = 0;
+                    live.session_started = false;
+                    live.generation = 0;
+                    live.start_error = None;
+                }
+            });
+            debug_log::append(&format!(
+                "Capture failed (session: {session_id}, stream_errors: {stream_errors})"
+            ));
+            emit_overlay(
+                &app,
+                "error",
+                "Microphone connection lost. Reconnect or reselect the input device.",
+            );
+            update_tray_status(&app, TrayVisualState::Ready);
+            return;
+        }
+    });
+}
+
 /// Ensures finalization cannot leave the coordinator stuck when any later
 /// transcription, post-processing, or insertion step returns an error.
 struct FinishDictationSession {
@@ -6255,6 +6332,7 @@ fn start_native_dictation(
         "Dictation capture started (session: {preview_generation}, engine: {:?}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
         settings.selected_voice_engine, settings.enable_streaming_preview
     ));
+    spawn_capture_error_monitor(app.clone(), preview_generation);
     update_tray_status(&app, TrayVisualState::Recording);
     if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
         *capture_state
