@@ -5527,6 +5527,42 @@ async fn nemotron_download_size(client: &reqwest::Client, file: &str) -> Option<
     })
 }
 
+/// Swap a fully verified staged component into place without deleting the last
+/// known-good installation first. Both paths are siblings in the app-owned
+/// component directory, so rename is an atomic filesystem operation. If the
+/// second rename fails, restore the old component before reporting failure.
+fn replace_component_directory(staging: &Path, destination: &Path) -> Result<(), String> {
+    let backup = destination.with_file_name(format!(
+        ".{}-previous-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("component"),
+        uuid::Uuid::new_v4()
+    ));
+    let had_previous = destination.exists();
+    if had_previous {
+        fs::rename(destination, &backup).map_err(|error| {
+            format!("Could not stage the previous component for replacement: {error}")
+        })?;
+    }
+    if let Err(error) = fs::rename(staging, destination) {
+        if had_previous {
+            let _ = fs::rename(&backup, destination);
+        }
+        return Err(format!("Could not activate the new component: {error}"));
+    }
+    if had_previous {
+        if let Err(error) = fs::remove_dir_all(&backup) {
+            debug_log::append(&format!(
+                "Could not remove superseded component backup {}: {error}",
+                backup.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn download_nemotron_model(
     app: AppHandle,
@@ -5624,14 +5660,13 @@ async fn download_nemotron_model(
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err("The Nemotron model download is incomplete".into());
     }
-    if destination.exists() {
-        tokio::fs::remove_dir_all(&destination)
-            .await
-            .map_err(|error| format!("Could not replace the existing Nemotron model: {error}"))?;
-    }
-    tokio::fs::rename(&staging, &destination)
-        .await
-        .map_err(|error| format!("Could not install the Nemotron model: {error}"))?;
+    let staged_component = staging.clone();
+    let destination_component = destination.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        replace_component_directory(&staged_component, &destination_component)
+    })
+    .await
+    .map_err(|error| format!("Nemotron installation task failed: {error}"))??;
     nemotron_status(&state)
 }
 
@@ -5801,13 +5836,7 @@ fn install_parakeet_archive(
             return Err(parakeet::installation_error(&extracted));
         }
         let destination = parakeet::model_directory(models_directory);
-        if destination.exists() {
-            fs::remove_dir_all(&destination).map_err(|error| {
-                format!("Could not replace the existing Parakeet model: {error}")
-            })?;
-        }
-        fs::rename(&extracted, &destination)
-            .map_err(|error| format!("Could not install the Parakeet model: {error}"))?;
+        replace_component_directory(&extracted, &destination)?;
         Ok(destination)
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -9576,6 +9605,33 @@ mod tests {
         let json: Value = serde_json::from_str(&contents).expect("database JSON parses");
         assert_eq!(json["schemaVersion"], DATABASE_SCHEMA_VERSION);
         assert!(json["data"].is_object());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn component_replacement_activates_a_verified_staging_directory() {
+        let root = std::env::temp_dir().join(format!("voxide-component-{}", uuid::Uuid::new_v4()));
+        let destination = root.join("component");
+        let staging = root.join("staging");
+        fs::create_dir_all(&destination).expect("old component directory creates");
+        fs::create_dir_all(&staging).expect("staged component directory creates");
+        fs::write(destination.join("version"), "old").expect("old component writes");
+        fs::write(staging.join("version"), "new").expect("staged component writes");
+
+        replace_component_directory(&staging, &destination).expect("component replacement works");
+        assert_eq!(
+            fs::read_to_string(destination.join("version")).unwrap(),
+            "new"
+        );
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("previous"))
+                .count(),
+            0
+        );
         let _ = fs::remove_dir_all(root);
     }
 
