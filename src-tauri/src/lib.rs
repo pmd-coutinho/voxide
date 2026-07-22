@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -58,6 +58,8 @@ const NEMOTRON_RUNTIME_ID: &str = "nemotron-cuda-runtime";
 const NEMOTRON_MODEL_DOWNLOAD_ID: &str = "nemotron-3.5-asr-streaming-0.6b";
 const NEMOTRON_SERVER_SOURCE: &str = include_str!("../scripts/nemotron_cuda_server.py");
 const NEMOTRON_SETUP_SOURCE: &str = include_str!("../../scripts/setup-nemotron-cuda-runtime.sh");
+const COMPONENT_RECEIPT_FILE: &str = ".voxide-component-receipt.json";
+const COMPONENT_RECEIPT_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +93,19 @@ struct AppDatabase {
 struct PersistedDatabase {
     schema_version: u32,
     data: AppDatabase,
+}
+
+/// A component-owned record written only after every declared artifact has
+/// verified and before the staging directory becomes active. It is an audit
+/// record, not a readiness marker, so older valid installations remain usable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ComponentReceipt {
+    schema: u32,
+    id: String,
+    version: String,
+    source: String,
+    files: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -5698,6 +5713,35 @@ async fn download_nemotron_model(
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err("The Nemotron model download is incomplete".into());
     }
+    let receipt_directory = staging.clone();
+    let receipt_result = tauri::async_runtime::spawn_blocking(move || {
+        write_component_receipt(
+            &receipt_directory,
+            &ComponentReceipt {
+                schema: COMPONENT_RECEIPT_SCHEMA,
+                id: nemotron::MODEL_ID.into(),
+                version: nemotron::MODEL_REVISION.into(),
+                source: format!(
+                    "https://huggingface.co/{}/tree/{}",
+                    nemotron::MODEL_REPOSITORY,
+                    nemotron::MODEL_REVISION
+                ),
+                files: component_file_hashes(&receipt_directory, NEMOTRON_MODEL_FILES)?,
+            },
+        )
+    })
+    .await;
+    match receipt_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(format!("Nemotron receipt task failed: {error}"));
+        }
+    }
     let staged_component = staging.clone();
     let destination_component = destination.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -5866,6 +5910,26 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn component_file_hashes(
+    directory: &Path,
+    files: impl IntoIterator<Item = &'static str>,
+) -> Result<BTreeMap<String, String>, String> {
+    files
+        .into_iter()
+        .map(|file| sha256_file(&directory.join(file)).map(|digest| (file.to_owned(), digest)))
+        .collect()
+}
+
+fn write_component_receipt(directory: &Path, receipt: &ComponentReceipt) -> Result<(), String> {
+    let contents = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| format!("Could not encode the component receipt: {error}"))?;
+    let temporary = directory.join(format!("{COMPONENT_RECEIPT_FILE}.tmp"));
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("Could not write the component receipt: {error}"))?;
+    fs::rename(&temporary, directory.join(COMPONENT_RECEIPT_FILE))
+        .map_err(|error| format!("Could not finalize the component receipt: {error}"))
+}
+
 fn install_parakeet_archive(
     archive_path: &Path,
     models_directory: &Path,
@@ -5893,6 +5957,19 @@ fn install_parakeet_archive(
         if !parakeet::model_is_installed(&extracted) {
             return Err(parakeet::installation_error(&extracted));
         }
+        write_component_receipt(
+            &extracted,
+            &ComponentReceipt {
+                schema: COMPONENT_RECEIPT_SCHEMA,
+                id: parakeet::MODEL_ID.into(),
+                version: parakeet::MODEL_ARCHIVE_SHA256.into(),
+                source: parakeet::MODEL_ARCHIVE_URL.into(),
+                files: component_file_hashes(
+                    &extracted,
+                    parakeet::required_files().iter().copied(),
+                )?,
+            },
+        )?;
         let destination = parakeet::model_directory(models_directory);
         replace_component_directory(&extracted, &destination)?;
         Ok(destination)
@@ -9754,6 +9831,40 @@ mod tests {
             "7bcd53ec8f339c1a407912b52875daaf8f04e7d69c19ca831172fb1f3f83343d"
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn component_receipt_is_atomic_and_records_verified_files() {
+        let directory =
+            std::env::temp_dir().join(format!("voxide-component-receipt-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("receipt directory creates");
+        fs::write(directory.join("model.bin"), b"voxide").expect("component fixture writes");
+        let files =
+            component_file_hashes(&directory, ["model.bin"]).expect("component fixture hashes");
+        write_component_receipt(
+            &directory,
+            &ComponentReceipt {
+                schema: COMPONENT_RECEIPT_SCHEMA,
+                id: "test-component".into(),
+                version: "test-version".into(),
+                source: "https://example.invalid/component".into(),
+                files,
+            },
+        )
+        .expect("receipt writes");
+        let receipt: ComponentReceipt = serde_json::from_slice(
+            &fs::read(directory.join(COMPONENT_RECEIPT_FILE)).expect("receipt reads"),
+        )
+        .expect("receipt parses");
+        assert_eq!(receipt.id, "test-component");
+        assert_eq!(
+            receipt.files["model.bin"],
+            "7bcd53ec8f339c1a407912b52875daaf8f04e7d69c19ca831172fb1f3f83343d"
+        );
+        assert!(!directory
+            .join(format!("{COMPONENT_RECEIPT_FILE}.tmp"))
+            .exists());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

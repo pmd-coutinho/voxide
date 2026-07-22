@@ -74,6 +74,10 @@ pub fn archive_root() -> &'static str {
     MODEL_ARCHIVE_ROOT
 }
 
+pub fn required_files() -> &'static [&'static str] {
+    &REQUIRED_FILES
+}
+
 pub fn model_is_installed(directory: &Path) -> bool {
     directory.is_dir()
         && REQUIRED_FILES
