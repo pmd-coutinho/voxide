@@ -63,6 +63,7 @@ const NEMOTRON_RUNTIME_HEALTH_FILE: &str = "runtime-health.json";
 const NEMOTRON_RUNTIME_MARKER_FILE: &str = ".voxide-nemotron-runtime-v1";
 const COMPONENT_RECEIPT_FILE: &str = ".voxide-component-receipt.json";
 const COMPONENT_RECEIPT_SCHEMA: u32 = 1;
+const COMPONENT_STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6361,6 +6362,53 @@ fn replace_component_directory(staging: &Path, destination: &Path) -> Result<(),
     Ok(())
 }
 
+/// Remove only abandoned directories whose names are created by our component
+/// transactions. A grace period avoids racing a currently active installer;
+/// unrelated user data is never considered for removal.
+fn cleanup_abandoned_component_directories(
+    directories: &[PathBuf],
+    minimum_age: Duration,
+) -> usize {
+    const OWNED_PREFIXES: [&str; 5] = [
+        ".nemotron-runtime-install-",
+        ".nemotron-runtime-previous-",
+        ".nemotron-3.5-asr-streaming-0.6b-download-",
+        ".nemotron-3.5-asr-streaming-0.6b-previous-",
+        ".parakeet-install-",
+    ];
+    let mut removed = 0;
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !OWNED_PREFIXES
+                .iter()
+                .any(|prefix| file_name.starts_with(prefix))
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let old_enough = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= minimum_age);
+            if metadata.is_dir() && old_enough && fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 #[tauri::command]
 async fn download_nemotron_model(
     app: AppHandle,
@@ -9042,6 +9090,25 @@ pub fn run() {
                 std::env::consts::ARCH
             ));
             let state = app.state::<AppState>();
+            let cleanup_directories = [state.models_directory(), state.data_directory()]
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            tauri::async_runtime::spawn(async move {
+                let removed = tauri::async_runtime::spawn_blocking(move || {
+                    cleanup_abandoned_component_directories(
+                        &cleanup_directories,
+                        COMPONENT_STAGING_MAX_AGE,
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                if removed != 0 {
+                    debug_log::append(&format!(
+                        "Removed abandoned component transaction directories (count: {removed})"
+                    ));
+                }
+            });
             let registry = app.state::<HotkeyRegistry>();
             let startup_settings = state
                 .database
@@ -10620,6 +10687,24 @@ mod tests {
             NEMOTRON_RUNTIME_ID,
             NEMOTRON_RUNTIME_VERSION,
         ));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn component_startup_cleanup_removes_only_owned_abandoned_directories() {
+        let directory =
+            std::env::temp_dir().join(format!("voxide-component-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("cleanup directory creates");
+        let owned = directory.join(".nemotron-runtime-install-interrupted");
+        let unrelated = directory.join("important-user-directory");
+        fs::create_dir_all(&owned).expect("owned staging creates");
+        fs::create_dir_all(&unrelated).expect("unrelated directory creates");
+        assert_eq!(
+            cleanup_abandoned_component_directories(&[directory.clone()], Duration::ZERO),
+            1
+        );
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
         let _ = fs::remove_dir_all(directory);
     }
 

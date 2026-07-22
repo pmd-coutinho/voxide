@@ -811,6 +811,10 @@ installation or activation fails. Immutable wheel manifests and signatures are
 still required before treating that Python runtime as a release-grade,
 reproducible artifact.
 
+At application startup, Voxide also removes only its own abandoned component
+transaction directories after a 24-hour grace period; it never scans or
+recursively removes arbitrary application-data directories.
+
 ### 11.4 Runtime loading
 
 - Prefer bundle-relative or component-root-relative library lookup.
