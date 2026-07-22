@@ -10014,6 +10014,14 @@ mod tests {
     }
 
     #[test]
+    fn capture_failure_event_uses_the_frontend_session_id_field() {
+        let value = serde_json::to_value(CaptureFailure { session_id: 42 })
+            .expect("capture failure event serializes");
+        assert_eq!(value["sessionId"], 42);
+        assert!(value.get("session_id").is_none());
+    }
+
+    #[test]
     fn dictionary_transfer_entries_only_include_portable_fields() {
         let transfer = DictionaryTransferEntry {
             spoken: "vox side".into(),
