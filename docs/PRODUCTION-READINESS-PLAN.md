@@ -1322,7 +1322,7 @@ The first implementation deliverable should be narrowly scoped:
 Completion checklist:
 
 - [x] No callback path uses `Mutex<Vec<f32>>` or silently ignores failure.
-- [ ] Raw packets have sequence/timestamp metadata.
+- [x] Raw packets have sequence/timestamp metadata.
 - [x] Resampling preserves fractional phase across packets.
 - [x] Canonical audio is the only input used by preview and final inference.
 - [x] Preview snapshots cannot block capture.
