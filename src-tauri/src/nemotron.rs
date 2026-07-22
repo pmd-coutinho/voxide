@@ -33,6 +33,9 @@ pub const MODEL_REVISION: &str = "f3d333391852ba876df169dcc9ba902d25b6ab0b";
 pub const DEFAULT_LOOKAHEAD_TOKENS: u8 = 6;
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const CANCELLATION_TIMEOUT: Duration = Duration::from_secs(20);
 const RUNTIME_MARKER: &str = ".voxide-nemotron-runtime-v1";
 const REQUIRED_MODEL_FILES: [&str; 5] = [
     "config.json",
@@ -149,7 +152,10 @@ impl Server {
             next_request_id: 1,
         };
         let response = server
-            .request(json!({ "action": "ping", "protocolVersion": PROTOCOL_VERSION }))
+            .request_with_timeout(
+                json!({ "action": "ping", "protocolVersion": PROTOCOL_VERSION }),
+                STARTUP_TIMEOUT,
+            )
             .await?;
         validate_handshake(&response)?;
         Ok(server)
@@ -196,7 +202,9 @@ impl Server {
     }
 
     pub async fn abort(&mut self) -> Result<(), String> {
-        let response = self.request(json!({ "action": "abort" })).await?;
+        let response = self
+            .request_with_timeout(json!({ "action": "abort" }), CANCELLATION_TIMEOUT)
+            .await?;
         if response.kind == "aborted" {
             Ok(())
         } else {
@@ -204,7 +212,15 @@ impl Server {
         }
     }
 
-    async fn request(&mut self, mut request: Value) -> Result<Response, String> {
+    async fn request(&mut self, request: Value) -> Result<Response, String> {
+        self.request_with_timeout(request, REQUEST_TIMEOUT).await
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        mut request: Value,
+        request_timeout: Duration,
+    ) -> Result<Response, String> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         request
@@ -228,11 +244,15 @@ impl Server {
         self.stdin.flush().await.map_err(|error| {
             format!("Could not send audio to the Nemotron CUDA service: {error}")
         })?;
-        let line = timeout(Duration::from_secs(180), self.stdout.next_line())
-            .await
-            .map_err(|_| "Nemotron CUDA service timed out".to_string())?
-            .map_err(|error| format!("Could not read the Nemotron CUDA service response: {error}"))?
-            .ok_or("Nemotron CUDA service stopped unexpectedly")?;
+        let line = match timeout(request_timeout, self.stdout.next_line()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.terminate();
+                return Err("Nemotron CUDA service timed out and was stopped".into());
+            }
+        }
+        .map_err(|error| format!("Could not read the Nemotron CUDA service response: {error}"))?
+        .ok_or("Nemotron CUDA service stopped unexpectedly")?;
         if line.len() > MAX_MESSAGE_BYTES {
             return Err("Nemotron CUDA service returned an oversized response".into());
         }
