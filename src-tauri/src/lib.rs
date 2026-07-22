@@ -7224,7 +7224,7 @@ async fn stop_native_dictation(
         .map(|started_at| started_at.elapsed().as_millis() as u64)
         .unwrap_or(captured.duration_ms);
     debug_log::append(&format!(
-        "Capture health (session: {recording_generation}, wall_duration_ms: {wall_duration_ms}, canonical_duration_ms: {}, callbacks: {}, input_samples: {}, accepted_samples: {}, dropped_samples: {}, overflow_blocks: {}, ring_high_water_samples: {}, canonical_samples: {}, stream_errors: {})",
+        "Capture health (session: {recording_generation}, wall_duration_ms: {wall_duration_ms}, canonical_duration_ms: {}, callbacks: {}, input_samples: {}, accepted_samples: {}, dropped_samples: {}, overflow_blocks: {}, ring_high_water_samples: {}, canonical_samples: {}, discontinuities: {}, capture_delay_ns: {}, stream_errors: {})",
         captured.duration_ms,
         capture_health.callback_blocks,
         capture_health.input_samples,
@@ -7233,6 +7233,8 @@ async fn stop_native_dictation(
         capture_health.overflow_blocks,
         capture_health.ring_high_water_samples,
         capture_health.canonical_samples,
+        capture_health.discontinuities,
+        capture_health.latest_capture_delay_ns,
         capture_health.stream_errors,
     ));
     if capture_health.dropped_samples != 0 {

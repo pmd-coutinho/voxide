@@ -50,6 +50,15 @@ pub struct CaptureHealth {
     pub ring_high_water_samples: usize,
     pub canonical_samples: u64,
     pub stream_errors: u64,
+    pub discontinuities: u64,
+    pub latest_capture_delay_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RawSample {
+    value: f32,
+    packet_sequence: u64,
+    capture_delay_ns: u64,
 }
 
 const RAW_RING_MINIMUM_SAMPLES: usize = 16_384;
@@ -66,6 +75,9 @@ struct CaptureCounters {
     ring_high_water_samples: AtomicUsize,
     canonical_samples: AtomicU64,
     stream_errors: AtomicU64,
+    next_packet_sequence: AtomicU64,
+    discontinuities: AtomicU64,
+    latest_capture_delay_ns: AtomicU64,
 }
 
 impl CaptureCounters {
@@ -79,6 +91,8 @@ impl CaptureCounters {
             ring_high_water_samples: self.ring_high_water_samples.load(Ordering::Relaxed),
             canonical_samples: self.canonical_samples.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            discontinuities: self.discontinuities.load(Ordering::Relaxed),
+            latest_capture_delay_ns: self.latest_capture_delay_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -95,6 +109,9 @@ impl Default for CaptureCounters {
             ring_high_water_samples: AtomicUsize::new(0),
             canonical_samples: AtomicU64::new(0),
             stream_errors: AtomicU64::new(0),
+            next_packet_sequence: AtomicU64::new(0),
+            discontinuities: AtomicU64::new(0),
+            latest_capture_delay_ns: AtomicU64::new(0),
         }
     }
 }
@@ -165,7 +182,7 @@ impl AudioCapture {
             .saturating_mul(channels.max(1) as usize)
             .saturating_mul(RAW_RING_BUFFER_SECONDS)
             .max(RAW_RING_MINIMUM_SAMPLES);
-        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
+        let (mut producer, consumer) = rtrb::RingBuffer::<RawSample>::new(ring_capacity);
         let canonical_samples = Arc::new(Mutex::new(Vec::new()));
         let counters = Arc::new(CaptureCounters::default());
         let stop_worker = Arc::new(AtomicBool::new(false));
@@ -186,8 +203,14 @@ impl AudioCapture {
             ($sample:ty) => {
                 device.build_input_stream(
                     &config,
-                    move |data: &[$sample], _| {
-                        append_samples(data, &mut producer, &callback_counters)
+                    move |data: &[$sample], info| {
+                        let timestamp = info.timestamp();
+                        let capture_delay_ns = timestamp
+                            .callback
+                            .duration_since(&timestamp.capture)
+                            .map(|delay| delay.as_nanos().min(u64::MAX as u128) as u64)
+                            .unwrap_or_default();
+                        append_samples(data, &mut producer, &callback_counters, capture_delay_ns)
                     },
                     move |error| {
                         error_counters.stream_errors.fetch_add(1, Ordering::Relaxed);
@@ -500,18 +523,29 @@ fn device_label(device: &cpal::Device) -> Option<String> {
         .map(|description| description.to_string())
 }
 
-fn append_samples<T>(data: &[T], producer: &mut rtrb::Producer<f32>, counters: &CaptureCounters)
-where
+fn append_samples<T>(
+    data: &[T],
+    producer: &mut rtrb::Producer<RawSample>,
+    counters: &CaptureCounters,
+    capture_delay_ns: u64,
+) where
     T: Sample,
     f32: FromSample<T>,
 {
+    let packet_sequence = counters
+        .next_packet_sequence
+        .fetch_add(1, Ordering::Relaxed);
     counters.callback_blocks.fetch_add(1, Ordering::Relaxed);
     counters
         .input_samples
         .fetch_add(data.len() as u64, Ordering::Relaxed);
     let mut overflowed = false;
     for sample in data.iter().copied().map(f32::from_sample) {
-        match producer.push(sample) {
+        match producer.push(RawSample {
+            value: sample,
+            packet_sequence,
+            capture_delay_ns,
+        }) {
             Ok(()) => {
                 counters.accepted_samples.fetch_add(1, Ordering::Relaxed);
                 let queued = counters.queued_samples.fetch_add(1, Ordering::Relaxed) + 1;
@@ -531,7 +565,7 @@ where
 }
 
 fn spawn_capture_worker(
-    mut consumer: rtrb::Consumer<f32>,
+    mut consumer: rtrb::Consumer<RawSample>,
     canonical_samples: Arc<Mutex<Vec<f32>>>,
     counters: Arc<CaptureCounters>,
     stop: Arc<AtomicBool>,
@@ -546,12 +580,22 @@ fn spawn_capture_worker(
             let mut canonical = Vec::with_capacity(2_048);
             let mut resampler = StatefulMonoResampler::new(sample_rate, channels);
             let mut level_tracker = LevelTracker::default();
+            let mut previous_packet_sequence = None;
             loop {
                 packet.clear();
                 while packet.len() < packet.capacity() {
                     match consumer.pop() {
                         Ok(sample) => {
-                            packet.push(sample);
+                            if let Some(previous) = previous_packet_sequence {
+                                if sample.packet_sequence > previous + 1 {
+                                    counters.discontinuities.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            previous_packet_sequence = Some(sample.packet_sequence);
+                            counters
+                                .latest_capture_delay_ns
+                                .store(sample.capture_delay_ns, Ordering::Relaxed);
+                            packet.push(sample.value);
                             counters.queued_samples.fetch_sub(1, Ordering::Relaxed);
                         }
                         Err(_) => break,
@@ -924,13 +968,31 @@ mod tests {
 
     #[test]
     fn full_raw_ring_is_counted_instead_of_silently_dropped() {
-        let (mut producer, _consumer) = rtrb::RingBuffer::<f32>::new(2);
+        let (mut producer, _consumer) = rtrb::RingBuffer::<RawSample>::new(2);
         let counters = CaptureCounters::default();
-        append_samples(&[0.1_f32, 0.2, 0.3], &mut producer, &counters);
+        append_samples(&[0.1_f32, 0.2, 0.3], &mut producer, &counters, 42);
         assert_eq!(counters.health().callback_blocks, 1);
         assert_eq!(counters.health().accepted_samples, 2);
         assert_eq!(counters.health().dropped_samples, 1);
         assert_eq!(counters.health().overflow_blocks, 1);
         assert_eq!(counters.health().ring_high_water_samples, 2);
+        assert_eq!(counters.health().latest_capture_delay_ns, 0);
+    }
+
+    #[test]
+    fn raw_ring_retains_packet_sequence_and_capture_delay_metadata() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<RawSample>::new(4);
+        let counters = CaptureCounters::default();
+        append_samples(&[0.25_f32, 0.5], &mut producer, &counters, 12);
+        append_samples(&[-0.25_f32], &mut producer, &counters, 34);
+        let first = consumer.pop().expect("first packet sample");
+        let second = consumer.pop().expect("second packet sample");
+        let third = consumer.pop().expect("next packet sample");
+        assert_eq!(first.packet_sequence, 0);
+        assert_eq!(second.packet_sequence, 0);
+        assert_eq!(third.packet_sequence, 1);
+        assert_eq!(first.capture_delay_ns, 12);
+        assert_eq!(third.capture_delay_ns, 34);
+        assert_eq!(third.value, -0.25);
     }
 }
