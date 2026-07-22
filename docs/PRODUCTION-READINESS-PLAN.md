@@ -1327,7 +1327,7 @@ Completion checklist:
 - [x] Canonical audio is the only input used by preview and final inference.
 - [x] Preview snapshots cannot block capture.
 - [x] Stop drains through an exact session boundary.
-- [ ] Device/callback failure reaches coordinator/UI state.
+- [x] Device/callback failure reaches coordinator/UI state.
 - [x] Capture health appears in redacted diagnostics.
 - [x] 44.1 and 48 kHz fixture tests pass.
 - [ ] Pause-heavy dictation fixture produces multiple preview updates.
