@@ -715,12 +715,12 @@ function renderWelcome(): void {
 }
 
 function renderVoiceEngine(): void {
-  const engines: [Settings["selectedVoiceEngine"], string, string, boolean][] = [
-    ["whisper", "Whisper", "Local models with broad language support", true],
-    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with FluidVoice-style full-buffer preview", voiceEngineAvailability.parakeet],
-    ["nemotron", "Nemotron Speech", "Local NVIDIA CUDA true-streaming transcription", voiceEngineAvailability.nemotron],
-    ["appleSpeech", "System speech", "Use the operating system speech service", true],
-    ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", true],
+  const engines: [Settings["selectedVoiceEngine"], string, string, "Stable" | "Experimental", boolean][] = [
+    ["whisper", "Whisper", "Local models with broad language support", "Stable", true],
+    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with FluidVoice-style full-buffer preview", "Stable", voiceEngineAvailability.parakeet],
+    ["nemotron", "Nemotron Speech", "Local NVIDIA CUDA true-streaming transcription", "Experimental", voiceEngineAvailability.nemotron],
+    ["appleSpeech", "System speech", "Use the operating system speech service", "Stable", true],
+    ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", "Stable", true],
   ];
   const selectedEngine = database.settings.selectedVoiceEngine;
   const isWhisper = selectedEngine === "whisper";
@@ -769,8 +769,8 @@ function renderVoiceEngine(): void {
     : "";
   renderShell(`
     ${pageTitle("Voice Engine", "Choose the transcription runtime used for dictation.")}
-    <section class="card"><div class="engine-grid">${engines.map(([id, name, description, available]) => `
-      <button class="engine-choice ${database.settings.selectedVoiceEngine === id ? "active" : ""}" data-engine="${id}" ${available ? "" : "disabled"}><strong>${name}</strong><span>${description}</span><em>${available ? (database.settings.selectedVoiceEngine === id ? "Selected" : "Select") : "Not available"}</em></button>`).join("")}</div></section>
+    <section class="card"><div class="engine-grid">${engines.map(([id, name, description, maturity, available]) => `
+      <button class="engine-choice ${database.settings.selectedVoiceEngine === id ? "active" : ""}" data-engine="${id}" ${available ? "" : "disabled"}><div class="engine-choice-title"><strong>${name}</strong><b class="engine-maturity ${maturity === "Experimental" ? "experimental" : "stable"}">${maturity}</b></div><span>${description}</span><em>${available ? (database.settings.selectedVoiceEngine === id ? "Selected" : "Select") : "Not available"}</em></button>`).join("")}</div></section>
     <section class="card form-card"><div class="card-title"><h2>Model configuration</h2>${status}</div>
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
