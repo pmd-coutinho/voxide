@@ -72,10 +72,46 @@ pub fn append(event: &str) {
         .filter(|character| !character.is_control() || *character == ' ')
         .take(500)
         .collect::<String>();
+    let sanitized = redact_sensitive_tokens(&sanitized);
     let line = format!("{} {}\n", Utc::now().to_rfc3339(), sanitized);
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+/// The diagnostic API is deliberately metadata-only, but error messages from
+/// dependencies can still contain a path, URL, or credential-like token.
+/// Redact those shapes centrally before a user can export the log.
+fn redact_sensitive_tokens(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            let lower = token.to_ascii_lowercase();
+            let looks_like_path = token.starts_with('/')
+                || token.starts_with("~/")
+                || token.starts_with("file:")
+                || token.contains("\\\\")
+                || (token.len() > 2
+                    && token.as_bytes()[1] == b':'
+                    && matches!(token.as_bytes()[0], b'a'..=b'z' | b'A'..=b'Z'));
+            let looks_like_url = token.contains("://");
+            let looks_like_secret = lower.contains("api_key")
+                || lower.contains("authorization")
+                || lower.contains("bearer")
+                || lower.contains("token=")
+                || lower.contains("sk-");
+            if looks_like_secret {
+                "<redacted-secret>"
+            } else if looks_like_path {
+                "<redacted-path>"
+            } else if looks_like_url {
+                "<redacted-url>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Returns only the last `limit` lines of the current log for an explicitly
@@ -94,6 +130,8 @@ pub fn recent_lines(limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn diagnostic_entries_are_bounded_and_strip_newlines() {
         let value = "line one\nline two";
@@ -103,5 +141,18 @@ mod tests {
             .take(500)
             .collect::<String>();
         assert_eq!(sanitized, "line oneline two");
+    }
+
+    #[test]
+    fn diagnostics_redact_paths_urls_and_credential_like_tokens() {
+        let value = redact_sensitive_tokens(
+            "failed /home/alice/private.wav https://example.test?token=abc api_key=secret C:\\Users\\alice",
+        );
+        assert!(!value.contains("alice"));
+        assert!(!value.contains("api_key=secret"));
+        assert_eq!(
+            value,
+            "failed <redacted-path> <redacted-secret> <redacted-secret> <redacted-path>"
+        );
     }
 }
