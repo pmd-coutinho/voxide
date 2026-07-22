@@ -780,7 +780,7 @@ function renderVoiceEngine(): void {
       : isNemotron && selectedEngineAvailable
         ? (!nemotronRuntimeReady
           ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
-          : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`)
+          : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}<button data-action="remove-nemotron-runtime" ${downloading ? "disabled" : ""}>Remove CUDA runtime</button>`)
     : "";
   const verificationAction = (isParakeet || isNemotron) && modelStatus?.installed
     ? `<button data-action="verify-voice-engine-installation" ${verifyingVoiceEngineInstallation ? "disabled" : ""}>${verifyingVoiceEngineInstallation ? "Verifying…" : "Verify installation"}</button>`
@@ -2531,6 +2531,17 @@ async function handleAction(element: HTMLElement): Promise<void> {
       } finally {
         modelDownloadProgress = undefined;
         render();
+      }
+      break;
+    }
+    case "remove-nemotron-runtime": {
+      if (!window.confirm("Remove the Nemotron CUDA runtime? The downloaded model will remain, but Nemotron cannot run again until you reinstall the runtime.")) break;
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("remove_nemotron_cuda_runtime");
+        showNotice("Nemotron CUDA runtime was removed. The model was kept.");
+        render();
+      } catch (error) {
+        showNotice(`Could not remove the Nemotron CUDA runtime: ${String(error)}`);
       }
       break;
     }

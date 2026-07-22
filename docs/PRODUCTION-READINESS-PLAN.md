@@ -832,6 +832,11 @@ component receipts only when requested, while ordinary recording readiness uses
 the verified install receipt and required-file inventory so it does not block a
 hotkey by hashing multi-gigabyte model weights.
 
+Nemotron settings also provide a guarded runtime-removal action. It refuses to
+remove the app-owned Python/CUDA directory while capture, finalization, or the
+cache-aware sidecar is active, and intentionally leaves the separately managed
+model in place for a later runtime repair.
+
 ### 11.5 Sidecar supervision
 
 Nemotron already uses a child process, but production supervision should add:

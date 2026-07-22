@@ -6201,6 +6201,57 @@ fn delete_nemotron_model(state: State<'_, AppState>) -> Result<VoiceModelStatus,
     nemotron_status(&state)
 }
 
+/// Remove the user-local Python/CUDA runtime only when no dictation or
+/// cache-aware sidecar can still reference it. The separately downloaded model
+/// is deliberately retained so reinstalling a repaired runtime does not force
+/// another multi-gigabyte model download.
+#[tauri::command]
+async fn remove_nemotron_cuda_runtime(
+    state: State<'_, AppState>,
+    capture_state: State<'_, NativeCaptureState>,
+) -> Result<VoiceModelStatus, String> {
+    let session_is_idle = capture_state
+        .session
+        .lock()
+        .map(|coordinator| coordinator.is_idle())
+        .map_err(|_| "Dictation session lock was poisoned".to_string())?;
+    let capture_is_inactive = capture_state
+        .capture
+        .lock()
+        .map(|capture| capture.is_none())
+        .map_err(|_| "Audio capture lock was poisoned".to_string())?;
+    if !session_is_idle || !capture_is_inactive {
+        return Err("Stop the active dictation before removing the Nemotron CUDA runtime.".into());
+    }
+    let mut live = capture_state.nemotron_live.try_lock().map_err(|_| {
+        "Nemotron is still finishing a previous dictation. Try again shortly.".to_string()
+    })?;
+    if live.session_started {
+        return Err("Nemotron is still finishing a previous dictation. Try again shortly.".into());
+    }
+    if let Some(mut server) = live.server.take() {
+        server.terminate();
+    }
+    live.fed_samples = 0;
+    live.generation = 0;
+    live.start_error = None;
+    drop(live);
+
+    let runtime = nemotron_runtime_path(&state)?;
+    if !runtime.exists() {
+        return Err("The Nemotron CUDA runtime is not installed.".into());
+    }
+    if !runtime.is_dir() {
+        return Err("The Nemotron CUDA runtime path is not a directory.".into());
+    }
+    let runtime_to_remove = runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || fs::remove_dir_all(&runtime_to_remove))
+        .await
+        .map_err(|error| format!("Nemotron runtime removal task failed: {error}"))?
+        .map_err(|error| format!("Could not remove the Nemotron CUDA runtime: {error}"))?;
+    nemotron_status(&state)
+}
+
 #[tauri::command]
 async fn install_nemotron_cuda_runtime(
     app: AppHandle,
@@ -9437,6 +9488,7 @@ pub fn run() {
             download_whisper_model,
             download_parakeet_model,
             install_nemotron_cuda_runtime,
+            remove_nemotron_cuda_runtime,
             download_nemotron_model,
             start_native_dictation,
             stop_native_dictation,

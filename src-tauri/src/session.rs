@@ -31,6 +31,10 @@ impl Default for SessionState {
 }
 
 impl Coordinator {
+    pub fn is_idle(&self) -> bool {
+        self.state == SessionState::Idle
+    }
+
     #[cfg(test)]
     pub fn state(&self) -> SessionState {
         self.state
@@ -121,8 +125,11 @@ mod tests {
     #[test]
     fn cancellation_rejects_stale_terminal_transitions() {
         let mut coordinator = Coordinator::default();
+        assert!(coordinator.is_idle());
         let id = coordinator.start().expect("session starts");
+        assert!(!coordinator.is_idle());
         assert!(coordinator.cancel(id));
+        assert!(coordinator.is_idle());
         assert!(!coordinator.begin_finalizing(id));
         assert!(!coordinator.finish(id));
     }
