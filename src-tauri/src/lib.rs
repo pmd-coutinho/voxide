@@ -5319,8 +5319,15 @@ fn valid_whisper_model_file(path: &std::path::Path) -> bool {
 /// Silero voice-activity-detection model used to strip non-speech audio
 /// before Whisper decodes it. Small (~2 MB); fetched once at startup.
 const VAD_MODEL_FILENAME: &str = "ggml-silero-v5.1.2.bin";
-const VAD_MODEL_URL: &str =
-    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+const VAD_MODEL_REVISION: &str = "e5614ed76a5dd4b03fad5068c89efcd2617a9d1e";
+const VAD_MODEL_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
+const VAD_MODEL_BYTES: usize = 885_098;
+
+fn vad_model_url() -> String {
+    format!(
+        "https://huggingface.co/ggml-org/whisper-vad/resolve/{VAD_MODEL_REVISION}/{VAD_MODEL_FILENAME}"
+    )
+}
 
 fn vad_model_path(state: &AppState) -> Option<PathBuf> {
     let path = state.models_directory().ok()?.join(VAD_MODEL_FILENAME);
@@ -5332,16 +5339,19 @@ async fn ensure_vad_model(state: &AppState) {
         return;
     };
     let path = directory.join(VAD_MODEL_FILENAME);
-    if path.is_file() {
+    if vad_model_is_verified(&path) {
         return;
     }
     let downloaded = async {
-        let response = reqwest::get(VAD_MODEL_URL).await.ok()?;
+        let response = reqwest::get(vad_model_url()).await.ok()?;
         if !response.status().is_success() {
             return None;
         }
         let bytes = response.bytes().await.ok()?;
-        if bytes.len() < 100_000 || looks_like_markup(&bytes) {
+        if bytes.len() != VAD_MODEL_BYTES || looks_like_markup(&bytes) {
+            return None;
+        }
+        if format!("{:x}", Sha256::digest(&bytes)) != VAD_MODEL_SHA256 {
             return None;
         }
         let temporary = path.with_extension("bin.tmp");
@@ -5357,6 +5367,15 @@ async fn ensure_vad_model(state: &AppState) {
             "failed; dictation continues without voice-activity detection"
         }
     ));
+}
+
+fn vad_model_is_verified(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() == VAD_MODEL_BYTES as u64)
+        .unwrap_or(false)
+        && sha256_file(path)
+            .map(|digest| digest == VAD_MODEL_SHA256)
+            .unwrap_or(false)
 }
 
 fn whisper_model_path(settings: &Settings, state: &AppState) -> Result<PathBuf, String> {
@@ -9965,6 +9984,18 @@ mod tests {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
         assert!(parakeet::MODEL_ARCHIVE_BYTES > 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vad_download_uses_a_pinned_revision_and_digest() {
+        let url = vad_model_url();
+        assert!(url.contains(VAD_MODEL_REVISION));
+        assert!(!url.contains("/resolve/main/"));
+        assert_eq!(VAD_MODEL_SHA256.len(), 64);
+        assert!(VAD_MODEL_SHA256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(VAD_MODEL_BYTES, 885_098);
     }
 
     #[test]
