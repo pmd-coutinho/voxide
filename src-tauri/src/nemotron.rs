@@ -83,6 +83,8 @@ struct Response {
     message: String,
     #[serde(default)]
     protocol_version: Option<u32>,
+    #[serde(default)]
+    request_id: Option<u64>,
 }
 
 /// One persistent Python process. Requests are intentionally serialized: one
@@ -92,6 +94,7 @@ pub struct Server {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    next_request_id: u64,
 }
 
 impl Server {
@@ -143,6 +146,7 @@ impl Server {
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
+            next_request_id: 1,
         };
         let response = server
             .request(json!({ "action": "ping", "protocolVersion": PROTOCOL_VERSION }))
@@ -200,7 +204,13 @@ impl Server {
         }
     }
 
-    async fn request(&mut self, request: Value) -> Result<Response, String> {
+    async fn request(&mut self, mut request: Value) -> Result<Response, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        request
+            .as_object_mut()
+            .ok_or("Nemotron request must be a JSON object")?
+            .insert("requestId".into(), json!(request_id));
         let encoded = serde_json::to_string(&request)
             .map_err(|error| format!("Could not encode a Nemotron request: {error}"))?;
         if encoded.len() > MAX_MESSAGE_BYTES {
@@ -228,6 +238,7 @@ impl Server {
         }
         let response: Response = serde_json::from_str(&line)
             .map_err(|error| format!("Nemotron CUDA service returned invalid JSON: {error}"))?;
+        validate_response_request_id(&response, request_id)?;
         if response.kind == "error" {
             return Err(if response.message.trim().is_empty() {
                 "Nemotron CUDA service reported an unknown error".into()
@@ -251,6 +262,13 @@ fn validate_handshake(response: &Response) -> Result<(), String> {
     }
     if response.protocol_version != Some(PROTOCOL_VERSION) {
         return Err("The Nemotron CUDA service is incompatible with this Voxide version. Reinstall the CUDA runtime.".into());
+    }
+    Ok(())
+}
+
+fn validate_response_request_id(response: &Response, request_id: u64) -> Result<(), String> {
+    if response.request_id != Some(request_id) {
+        return Err("Nemotron CUDA service returned a response for a different request".into());
     }
     Ok(())
 }
@@ -310,6 +328,7 @@ mod tests {
             text: String::new(),
             message: String::new(),
             protocol_version: Some(PROTOCOL_VERSION),
+            request_id: Some(1),
         };
         assert!(validate_handshake(&ready).is_ok());
         assert!(validate_handshake(&Response {
@@ -317,5 +336,18 @@ mod tests {
             ..ready
         })
         .is_err());
+    }
+
+    #[test]
+    fn response_must_belong_to_the_active_request() {
+        let response = Response {
+            kind: "partial".into(),
+            text: String::new(),
+            message: String::new(),
+            protocol_version: None,
+            request_id: Some(7),
+        };
+        assert!(validate_response_request_id(&response, 7).is_ok());
+        assert!(validate_response_request_id(&response, 8).is_err());
     }
 }

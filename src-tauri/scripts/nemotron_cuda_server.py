@@ -8,15 +8,15 @@ cache-aware streaming path.
 
 Protocol (one JSON object per stdin line):
 
-  ping
-  start { language, lookaheadTokens }
-  append { audio }                      # base64 float32 little-endian PCM
-  finish { audio? }
-  transcribe { audio, language }
-  shutdown
+  ping { requestId, protocolVersion }
+  start { requestId, language, lookaheadTokens }
+  append { requestId, audio }            # base64 float32 little-endian PCM
+  finish { requestId, audio? }
+  transcribe { requestId, audio, language }
+  shutdown { requestId }
 
-Every request produces exactly one JSON response on stdout.  Diagnostics are
-written only to stderr so stdout remains machine-readable.
+Every request produces exactly one JSON response with the same request ID on
+stdout. Diagnostics are written only to stderr so stdout remains machine-readable.
 """
 
 from __future__ import annotations
@@ -42,10 +42,63 @@ MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 DEFAULT_LOOKAHEAD_TOKENS = 6
 
 
-def respond(payload: dict[str, Any]) -> None:
+def respond(payload: dict[str, Any], request_id: int | None = None) -> None:
     """Write a protocol message without ever contaminating stdout."""
+    if request_id is not None:
+        payload = {**payload, "requestId": request_id}
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def request_id_from(request: dict[str, Any]) -> int:
+    request_id = request.get("requestId")
+    if type(request_id) is not int or request_id < 1:
+        raise ValueError("Nemotron requestId must be a positive integer")
+    return request_id
+
+
+def required_string(request: dict[str, Any], field: str) -> str:
+    value = request.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"Nemotron {field} must be a string")
+    return value
+
+
+def optional_audio(request: dict[str, Any]) -> str | None:
+    audio = request.get("audio")
+    if audio is not None and not isinstance(audio, str):
+        raise ValueError("Nemotron audio must be a base64 string")
+    return audio
+
+
+def validate_request(request: dict[str, Any]) -> tuple[str, int]:
+    """Enforce the versioned JSON-line request schema before model access."""
+    action = required_string(request, "action")
+    request_id = request_id_from(request)
+    allowed_fields = {
+        "ping": {"action", "requestId", "protocolVersion"},
+        "start": {"action", "requestId", "language", "lookaheadTokens"},
+        "append": {"action", "requestId", "audio"},
+        "finish": {"action", "requestId", "audio"},
+        "transcribe": {"action", "requestId", "audio", "language"},
+        "abort": {"action", "requestId"},
+        "shutdown": {"action", "requestId"},
+    }
+    if action not in allowed_fields:
+        raise ValueError("Unknown Nemotron runtime action")
+    if set(request) - allowed_fields[action]:
+        raise ValueError("Nemotron request contains unsupported fields")
+    if action == "ping" and request.get("protocolVersion") != PROTOCOL_VERSION:
+        raise ValueError("Incompatible Nemotron protocol version")
+    if action in {"start", "transcribe"}:
+        required_string(request, "language")
+    if action in {"append", "finish", "transcribe"}:
+        optional_audio(request)
+    if action == "start":
+        lookahead = request.get("lookaheadTokens")
+        if type(lookahead) is not int or lookahead not in {0, 3, 6, 13}:
+            raise ValueError("Nemotron lookaheadTokens must be one of 0, 3, 6, or 13")
+    return action, request_id
 
 
 def pcm_from_base64(encoded: str | None):
@@ -313,57 +366,59 @@ def main() -> int:
     args = parse_args()
     runtime = NemotronRuntime(args.model_dir)
     session: StreamingSession | None = None
-    for raw_line in sys.stdin:
+    stdin = sys.stdin.buffer
+    while raw_line := stdin.readline(MAX_MESSAGE_BYTES + 1):
+        request_id: int | None = None
         try:
-            if len(raw_line.encode("utf-8")) > MAX_MESSAGE_BYTES:
+            if len(raw_line) > MAX_MESSAGE_BYTES:
                 raise ValueError("Nemotron request exceeds the service safety limit")
             request = json.loads(raw_line)
             if not isinstance(request, dict):
                 raise ValueError("Nemotron request must be a JSON object")
-            action = request.get("action")
+            action, request_id = validate_request(request)
             if action == "ping":
-                if request.get("protocolVersion") != PROTOCOL_VERSION:
-                    raise ValueError("Incompatible Nemotron protocol version")
-                respond({"type": "ready", "modelId": MODEL_ID, "protocolVersion": PROTOCOL_VERSION})
+                respond(
+                    {"type": "ready", "modelId": MODEL_ID, "protocolVersion": PROTOCOL_VERSION},
+                    request_id,
+                )
             elif action == "start":
-                language = str(request.get("language") or "auto")
-                lookahead_tokens = int(request.get("lookaheadTokens", DEFAULT_LOOKAHEAD_TOKENS))
+                language = required_string(request, "language")
+                lookahead_tokens = request["lookaheadTokens"]
                 session = runtime.begin(language, lookahead_tokens)
                 respond(
                     {
                         "type": "started",
                         "latencyMs": runtime.processor.streaming_latency_ms,
                         "lookaheadTokens": lookahead_tokens,
-                    }
+                    },
+                    request_id,
                 )
             elif action == "append":
                 if session is None:
                     raise RuntimeError("Start a Nemotron streaming session before appending audio")
-                text = session.append(pcm_from_base64(request.get("audio")))
-                respond({"type": "partial", "text": text})
+                text = session.append(pcm_from_base64(optional_audio(request)))
+                respond({"type": "partial", "text": text}, request_id)
             elif action == "finish":
                 if session is None:
                     raise RuntimeError("Start a Nemotron streaming session before finishing")
-                text = session.finish(pcm_from_base64(request.get("audio")))
+                text = session.finish(pcm_from_base64(optional_audio(request)))
                 session = None
-                respond({"type": "final", "text": text})
+                respond({"type": "final", "text": text}, request_id)
             elif action == "transcribe":
-                language = str(request.get("language") or "auto")
-                text = runtime.transcribe(pcm_from_base64(request.get("audio")), language)
-                respond({"type": "final", "text": text})
+                language = required_string(request, "language")
+                text = runtime.transcribe(pcm_from_base64(optional_audio(request)), language)
+                respond({"type": "final", "text": text}, request_id)
             elif action == "abort":
                 if session is not None:
                     session.abort()
                     session = None
-                respond({"type": "aborted"})
+                respond({"type": "aborted"}, request_id)
             elif action == "shutdown":
-                respond({"type": "stopped"})
+                respond({"type": "stopped"}, request_id)
                 return 0
-            else:
-                raise ValueError("Unknown Nemotron runtime action")
         except Exception as error:  # noqa: BLE001 -- never crash the persistent service for a bad request.
             traceback.print_exc(file=sys.stderr)
-            respond({"type": "error", "message": str(error)})
+            respond({"type": "error", "message": str(error)}, request_id)
     return 0
 
 
