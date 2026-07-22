@@ -43,13 +43,16 @@ jobs:
             libwebkit2gtk-4.1-dev \
             pkg-config
       - name: Install minimum supported Rust
-        run: rustup toolchain install 1.89 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
       - name: Check formatting
         working-directory: src-tauri
         run: cargo +1.89 fmt --check
       - name: Run portable Rust tests
         working-directory: src-tauri
         run: cargo +1.89 test --lib --no-default-features
+      - name: Lint portable Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
       - name: Compile portable Rust target
         working-directory: src-tauri
-        run: cargo +1.89 check --no-default-features
+        run: cargo +1.89 build --release --no-default-features
