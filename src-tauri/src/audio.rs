@@ -574,6 +574,19 @@ fn spawn_capture_worker(
                     continue;
                 }
                 if stop.load(Ordering::Acquire) {
+                    canonical.clear();
+                    resampler.finish(&mut canonical);
+                    if !canonical.is_empty() {
+                        if let Some(on_level) = on_level.as_ref() {
+                            on_level(level_tracker.observe(&canonical));
+                        }
+                        if let Ok(mut timeline) = canonical_samples.lock() {
+                            timeline.extend_from_slice(&canonical);
+                            counters
+                                .canonical_samples
+                                .fetch_add(canonical.len() as u64, Ordering::Relaxed);
+                        }
+                    }
                     break;
                 }
                 thread::sleep(CAPTURE_WORKER_IDLE_SLEEP);
@@ -633,6 +646,22 @@ impl StatefulMonoResampler {
         self.previous = Some(current);
         self.source_index += 1;
     }
+
+    /// Completes a finite source by holding its final sample for any output
+    /// positions still inside the source duration. Live capture calls this
+    /// only after the stream has stopped and its raw ring has drained; file
+    /// decoding calls it at end-of-file. That keeps both paths sample-for-
+    /// sample equivalent without extrapolating beyond the recording boundary.
+    fn finish(&mut self, destination: &mut Vec<f32>) {
+        self.pending_frame.clear();
+        let Some(last) = self.previous else {
+            return;
+        };
+        while self.next_output_position < self.source_index as f64 {
+            destination.push(last);
+            self.next_output_position += self.ratio;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -668,33 +697,14 @@ pub fn mono_resample_for_whisper(audio: CapturedAudio) -> Result<Vec<f32>, Strin
         return Ok(audio.samples);
     }
 
-    let channel_count = audio.channels as usize;
-    let mono: Vec<f32> = audio
-        .samples
-        .chunks(channel_count)
-        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
-        .collect();
-
-    if audio.sample_rate == WHISPER_SAMPLE_RATE {
-        return Ok(mono);
-    }
-
-    let output_length =
-        ((mono.len() as u64 * WHISPER_SAMPLE_RATE as u64) / audio.sample_rate as u64) as usize;
-    if output_length == 0 {
+    let mut resampler = StatefulMonoResampler::new(audio.sample_rate, audio.channels);
+    let mut output = Vec::new();
+    resampler.push_interleaved(&audio.samples, &mut output);
+    resampler.finish(&mut output);
+    if output.is_empty() {
         return Err("The recording is too short to transcribe".into());
     }
-
-    let ratio = audio.sample_rate as f64 / WHISPER_SAMPLE_RATE as f64;
-    Ok((0..output_length)
-        .map(|index| {
-            let source_position = index as f64 * ratio;
-            let before = source_position.floor() as usize;
-            let after = (before + 1).min(mono.len() - 1);
-            let fraction = (source_position - before as f64) as f32;
-            mono[before] + (mono[after] - mono[before]) * fraction
-        })
-        .collect())
+    Ok(output)
 }
 
 pub fn wav_bytes_from_16khz_mono(samples: &[f32]) -> Result<Vec<u8>, String> {
@@ -778,6 +788,7 @@ mod tests {
             offset = end;
             packet_index += 1;
         }
+        resampler.finish(&mut output);
         output
     }
 
@@ -865,6 +876,7 @@ mod tests {
             let mut whole_resampler = StatefulMonoResampler::new(sample_rate, channels);
             let mut whole = Vec::new();
             whole_resampler.push_interleaved(&input, &mut whole);
+            whole_resampler.finish(&mut whole);
             let packetized = resample_packetized(&input, sample_rate, channels);
 
             assert_eq!(
@@ -877,6 +889,25 @@ mod tests {
                     .iter()
                     .all(|sample| sample.abs() < 1e-6),
                 "the internal silence must remain silence after resampling"
+            );
+        }
+    }
+
+    #[test]
+    fn file_audio_and_packetized_capture_share_the_canonical_timeline() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let input = pause_heavy_fixture(sample_rate, channels);
+            let file_audio = mono_resample_for_whisper(CapturedAudio {
+                samples: input.clone(),
+                sample_rate,
+                channels,
+                duration_ms: 3_000,
+            })
+            .expect("fixture should convert");
+            assert_eq!(
+                file_audio,
+                resample_packetized(&input, sample_rate, channels),
+                "{sample_rate} Hz/{channels} channel fixture"
             );
         }
     }
