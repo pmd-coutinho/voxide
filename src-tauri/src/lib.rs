@@ -39,6 +39,7 @@ mod permissions;
 #[cfg(target_os = "linux")]
 mod portal_hotkeys;
 mod provider;
+mod session;
 mod speech;
 #[cfg(unix)]
 pub mod trigger;
@@ -1417,6 +1418,7 @@ impl AppState {
 
 struct NativeCaptureState {
     capture: Mutex<Option<audio::AudioCapture>>,
+    session: Arc<Mutex<session::Coordinator>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
     preview_generation: Arc<AtomicU64>,
@@ -1428,11 +1430,27 @@ impl Default for NativeCaptureState {
     fn default() -> Self {
         Self {
             capture: Mutex::new(None),
+            session: Arc::new(Mutex::new(session::Coordinator::default())),
             context: Mutex::new(DictationContext::default()),
             continuous_context: Mutex::new(ContinuousDictationContext::default()),
             preview_generation: Arc::new(AtomicU64::new(0)),
             parakeet_live: Mutex::new(ParakeetLiveState::default()),
             nemotron_live: Arc::new(tokio::sync::Mutex::new(NemotronLiveState::default())),
+        }
+    }
+}
+
+/// Ensures finalization cannot leave the coordinator stuck when any later
+/// transcription, post-processing, or insertion step returns an error.
+struct FinishDictationSession {
+    coordinator: Arc<Mutex<session::Coordinator>>,
+    id: u64,
+}
+
+impl Drop for FinishDictationSession {
+    fn drop(&mut self) {
+        if let Ok(mut coordinator) = self.coordinator.lock() {
+            coordinator.finish(self.id);
         }
     }
 }
@@ -5986,23 +6004,34 @@ fn start_native_dictation(
         settings.selected_voice_engine, settings.enable_streaming_preview
     ));
     let preview_generation = capture_state
+        .session
+        .lock()
+        .map_err(|_| "Dictation session lock was poisoned".to_string())?
+        .start()
+        .map_err(str::to_string)?;
+    capture_state
         .preview_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
+        .store(preview_generation, Ordering::SeqCst);
     // Reserve the single cache-aware stream before opening the microphone. If
     // a previous Nemotron finalization is still running, fail cleanly instead
     // of leaving an otherwise invisible capture active.
     if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
-        let mut live = capture_state
-            .nemotron_live
-            .try_lock()
-            .map_err(|_| "Nemotron is still finishing the previous dictation".to_string())?;
+        let mut live = match capture_state.nemotron_live.try_lock() {
+            Ok(live) => live,
+            Err(_) => {
+                let _ = capture_state
+                    .session
+                    .lock()
+                    .map(|mut session| session.cancel(preview_generation));
+                return Err("Nemotron is still finishing the previous dictation".into());
+            }
+        };
         live.generation = preview_generation;
         live.fed_samples = 0;
         live.session_started = false;
         live.start_error = None;
     }
-    let started = audio::AudioCapture::start(
+    let started = match audio::AudioCapture::start(
         settings.selected_input_device.as_deref(),
         Some(Arc::new(move |level| {
             let Ok(mut last_emit) = last_emit.lock() else {
@@ -6013,7 +6042,19 @@ fn start_native_dictation(
                 let _ = app_for_levels.emit("dictation-audio-level", level);
             }
         })),
-    )?;
+    ) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = capture_state
+                .session
+                .lock()
+                .map(|mut session| session.cancel(preview_generation));
+            capture_state
+                .preview_generation
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
     let sample_rate = started.sample_rate();
     let channels = started.channels();
     *capture = Some(started);
@@ -6832,6 +6873,18 @@ async fn stop_native_dictation(
         .map_err(|_| "Audio capture lock was poisoned".to_string())?
         .take()
         .ok_or("Dictation is not recording")?;
+    let finalizing = capture_state
+        .session
+        .lock()
+        .map_err(|_| "Dictation session lock was poisoned".to_string())?
+        .begin_finalizing(recording_generation);
+    if !finalizing {
+        return Err("Dictation session was superseded before finalization".into());
+    }
+    let _finish_session = FinishDictationSession {
+        coordinator: Arc::clone(&capture_state.session),
+        id: recording_generation,
+    };
     let context = capture_state
         .context
         .lock()
@@ -7561,7 +7614,7 @@ fn cancel_native_dictation(
     app: AppHandle,
     capture_state: State<'_, NativeCaptureState>,
 ) -> Result<bool, String> {
-    capture_state
+    let recording_generation = capture_state
         .preview_generation
         .fetch_add(1, Ordering::SeqCst);
     let capture = capture_state
@@ -7571,6 +7624,10 @@ fn cancel_native_dictation(
         .take();
     let cancelled = capture.is_some();
     if cancelled {
+        let _ = capture_state
+            .session
+            .lock()
+            .map(|mut session| session.cancel(recording_generation));
         let nemotron_live = Arc::clone(&capture_state.nemotron_live);
         tauri::async_runtime::spawn(async move {
             let mut live = nemotron_live.lock().await;
