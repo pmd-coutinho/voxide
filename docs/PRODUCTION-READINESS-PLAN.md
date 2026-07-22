@@ -1065,7 +1065,8 @@ three-slot, same-directory backup rotation and flushes the newest backup before
 the live file is replaced. On malformed current data, startup restores the
 newest valid snapshot only after moving the unreadable original aside under an
 app-owned corrupt-file name. A future-schema database is still rejected and
-never silently replaced.
+never silently replaced. Unix builds also flush the containing directory after
+the atomic live-file rename.
 
 ### 13.4 Backup format
 

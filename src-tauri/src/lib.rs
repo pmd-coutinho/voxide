@@ -1537,7 +1537,9 @@ impl AppState {
         drop(temporary);
         rotate_database_backups(&self.path)?;
         fs::rename(&temporary_path, &self.path)
-            .map_err(|error| format!("Could not finalize Voxide data: {error}"))
+            .map_err(|error| format!("Could not finalize Voxide data: {error}"))?;
+        sync_parent_directory(&self.path)?;
+        Ok(())
     }
 
     fn back_up_pre_migration_database(&self) -> Result<(), String> {
@@ -1637,6 +1639,24 @@ fn database_backup_path(path: &Path, index: usize) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(DATABASE_FILE);
     path.with_file_name(format!("{filename}.backup-{index}"))
+}
+
+/// Renames are only crash-durable once the containing directory metadata has
+/// reached storage. Windows does not expose an equivalent portable directory
+/// handle, so the file flush remains the cross-platform baseline there.
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("Could not determine the Voxide data directory")?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Could not flush the Voxide data directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn newest_valid_database_backup(path: &Path) -> Result<(AppDatabase, bool, PathBuf), String> {
