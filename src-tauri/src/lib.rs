@@ -5508,8 +5508,9 @@ const NEMOTRON_MODEL_FILES: [&str; 6] = [
 
 fn nemotron_model_url(file: &str) -> String {
     format!(
-        "https://huggingface.co/{}/resolve/main/{file}?download=true",
-        nemotron::MODEL_REPOSITORY
+        "https://huggingface.co/{}/resolve/{}/{file}?download=true",
+        nemotron::MODEL_REPOSITORY,
+        nemotron::MODEL_REVISION
     )
 }
 
@@ -9633,6 +9634,13 @@ mod tests {
             0
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nemotron_downloads_use_the_pinned_model_revision() {
+        let url = nemotron_model_url("config.json");
+        assert!(url.contains(nemotron::MODEL_REVISION));
+        assert!(!url.contains("/resolve/main/"));
     }
 
     #[test]

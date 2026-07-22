@@ -25,6 +25,10 @@ use crate::debug_log;
 
 pub const MODEL_ID: &str = "nemotron-3.5-asr-streaming-0.6b";
 pub const MODEL_REPOSITORY: &str = "nvidia/nemotron-3.5-asr-streaming-0.6b";
+/// Immutable Hugging Face commit verified on 2026-07-22. Never download model
+/// artifacts from a mutable branch: component receipts and reproduction depend
+/// on every file resolving to this exact revision.
+pub const MODEL_REVISION: &str = "f3d333391852ba876df169dcc9ba902d25b6ab0b";
 /// NVIDIA's documented balanced streaming configuration (560 ms chunks).
 pub const DEFAULT_LOOKAHEAD_TOKENS: u8 = 6;
 const RUNTIME_MARKER: &str = ".voxide-nemotron-runtime-v1";
