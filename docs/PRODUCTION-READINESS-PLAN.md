@@ -519,6 +519,11 @@ logic out of `lib.rs` without a behavior-changing big-bang rewrite.
 - Make cleanup idempotent.
 - Keep the last known-good engine selection if preparation or download fails.
 
+Startup failures now use generation-guarded rollback: an engine reservation,
+microphone-start, or preview-setup error clears the admitted coordinator
+session and preserved application context only if it still owns that generation.
+The regression tests also prove an old failure cannot roll back a newer session.
+
 ### 8.3 Model readiness
 
 - Cache loaded engines deliberately, with a documented memory policy.

@@ -1440,13 +1440,7 @@ impl VoiceEngine {
         if self.is_nemotron() {
             let mut live = match capture_state.nemotron_live.try_lock() {
                 Ok(live) => live,
-                Err(_) => {
-                    let _ = capture_state
-                        .session
-                        .lock()
-                        .map(|mut session| session.cancel(session_id));
-                    return Err("Nemotron is still finishing the previous dictation".into());
-                }
+                Err(_) => return Err("Nemotron is still finishing the previous dictation".into()),
             };
             live.generation = session_id;
             live.fed_samples = 0;
@@ -2043,6 +2037,48 @@ fn finish_preview(capture_state: &NativeCaptureState, session_id: u64) {
     if let Ok(mut coordinator) = capture_state.session.lock() {
         coordinator.finish_preview(session_id);
     }
+}
+
+/// Invalidates only the specified generation. A stale startup failure must not
+/// suppress previews from a newer recording that has already replaced it.
+fn invalidate_preview_generation(capture_state: &NativeCaptureState, session_id: u64) -> bool {
+    let next_generation = session_id.wrapping_add(1).max(1);
+    capture_state
+        .preview_generation
+        .compare_exchange(
+            session_id,
+            next_generation,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+/// Makes every failure between coordinator admission and a usable capture
+/// indistinguishable from a cancelled recording. This path is deliberately
+/// idempotent: an engine reservation, microphone start, or preview setup may
+/// fail at different points, but none may leave stale session or application
+/// context state behind.
+fn rollback_native_dictation_start(capture_state: &NativeCaptureState, session_id: u64) {
+    if !invalidate_preview_generation(capture_state, session_id) {
+        return;
+    }
+    let _ = capture_state
+        .capture
+        .lock()
+        .map(|mut capture| capture.take());
+    let _ = capture_state
+        .capture_started_at
+        .lock()
+        .map(|mut started_at| started_at.take());
+    let _ = capture_state
+        .session
+        .lock()
+        .map(|mut session| session.cancel(session_id));
+    let _ = capture_state
+        .context
+        .lock()
+        .map(|mut context| *context = DictationContext::default());
 }
 
 /// CPAL reports device and route failures on a callback that must stay
@@ -7210,10 +7246,7 @@ fn start_native_dictation(
             source_application.as_deref(),
             source_window_title.as_deref(),
         );
-    *capture_state
-        .context
-        .lock()
-        .map_err(|_| "Dictation context lock was poisoned".to_string())? = DictationContext {
+    let dictation_context = DictationContext {
         source_application: source_application.clone(),
         source_window_title: source_window_title.clone(),
         prompt_profile_id: prompt_profile_id.clone(),
@@ -7252,6 +7285,10 @@ fn start_native_dictation(
     settings
         .selected_voice_engine
         .prepare_live_capture(&settings, &state)?;
+    *capture_state
+        .context
+        .lock()
+        .map_err(|_| "Dictation context lock was poisoned".to_string())? = dictation_context;
     if let Err(error) = apply_overlay_window_layout(&app, &settings) {
         debug_log::append(&format!(
             "Could not apply dictation overlay layout: {error}"
@@ -7269,9 +7306,13 @@ fn start_native_dictation(
     // Reserve the selected engine before opening the microphone. This is
     // especially important for cache-aware engines whose prior finalization
     // may still own their single stream.
-    settings
+    if let Err(error) = settings
         .selected_voice_engine
-        .begin_live_session(&capture_state, preview_generation)?;
+        .begin_live_session(&capture_state, preview_generation)
+    {
+        rollback_native_dictation_start(&capture_state, preview_generation);
+        return Err(error);
+    }
     let started = match audio::AudioCapture::start(
         settings.selected_input_device.as_deref(),
         Some(Arc::new(move |level| {
@@ -7286,13 +7327,7 @@ fn start_native_dictation(
     ) {
         Ok(capture) => capture,
         Err(error) => {
-            let _ = capture_state
-                .session
-                .lock()
-                .map(|mut session| session.cancel(preview_generation));
-            capture_state
-                .preview_generation
-                .fetch_add(1, Ordering::SeqCst);
+            rollback_native_dictation_start(&capture_state, preview_generation);
             return Err(error);
         }
     };
@@ -7330,21 +7365,7 @@ fn start_native_dictation(
         // No preview/setup error may leave an active but invisible microphone
         // stream behind. The coordinator owns the generation, so invalidating
         // it also prevents any already-spawned adapter from publishing text.
-        let _ = capture_state
-            .capture
-            .lock()
-            .map(|mut capture| capture.take());
-        let _ = capture_state
-            .capture_started_at
-            .lock()
-            .map(|mut started_at| started_at.take());
-        let _ = capture_state
-            .session
-            .lock()
-            .map(|mut session| session.cancel(preview_generation));
-        capture_state
-            .preview_generation
-            .fetch_add(1, Ordering::SeqCst);
+        rollback_native_dictation_start(&capture_state, preview_generation);
         update_tray_status(&app, TrayVisualState::Ready);
         return Err(error);
     }
@@ -9561,6 +9582,95 @@ mod tests {
             database.settings.selected_voice_engine,
             VoiceEngine::Whisper
         ));
+    }
+
+    #[test]
+    fn failed_dictation_start_rolls_back_session_context_and_generation() {
+        let capture_state = NativeCaptureState::default();
+        let session_id = capture_state
+            .session
+            .lock()
+            .expect("session lock")
+            .start()
+            .expect("session starts");
+        capture_state
+            .preview_generation
+            .store(session_id, Ordering::SeqCst);
+        *capture_state.context.lock().expect("context lock") = DictationContext {
+            source_application: Some("Example".into()),
+            source_window_title: Some("Draft".into()),
+            prompt_profile_id: Some("profile".into()),
+            preceding_text: "previous text".into(),
+        };
+
+        rollback_native_dictation_start(&capture_state, session_id);
+
+        assert!(
+            capture_state
+                .session
+                .lock()
+                .expect("session lock")
+                .is_idle(),
+            "the coordinator must not remain active after startup failure"
+        );
+        assert_eq!(
+            capture_state.preview_generation.load(Ordering::SeqCst),
+            session_id.wrapping_add(1).max(1)
+        );
+        let context = capture_state.context.lock().expect("context lock");
+        assert!(context.source_application.is_none());
+        assert!(context.source_window_title.is_none());
+        assert!(context.prompt_profile_id.is_none());
+        assert!(context.preceding_text.is_empty());
+    }
+
+    #[test]
+    fn stale_startup_failure_does_not_roll_back_a_newer_generation() {
+        let capture_state = NativeCaptureState::default();
+        let stale_session = capture_state
+            .session
+            .lock()
+            .expect("session lock")
+            .start()
+            .expect("first session starts");
+        capture_state
+            .session
+            .lock()
+            .expect("session lock")
+            .cancel(stale_session);
+        let active_session = capture_state
+            .session
+            .lock()
+            .expect("session lock")
+            .start()
+            .expect("second session starts");
+        capture_state
+            .preview_generation
+            .store(active_session, Ordering::SeqCst);
+        *capture_state.context.lock().expect("context lock") = DictationContext {
+            source_application: Some("Example".into()),
+            ..Default::default()
+        };
+
+        rollback_native_dictation_start(&capture_state, stale_session);
+
+        assert_eq!(
+            capture_state.session.lock().expect("session lock").state(),
+            session::SessionState::Recording { id: active_session }
+        );
+        assert_eq!(
+            capture_state.preview_generation.load(Ordering::SeqCst),
+            active_session
+        );
+        assert_eq!(
+            capture_state
+                .context
+                .lock()
+                .expect("context lock")
+                .source_application
+                .as_deref(),
+            Some("Example")
+        );
     }
 
     #[test]
