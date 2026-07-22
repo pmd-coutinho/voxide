@@ -29,6 +29,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 mod analytics;
 mod apple_speech;
+mod asr;
 mod audio;
 mod debug_log;
 mod formatting;
@@ -1257,7 +1258,7 @@ enum HotkeyActivationMode {
     Automatic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum VoiceEngine {
     Whisper,
@@ -1265,6 +1266,368 @@ enum VoiceEngine {
     Nemotron,
     AppleSpeech,
     Cloud,
+}
+
+impl VoiceEngine {
+    const ALL: [Self; 5] = [
+        Self::Whisper,
+        Self::Parakeet,
+        Self::Nemotron,
+        Self::AppleSpeech,
+        Self::Cloud,
+    ];
+
+    fn requires_provider_profile(self) -> bool {
+        matches!(self, Self::Cloud)
+    }
+
+    fn is_nemotron(self) -> bool {
+        matches!(self, Self::Nemotron)
+    }
+
+    fn is_parakeet(self) -> bool {
+        matches!(self, Self::Parakeet)
+    }
+
+    fn capabilities(self) -> &'static asr::EngineCapabilities {
+        match self {
+            Self::Whisper => &asr::WHISPER,
+            Self::Parakeet => &asr::PARAKEET,
+            Self::Nemotron => &asr::NEMOTRON,
+            Self::AppleSpeech => &asr::APPLE_SPEECH,
+            Self::Cloud => &asr::CLOUD,
+        }
+    }
+
+    fn audio_model_id(self, settings: &Settings) -> String {
+        match self {
+            Self::Whisper => settings.selected_model.clone(),
+            Self::Cloud => settings.cloud_transcription_model.clone(),
+            Self::AppleSpeech => "apple-speech".into(),
+            Self::Parakeet => "parakeet".into(),
+            Self::Nemotron => "nemotron".into(),
+        }
+    }
+
+    fn runtime_available(self) -> bool {
+        match self {
+            Self::Parakeet => parakeet::is_compiled(),
+            Self::Nemotron => nemotron::is_compiled(),
+            Self::AppleSpeech => apple_speech::is_supported(),
+            Self::Whisper | Self::Cloud => true,
+        }
+    }
+
+    fn unavailable_reason(self) -> Option<&'static str> {
+        if self.runtime_available() {
+            return None;
+        }
+        match self {
+            Self::Parakeet | Self::Nemotron => Some("Requires Voxide's CUDA build"),
+            Self::AppleSpeech => Some("Available only on macOS"),
+            Self::Whisper | Self::Cloud => None,
+        }
+    }
+
+    fn descriptor(self) -> VoiceEngineDescriptor {
+        let capabilities = asr::SpeechEngine::capabilities(&self);
+        VoiceEngineDescriptor {
+            id: capabilities.id,
+            label: capabilities.label,
+            description: capabilities.description,
+            maturity: capabilities.maturity,
+            preview_mode: capabilities.preview_mode,
+            final_mode: capabilities.final_mode,
+            supports_files: capabilities.supports_files,
+            supports_translation: capabilities.supports_translation,
+            supports_vocabulary: capabilities.supports_vocabulary,
+            requires_cuda: capabilities.requires_cuda,
+            available: self.runtime_available(),
+            unavailable_reason: self.unavailable_reason(),
+        }
+    }
+
+    /// Validate the immutable engine portion of a live session before a
+    /// microphone is opened. This makes a bad selection fail without creating
+    /// an invisible capture, and keeps selection separate from installation.
+    fn prepare_live_capture(self, settings: &Settings, state: &AppState) -> Result<(), String> {
+        match self {
+            Self::Whisper => {
+                let model = whisper_model_path(settings, state)?;
+                if valid_whisper_model_file(&model) {
+                    Ok(())
+                } else {
+                    Err("The selected Whisper model is missing, empty, or invalid. Download it again before recording.".into())
+                }
+            }
+            Self::Parakeet => {
+                if !parakeet::is_compiled() {
+                    return Err("Parakeet is available in Voxide's CUDA build".into());
+                }
+                let model = parakeet_model_path(state)?;
+                if parakeet::model_is_installed(&model) {
+                    Ok(())
+                } else {
+                    Err("The Parakeet model is missing. Download it before recording.".into())
+                }
+            }
+            Self::Nemotron => {
+                if !nemotron::is_compiled() {
+                    return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+                }
+                let runtime = nemotron_runtime_path(state)?;
+                if !nemotron::runtime_is_installed(&runtime) {
+                    return Err("Install the Nemotron CUDA runtime from Voice Engine before dictating.".into());
+                }
+                let model = nemotron_model_path(state)?;
+                if !nemotron::model_is_installed(&model) {
+                    return Err("Download the Nemotron model from Voice Engine before dictating.".into());
+                }
+                ensure_nemotron_server_script(&runtime).map(|_| ())
+            }
+            Self::Cloud => Ok(()),
+            Self::AppleSpeech if apple_speech::is_supported() => Ok(()),
+            Self::AppleSpeech => Err("Apple Speech is available only on macOS. Select Whisper or a compatible cloud provider on this platform.".into()),
+        }
+    }
+
+    /// Reserve or reset state owned by an engine for one coordinator
+    /// generation. Called only after the coordinator admitted the session.
+    fn begin_live_session(
+        self,
+        capture_state: &NativeCaptureState,
+        session_id: u64,
+    ) -> Result<(), String> {
+        if self.is_nemotron() {
+            let mut live = match capture_state.nemotron_live.try_lock() {
+                Ok(live) => live,
+                Err(_) => {
+                    let _ = capture_state
+                        .session
+                        .lock()
+                        .map(|mut session| session.cancel(session_id));
+                    return Err("Nemotron is still finishing the previous dictation".into());
+                }
+            };
+            live.generation = session_id;
+            live.fed_samples = 0;
+            live.session_started = false;
+            live.start_error = None;
+        }
+        if self.is_parakeet() {
+            *capture_state
+                .parakeet_live
+                .lock()
+                .map_err(|_| "Parakeet live state lock was poisoned".to_string())? =
+                ParakeetLiveState {
+                    generation: session_id,
+                    ..Default::default()
+                };
+        }
+        Ok(())
+    }
+
+    /// Starts the selected engine's preview adapter. Each adapter receives the
+    /// same canonical capture timeline and coordinator generation; only its
+    /// declared preview mode determines how it consumes that timeline.
+    fn spawn_live_preview(
+        self,
+        app: AppHandle,
+        capture_state: &NativeCaptureState,
+        session_id: u64,
+        state: &AppState,
+        settings: &Settings,
+        custom_words: Vec<String>,
+        cloud_profile: Option<provider::AiProviderProfile>,
+        dictionary: Vec<DictionaryEntry>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Whisper if settings.enable_streaming_preview => {
+                let model = whisper_model_path(settings, state)?;
+                spawn_live_whisper_preview(
+                    app,
+                    session_id,
+                    Arc::clone(&capture_state.preview_generation),
+                    model,
+                    vad_model_path(state),
+                    settings.language.clone(),
+                    custom_words,
+                    settings.transcription_preview_char_limit,
+                );
+            }
+            Self::Parakeet if settings.enable_streaming_preview => {
+                let model = parakeet_model_path(state)?;
+                spawn_live_parakeet_preview(
+                    app,
+                    session_id,
+                    model,
+                    settings.clone(),
+                    dictionary,
+                    settings.transcription_preview_char_limit,
+                );
+            }
+            Self::Nemotron => {
+                let runtime = nemotron_runtime_path(state)?;
+                let model = nemotron_model_path(state)?;
+                let script = ensure_nemotron_server_script(&runtime)?;
+                spawn_live_nemotron_stream(
+                    app,
+                    session_id,
+                    runtime,
+                    script,
+                    model,
+                    settings.language.clone(),
+                    settings.nemotron_streaming_mode.lookahead_tokens(),
+                    settings.enable_streaming_preview,
+                    settings.transcription_preview_char_limit,
+                );
+            }
+            Self::Cloud if settings.enable_streaming_preview => {
+                if let Some(profile) = cloud_profile {
+                    if let Ok(api_key) = provider_api_key(&profile.id) {
+                        spawn_live_cloud_preview(
+                            app,
+                            session_id,
+                            profile,
+                            api_key,
+                            settings.cloud_transcription_model.clone(),
+                            settings.language.clone(),
+                            settings.transcription_preview_char_limit,
+                        );
+                    }
+                }
+            }
+            Self::AppleSpeech if settings.enable_streaming_preview => {
+                spawn_live_apple_speech_preview(
+                    app,
+                    session_id,
+                    settings.apple_speech_locale.clone(),
+                    custom_words,
+                    settings.transcription_preview_char_limit,
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn transcribe_live_final(
+        self,
+        state: &AppState,
+        capture_state: &NativeCaptureState,
+        settings: &Settings,
+        recording_generation: u64,
+        samples: Vec<f32>,
+        custom_words: Vec<String>,
+    ) -> Result<EngineFinalTranscript, String> {
+        self.prepare_live_capture(settings, state)?;
+        match self {
+            Self::Whisper => {
+                let model = whisper_model_path(settings, state)?;
+                let language = settings.language.clone();
+                let vad_model = vad_model_path(state);
+                let beam_size = settings.whisper_beam_size;
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    speech::transcribe_whisper_with_options(
+                        samples,
+                        &model,
+                        vad_model.as_deref(),
+                        &language,
+                        &custom_words,
+                        speech::TranscriptionOptions::final_decode(beam_size),
+                    )
+                })
+                .await
+                .map_err(|error| format!("Voice engine task failed: {error}"))??;
+                Ok(EngineFinalTranscript {
+                    text: result.text,
+                    whisper_timings: Some(result.timings),
+                })
+            }
+            Self::Parakeet => {
+                let model = parakeet_model_path(state)?;
+                let text = tauri::async_runtime::spawn_blocking(move || {
+                    transcribe_parakeet_final(&samples, &model, &custom_words)
+                })
+                .await
+                .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
+                Ok(EngineFinalTranscript {
+                    text,
+                    whisper_timings: None,
+                })
+            }
+            Self::Nemotron => {
+                let runtime = nemotron_runtime_path(state)?;
+                let model = nemotron_model_path(state)?;
+                let script = ensure_nemotron_server_script(&runtime)?;
+                let text = finish_nemotron_live(
+                    capture_state,
+                    recording_generation,
+                    &samples,
+                    &runtime,
+                    &script,
+                    &model,
+                    &settings.language,
+                    settings.nemotron_streaming_mode.lookahead_tokens(),
+                )
+                .await?;
+                Ok(EngineFinalTranscript {
+                    text,
+                    whisper_timings: None,
+                })
+            }
+            Self::Cloud => {
+                let profile = {
+                    let database = state
+                        .database
+                        .lock()
+                        .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+                    selected_provider(&database, None)?
+                };
+                let api_key = provider_api_key(&profile.id)?;
+                let wav = audio::wav_bytes_from_16khz_mono(&samples)?;
+                let text = provider::transcribe_openai_compatible_audio(
+                    &profile,
+                    api_key.as_deref(),
+                    &settings.cloud_transcription_model,
+                    &settings.language,
+                    wav,
+                )
+                .await?;
+                Ok(EngineFinalTranscript {
+                    text,
+                    whisper_timings: None,
+                })
+            }
+            Self::AppleSpeech => {
+                let language = settings.apple_speech_locale.clone();
+                let text = tauri::async_runtime::spawn_blocking(move || {
+                    apple_speech::transcribe_samples(&samples, &language, &custom_words)
+                })
+                .await
+                .map_err(|error| format!("Apple Speech task failed: {error}"))??;
+                Ok(EngineFinalTranscript {
+                    text,
+                    whisper_timings: None,
+                })
+            }
+        }
+    }
+}
+
+struct EngineFinalTranscript {
+    text: String,
+    whisper_timings: Option<speech::TranscriptionTimings>,
+}
+
+impl asr::SpeechEngine for VoiceEngine {
+    fn engine_id(&self) -> &'static str {
+        (*self).capabilities().id
+    }
+
+    fn capabilities(&self) -> &'static asr::EngineCapabilities {
+        (*self).capabilities()
+    }
 }
 
 /// Nemotron's cache-aware encoder supports fixed right-context choices.
@@ -5200,8 +5563,27 @@ struct VoiceModelStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VoiceEngineAvailability {
-    parakeet: bool,
-    nemotron: bool,
+    engines: Vec<VoiceEngineDescriptor>,
+}
+
+/// Runtime state paired with the static ASR contract. `available` only means
+/// this build/platform can run the engine; model and credential readiness are
+/// reported separately by `voice_model_status`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceEngineDescriptor {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    maturity: asr::EngineMaturity,
+    preview_mode: asr::PreviewMode,
+    final_mode: asr::FinalMode,
+    supports_files: bool,
+    supports_translation: bool,
+    supports_vocabulary: bool,
+    requires_cuda: bool,
+    available: bool,
+    unavailable_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5542,8 +5924,10 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
 #[tauri::command]
 fn voice_engine_availability() -> VoiceEngineAvailability {
     VoiceEngineAvailability {
-        parakeet: parakeet::is_compiled(),
-        nemotron: nemotron::is_compiled(),
+        engines: VoiceEngine::ALL
+            .into_iter()
+            .map(VoiceEngine::descriptor)
+            .collect(),
     }
 }
 
@@ -6260,7 +6644,9 @@ fn start_native_dictation(
             }
         }
         let settings = database.settings.clone();
-        let cloud_profile = matches!(&settings.selected_voice_engine, VoiceEngine::Cloud)
+        let cloud_profile = settings
+            .selected_voice_engine
+            .requires_provider_profile()
             .then(|| selected_provider(&database, None))
             .transpose()?;
         let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
@@ -6271,22 +6657,9 @@ fn start_native_dictation(
             database.dictionary.clone(),
         )
     };
-    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
-        if !nemotron::is_compiled() {
-            return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
-        }
-        let runtime = nemotron_runtime_path(&state)?;
-        if !nemotron::runtime_is_installed(&runtime) {
-            return Err(
-                "Install the Nemotron CUDA runtime from Voice Engine before dictating.".into(),
-            );
-        }
-        let model = nemotron_model_path(&state)?;
-        if !nemotron::model_is_installed(&model) {
-            return Err("Download the Nemotron model from Voice Engine before dictating.".into());
-        }
-        ensure_nemotron_server_script(&runtime)?;
-    }
+    settings
+        .selected_voice_engine
+        .prepare_live_capture(&settings, &state)?;
     if let Err(error) = apply_overlay_window_layout(&app, &settings) {
         debug_log::append(&format!(
             "Could not apply dictation overlay layout: {error}"
@@ -6301,25 +6674,12 @@ fn start_native_dictation(
     capture_state
         .preview_generation
         .store(preview_generation, Ordering::SeqCst);
-    // Reserve the single cache-aware stream before opening the microphone. If
-    // a previous Nemotron finalization is still running, fail cleanly instead
-    // of leaving an otherwise invisible capture active.
-    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
-        let mut live = match capture_state.nemotron_live.try_lock() {
-            Ok(live) => live,
-            Err(_) => {
-                let _ = capture_state
-                    .session
-                    .lock()
-                    .map(|mut session| session.cancel(preview_generation));
-                return Err("Nemotron is still finishing the previous dictation".into());
-            }
-        };
-        live.generation = preview_generation;
-        live.fed_samples = 0;
-        live.session_started = false;
-        live.start_error = None;
-    }
+    // Reserve the selected engine before opening the microphone. This is
+    // especially important for cache-aware engines whose prior finalization
+    // may still own their single stream.
+    settings
+        .selected_voice_engine
+        .begin_live_session(&capture_state, preview_generation)?;
     let started = match audio::AudioCapture::start(
         settings.selected_input_device.as_deref(),
         Some(Arc::new(move |level| {
@@ -6355,104 +6715,45 @@ fn start_native_dictation(
     drop(capture_started_at);
     drop(capture);
     debug_log::append(&format!(
-        "Dictation capture started (session: {preview_generation}, engine: {:?}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
-        settings.selected_voice_engine, settings.enable_streaming_preview
+        "Dictation capture started (session: {preview_generation}, engine: {}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
+        asr::SpeechEngine::engine_id(&settings.selected_voice_engine),
+        settings.enable_streaming_preview
     ));
     spawn_capture_error_monitor(app.clone(), preview_generation);
     update_tray_status(&app, TrayVisualState::Recording);
-    if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
-        *capture_state
-            .parakeet_live
-            .lock()
-            .map_err(|_| "Parakeet live state lock was poisoned".to_string())? =
-            ParakeetLiveState {
-                generation: preview_generation,
-                ..Default::default()
-            };
-    }
-    let preview_cancellation = Arc::clone(&capture_state.preview_generation);
     if settings.enable_streaming_preview {
         emit_overlay(&app, "recording", "Listening…");
     }
-    if settings.enable_streaming_preview
-        && matches!(&settings.selected_voice_engine, VoiceEngine::Whisper)
-    {
-        if let Ok(model_path) = whisper_model_path(&settings, &state) {
-            if valid_whisper_model_file(&model_path) {
-                spawn_live_whisper_preview(
-                    app.clone(),
-                    preview_generation,
-                    preview_cancellation,
-                    model_path,
-                    vad_model_path(&state),
-                    settings.language.clone(),
-                    custom_words.clone(),
-                    settings.transcription_preview_char_limit,
-                );
-            }
-        }
-    }
-    if settings.enable_streaming_preview
-        && matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet)
-        && parakeet::is_compiled()
-    {
-        if let Ok(model_path) = parakeet_model_path(&state) {
-            if parakeet::model_is_installed(&model_path) {
-                spawn_live_parakeet_preview(
-                    app.clone(),
-                    preview_generation,
-                    model_path,
-                    settings.clone(),
-                    dictionary,
-                    settings.transcription_preview_char_limit,
-                );
-            }
-        }
-    }
-    if matches!(&settings.selected_voice_engine, VoiceEngine::Nemotron) {
-        let runtime = nemotron_runtime_path(&state)?;
-        let model = nemotron_model_path(&state)?;
-        let script = ensure_nemotron_server_script(&runtime)?;
-        spawn_live_nemotron_stream(
-            app.clone(),
-            preview_generation,
-            runtime,
-            script,
-            model,
-            settings.language.clone(),
-            settings.nemotron_streaming_mode.lookahead_tokens(),
-            settings.enable_streaming_preview,
-            settings.transcription_preview_char_limit,
-        );
-    }
-    if settings.enable_streaming_preview
-        && matches!(&settings.selected_voice_engine, VoiceEngine::Cloud)
-    {
-        if let Some(profile) = cloud_profile {
-            if let Ok(api_key) = provider_api_key(&profile.id) {
-                spawn_live_cloud_preview(
-                    app.clone(),
-                    preview_generation,
-                    profile,
-                    api_key,
-                    settings.cloud_transcription_model.clone(),
-                    settings.language.clone(),
-                    settings.transcription_preview_char_limit,
-                );
-            }
-        }
-    }
-    if settings.enable_streaming_preview
-        && matches!(&settings.selected_voice_engine, VoiceEngine::AppleSpeech)
-        && apple_speech::is_supported()
-    {
-        spawn_live_apple_speech_preview(
-            app.clone(),
-            preview_generation,
-            settings.apple_speech_locale.clone(),
-            custom_words,
-            settings.transcription_preview_char_limit,
-        );
+    if let Err(error) = settings.selected_voice_engine.spawn_live_preview(
+        app.clone(),
+        &capture_state,
+        preview_generation,
+        &state,
+        &settings,
+        custom_words,
+        cloud_profile,
+        dictionary,
+    ) {
+        // No preview/setup error may leave an active but invisible microphone
+        // stream behind. The coordinator owns the generation, so invalidating
+        // it also prevents any already-spawned adapter from publishing text.
+        let _ = capture_state
+            .capture
+            .lock()
+            .map(|mut capture| capture.take());
+        let _ = capture_state
+            .capture_started_at
+            .lock()
+            .map(|mut started_at| started_at.take());
+        let _ = capture_state
+            .session
+            .lock()
+            .map(|mut session| session.cancel(preview_generation));
+        capture_state
+            .preview_generation
+            .fetch_add(1, Ordering::SeqCst);
+        update_tray_status(&app, TrayVisualState::Ready);
+        return Err(error);
     }
     Ok(NativeCaptureStarted {
         sample_rate,
@@ -7292,102 +7593,22 @@ async fn stop_native_dictation(
     audio::pad_short_transcription_samples(&mut samples);
 
     let transcription_started = Instant::now();
-    let (raw_text, whisper_timings) = match settings.selected_voice_engine {
-        VoiceEngine::Whisper => {
-            let model_path = whisper_model_path(&settings, &state)?;
-            if !valid_whisper_model_file(&model_path) {
-                return Err("The selected Whisper model is missing, empty, or invalid. Download it again before recording.".into());
-            }
-            let language = settings.language.clone();
-            let vad_model = vad_model_path(&state);
-            let beam_size = settings.whisper_beam_size;
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_whisper_with_options(
-                    samples,
-                    &model_path,
-                    vad_model.as_deref(),
-                    &language,
-                    &custom_words,
-                    speech::TranscriptionOptions::final_decode(beam_size),
-                )
-            })
-            .await
-            .map_err(|error| format!("Voice engine task failed: {error}"))??;
-            (result.text, Some(result.timings))
-        }
-        VoiceEngine::Parakeet => {
-            if !parakeet::is_compiled() {
-                return Err("Parakeet is available in Voxide's CUDA build".into());
-            }
-            let model_path = parakeet_model_path(&state)?;
-            if !parakeet::model_is_installed(&model_path) {
-                return Err("The Parakeet model is missing. Download it before recording.".into());
-            }
-            let text = tauri::async_runtime::spawn_blocking(move || {
-                transcribe_parakeet_final(&samples, &model_path, &custom_words)
-            })
-            .await
-            .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
-            (text, None)
-        }
-        VoiceEngine::Nemotron => {
-            if !nemotron::is_compiled() {
-                return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
-            }
-            let runtime = nemotron_runtime_path(&state)?;
-            if !nemotron::runtime_is_installed(&runtime) {
-                return Err("Install the Nemotron CUDA runtime before recording.".into());
-            }
-            let model = nemotron_model_path(&state)?;
-            if !nemotron::model_is_installed(&model) {
-                return Err("Download the Nemotron model before recording.".into());
-            }
-            let script = ensure_nemotron_server_script(&runtime)?;
-            let text = finish_nemotron_live(
-                &capture_state,
-                recording_generation,
-                &samples,
-                &runtime,
-                &script,
-                &model,
-                &settings.language,
-                settings.nemotron_streaming_mode.lookahead_tokens(),
-            )
-            .await?;
-            (text, None)
-        }
-        VoiceEngine::Cloud => {
-            let profile = {
-                let database = state
-                    .database
-                    .lock()
-                    .map_err(|_| "Voxide data lock was poisoned".to_string())?;
-                selected_provider(&database, None)?
-            };
-            let api_key = provider_api_key(&profile.id)?;
-            let wav = audio::wav_bytes_from_16khz_mono(&samples)?;
-            let text = provider::transcribe_openai_compatible_audio(
-                &profile,
-                api_key.as_deref(),
-                &settings.cloud_transcription_model,
-                &settings.language,
-                wav,
-            )
-            .await?;
-            (text, None)
-        }
-        VoiceEngine::AppleSpeech => {
-            let language = settings.apple_speech_locale.clone();
-            let text = tauri::async_runtime::spawn_blocking(move || {
-                apple_speech::transcribe_samples(&samples, &language, &custom_words)
-            })
-            .await
-            .map_err(|error| format!("Apple Speech task failed: {error}"))??;
-            (text, None)
-        }
-    };
+    let EngineFinalTranscript {
+        text: raw_text,
+        whisper_timings,
+    } = settings
+        .selected_voice_engine
+        .transcribe_live_final(
+            &state,
+            &capture_state,
+            &settings,
+            recording_generation,
+            samples,
+            custom_words,
+        )
+        .await?;
     let transcription_latency_ms = transcription_started.elapsed().as_millis() as u64;
-    let cleanup_style = if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
+    let cleanup_style = if settings.selected_voice_engine.is_parakeet() {
         DictationCleanupStyle::FluidVoiceParakeet
     } else {
         DictationCleanupStyle::Standard
@@ -7512,13 +7733,7 @@ async fn stop_native_dictation(
     };
     let audio_model = audio_file
         .as_ref()
-        .map(|_| match &settings.selected_voice_engine {
-            VoiceEngine::Whisper => settings.selected_model.clone(),
-            VoiceEngine::Cloud => settings.cloud_transcription_model.clone(),
-            VoiceEngine::AppleSpeech => "apple-speech".into(),
-            VoiceEngine::Parakeet => "parakeet".into(),
-            VoiceEngine::Nemotron => "nemotron".into(),
-        });
+        .map(|_| settings.selected_voice_engine.audio_model_id(&settings));
 
     if settings.enable_streaming_preview {
         emit_overlay(&app, "hidden", "");
@@ -8785,6 +9000,49 @@ mod tests {
             database.settings.selected_voice_engine,
             VoiceEngine::Whisper
         ));
+    }
+
+    #[test]
+    fn engine_catalog_is_a_complete_single_source_of_capabilities() {
+        let descriptors = VoiceEngine::ALL
+            .into_iter()
+            .map(VoiceEngine::descriptor)
+            .collect::<Vec<_>>();
+        let mut ids = descriptors
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), VoiceEngine::ALL.len());
+
+        let nemotron = VoiceEngine::Nemotron.descriptor();
+        assert_eq!(nemotron.preview_mode, asr::PreviewMode::Incremental);
+        assert_eq!(nemotron.final_mode, asr::FinalMode::FlushActiveStream);
+        assert!(nemotron.requires_cuda);
+        assert!(!nemotron.supports_vocabulary);
+
+        let whisper = VoiceEngine::Whisper.descriptor();
+        assert_eq!(whisper.preview_mode, asr::PreviewMode::FullSnapshot);
+        assert_eq!(whisper.final_mode, asr::FinalMode::IndependentFullDecode);
+        assert!(whisper.supports_files);
+        assert!(whisper.supports_translation);
+    }
+
+    #[test]
+    fn engine_catalog_serializes_runtime_and_capability_fields_for_the_ui() {
+        let catalog = voice_engine_availability();
+        let value = serde_json::to_value(catalog).expect("engine catalog serializes");
+        let whisper = value["engines"]
+            .as_array()
+            .expect("engine list")
+            .iter()
+            .find(|engine| engine["id"] == "whisper")
+            .expect("whisper descriptor");
+        assert_eq!(whisper["previewMode"], "fullSnapshot");
+        assert_eq!(whisper["finalMode"], "independentFullDecode");
+        assert_eq!(whisper["maturity"], "stable");
+        assert_eq!(whisper["available"], true);
     }
 
     #[test]

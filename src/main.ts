@@ -237,8 +237,22 @@ interface VoiceModelStatus {
 }
 
 interface VoiceEngineAvailability {
-  parakeet: boolean;
-  nemotron: boolean;
+  engines: VoiceEngineDescriptor[];
+}
+
+interface VoiceEngineDescriptor {
+  id: Settings["selectedVoiceEngine"];
+  label: string;
+  description: string;
+  maturity: "stable" | "experimental";
+  previewMode: "none" | "fullSnapshot" | "incremental";
+  finalMode: "independentFullDecode" | "flushActiveStream";
+  supportsFiles: boolean;
+  supportsTranslation: boolean;
+  supportsVocabulary: boolean;
+  requiresCuda: boolean;
+  available: boolean;
+  unavailableReason?: string;
 }
 
 interface ModelDownloadProgress {
@@ -465,7 +479,7 @@ let currentView = "welcome";
 let recording = false;
 let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
-let voiceEngineAvailability: VoiceEngineAvailability = { parakeet: false, nemotron: false };
+let voiceEngineAvailability: VoiceEngineAvailability = { engines: [] };
 let modelDownloadProgress: ModelDownloadProgress | undefined;
 let audioDevices: string[] = [];
 let providers: AiProviderView[] = [];
@@ -719,14 +733,10 @@ function renderWelcome(): void {
 }
 
 function renderVoiceEngine(): void {
-  const engines: [Settings["selectedVoiceEngine"], string, string, "Stable" | "Experimental", boolean][] = [
-    ["whisper", "Whisper", "Local models with broad language support", "Stable", true],
-    ["parakeet", "Parakeet", "Local NVIDIA CUDA transcription with FluidVoice-style full-buffer preview", "Stable", voiceEngineAvailability.parakeet],
-    ["nemotron", "Nemotron Speech", "Local NVIDIA CUDA true-streaming transcription", "Experimental", voiceEngineAvailability.nemotron],
-    ["appleSpeech", "System speech", "Use the operating system speech service", "Stable", true],
-    ["cloud", "Compatible cloud API", "OpenAI-compatible transcription endpoint", "Stable", true],
-  ];
+  const engines = voiceEngineAvailability.engines;
   const selectedEngine = database.settings.selectedVoiceEngine;
+  const selectedEngineDescriptor = engines.find((engine) => engine.id === selectedEngine);
+  const selectedEngineAvailable = selectedEngineDescriptor?.available ?? false;
   const isWhisper = selectedEngine === "whisper";
   const isParakeet = selectedEngine === "parakeet";
   const isNemotron = selectedEngine === "nemotron";
@@ -734,7 +744,7 @@ function renderVoiceEngine(): void {
   const isAppleSpeech = selectedEngine === "appleSpeech";
   const status = modelStatus?.installed
     ? `<span class="status done">Installed</span>`
-    : `<span class="status pending">${(isParakeet && !voiceEngineAvailability.parakeet) || (isNemotron && !voiceEngineAvailability.nemotron) ? "CUDA build required" : "Not installed"}</span>`;
+    : `<span class="status pending">${selectedEngineDescriptor?.unavailableReason ?? "Not installed"}</span>`;
   const nemotronRuntimeReady = modelStatus?.runtimeInstalled === true;
   const downloadId = isWhisper ? database.settings.selectedModel : isParakeet ? "parakeet-tdt-0.6b-v3-int8" : isNemotron ? (nemotronRuntimeReady ? "nemotron-3.5-asr-streaming-0.6b" : "nemotron-cuda-runtime") : "";
   const downloading = downloadId && modelDownloadProgress?.id === downloadId ? modelDownloadProgress : undefined;
@@ -764,17 +774,17 @@ function renderVoiceEngine(): void {
         : `<p class="muted">This engine is listed for migration compatibility but is not yet available in the portable runtime. Select Whisper, System speech on macOS, or a compatible cloud API.</p>`;
   const modelActions = isWhisper
     ? `<button data-action="download-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download selected model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
-    : isParakeet && voiceEngineAvailability.parakeet
+    : isParakeet && selectedEngineAvailable
       ? `<button data-action="download-parakeet-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Parakeet model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-parakeet-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
-      : isNemotron && voiceEngineAvailability.nemotron
+      : isNemotron && selectedEngineAvailable
         ? (!nemotronRuntimeReady
           ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
           : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`)
     : "";
   renderShell(`
     ${pageTitle("Voice Engine", "Choose the transcription runtime used for dictation.")}
-    <section class="card"><div class="engine-grid">${engines.map(([id, name, description, maturity, available]) => `
-      <button class="engine-choice ${database.settings.selectedVoiceEngine === id ? "active" : ""}" data-engine="${id}" ${available ? "" : "disabled"}><div class="engine-choice-title"><strong>${name}</strong><b class="engine-maturity ${maturity === "Experimental" ? "experimental" : "stable"}">${maturity}</b></div><span>${description}</span><em>${available ? (database.settings.selectedVoiceEngine === id ? "Selected" : "Select") : "Not available"}</em></button>`).join("")}</div></section>
+    <section class="card"><div class="engine-grid">${engines.map((engine) => `
+      <button class="engine-choice ${database.settings.selectedVoiceEngine === engine.id ? "active" : ""}" data-engine="${engine.id}" ${engine.available ? "" : "disabled"}><div class="engine-choice-title"><strong>${engine.label}</strong><b class="engine-maturity ${engine.maturity === "experimental" ? "experimental" : "stable"}">${engine.maturity === "experimental" ? "Experimental" : "Stable"}</b></div><span>${engine.description}</span><em>${engine.available ? (database.settings.selectedVoiceEngine === engine.id ? "Selected" : "Select") : escapeHtml(engine.unavailableReason ?? "Not available")}</em></button>`).join("")}</div></section>
     <section class="card form-card"><div class="card-title"><h2>Model configuration</h2>${status}</div>
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
