@@ -1424,7 +1424,7 @@ impl VoiceEngine {
                 }
                 ensure_nemotron_server_script(&runtime).map(|_| ())
             }
-            Self::Cloud => Ok(()),
+            Self::Cloud => cloud_transcription_readiness(settings, state).map(|_| ()),
             Self::AppleSpeech if apple_speech::is_supported() => Ok(()),
             Self::AppleSpeech => Err("Apple Speech is available only on macOS. Select Whisper or a compatible cloud provider on this platform.".into()),
         }
@@ -3768,6 +3768,50 @@ fn provider_api_key(provider_id: &str) -> Result<Option<String>, String> {
             "Could not read the API key from secure storage: {error}"
         )),
     }
+}
+
+fn cloud_transcription_profile(
+    settings: &Settings,
+    database: &AppDatabase,
+) -> Result<provider::AiProviderProfile, String> {
+    if settings.cloud_transcription_model.trim().is_empty() {
+        return Err("Choose a cloud transcription model before recording.".into());
+    }
+    let profile = selected_provider(database, None)?;
+    if !matches!(
+        profile.api_style,
+        provider::ProviderApiStyle::OpenAiCompatible
+    ) {
+        return Err(format!(
+            "{} does not expose an OpenAI-compatible audio transcription endpoint. Choose a compatible provider in AI Enhancement.",
+            profile.name
+        ));
+    }
+    Ok(profile)
+}
+
+/// Validates only the local configuration required to begin cloud capture. A
+/// real request is deliberately not made here: microphone start must not
+/// perform an unprompted network call, while missing credentials should still
+/// fail before audio is captured.
+fn cloud_transcription_readiness(
+    settings: &Settings,
+    state: &AppState,
+) -> Result<provider::AiProviderProfile, String> {
+    let profile = {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+        cloud_transcription_profile(settings, &database)?
+    };
+    if !provider::is_local_endpoint(&profile.base_url) && provider_api_key(&profile.id)?.is_none() {
+        return Err(format!(
+            "Set an API key for {} in AI Enhancement before recording.",
+            profile.name
+        ));
+    }
+    Ok(profile)
 }
 
 fn configured_provider(
@@ -6122,12 +6166,20 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
         .settings
         .clone();
     match settings.selected_voice_engine {
-        VoiceEngine::Cloud => Ok(VoiceModelStatus {
-            id: settings.cloud_transcription_model,
-            installed: true,
-            path: "Configured cloud transcription endpoint".into(),
-            runtime_installed: None,
-        }),
+        VoiceEngine::Cloud => match cloud_transcription_readiness(&settings, &state) {
+            Ok(profile) => Ok(VoiceModelStatus {
+                id: settings.cloud_transcription_model,
+                installed: true,
+                path: format!("Ready: {} cloud transcription", profile.name),
+                runtime_installed: None,
+            }),
+            Err(error) => Ok(VoiceModelStatus {
+                id: settings.cloud_transcription_model,
+                installed: false,
+                path: error,
+                runtime_installed: None,
+            }),
+        },
         VoiceEngine::AppleSpeech => Ok(VoiceModelStatus {
             id: "apple-speech".into(),
             installed: apple_speech::is_supported(),
@@ -9790,6 +9842,31 @@ mod tests {
             &coordinator
         )
         .is_ok());
+    }
+
+    #[test]
+    fn cloud_profile_readiness_requires_a_model_and_compatible_provider() {
+        let database = AppDatabase::default();
+        let mut settings = database.settings.clone();
+        let profile =
+            cloud_transcription_profile(&settings, &database).expect("default profile is valid");
+        assert!(matches!(
+            profile.api_style,
+            provider::ProviderApiStyle::OpenAiCompatible
+        ));
+
+        settings.cloud_transcription_model.clear();
+        assert_eq!(
+            cloud_transcription_profile(&settings, &database)
+                .expect_err("empty model must be rejected"),
+            "Choose a cloud transcription model before recording."
+        );
+
+        let mut anthropic_database = AppDatabase::default();
+        anthropic_database.settings.selected_ai_provider = "anthropic".into();
+        let error = cloud_transcription_profile(&anthropic_database.settings, &anthropic_database)
+            .expect_err("Anthropic does not offer the OpenAI audio endpoint");
+        assert!(error.contains("OpenAI-compatible audio transcription endpoint"));
     }
 
     #[test]

@@ -528,6 +528,9 @@ leaves scope, including failure paths, and capture-device failure uses the same
 generation guard before it cleans up.
 Saving settings now rejects a selected-engine change while the coordinator is
 recording or finalizing, while allowing unrelated preferences to be saved.
+Cloud dictation also validates its selected model, OpenAI-compatible provider,
+and remote API-key presence before opening the microphone; local compatible
+endpoints remain intentionally keyless.
 
 ### 8.3 Model readiness
 

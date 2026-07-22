@@ -2243,7 +2243,10 @@ fn join_endpoint(base: &str, path: &str) -> String {
     )
 }
 
-fn is_local_endpoint(url: &str) -> bool {
+/// Local OpenAI-compatible servers (for example Ollama or LM Studio) may be
+/// intentionally configured without a bearer token. Remote endpoints require
+/// a key before Voxide starts capture.
+pub(crate) fn is_local_endpoint(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
