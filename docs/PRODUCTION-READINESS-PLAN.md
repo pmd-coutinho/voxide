@@ -1321,18 +1321,18 @@ The first implementation deliverable should be narrowly scoped:
 
 Completion checklist:
 
-- [ ] No callback path uses `Mutex<Vec<f32>>` or silently ignores failure.
+- [x] No callback path uses `Mutex<Vec<f32>>` or silently ignores failure.
 - [ ] Raw packets have sequence/timestamp metadata.
-- [ ] Resampling preserves fractional phase across packets.
-- [ ] Canonical audio is the only input used by preview and final inference.
-- [ ] Preview snapshots cannot block capture.
-- [ ] Stop drains through an exact session boundary.
+- [x] Resampling preserves fractional phase across packets.
+- [x] Canonical audio is the only input used by preview and final inference.
+- [x] Preview snapshots cannot block capture.
+- [x] Stop drains through an exact session boundary.
 - [ ] Device/callback failure reaches coordinator/UI state.
-- [ ] Capture health appears in redacted diagnostics.
-- [ ] 44.1 and 48 kHz fixture tests pass.
+- [x] Capture health appears in redacted diagnostics.
+- [x] 44.1 and 48 kHz fixture tests pass.
 - [ ] Pause-heavy dictation fixture produces multiple preview updates.
 - [ ] Silence-only suffix does not append preview text in the behavioral test.
-- [ ] Existing final transcription tests remain green.
+- [x] Existing final transcription tests remain green.
 - [ ] Frontend build and portable/CUDA feature builds remain green.
 
 Only after this deliverable is verified should the engine lifecycle refactor or
