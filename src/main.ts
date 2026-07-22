@@ -2438,9 +2438,6 @@ async function handleAction(element: HTMLElement): Promise<void> {
       render();
       try {
         modelStatus = await invoke<VoiceModelStatus>("download_whisper_model", { modelId: model });
-        database.settings.selectedVoiceEngine = "whisper";
-        database.settings.selectedModel = model;
-        database.settings.localModelPath = undefined;
         showNotice(`${model} is ready for local dictation.`);
       } catch (error) {
         showNotice(`Could not download ${model}: ${String(error)}`);
@@ -2468,9 +2465,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
       render();
       try {
         modelStatus = await invoke<VoiceModelStatus>("download_parakeet_model");
-        database.settings.selectedVoiceEngine = "parakeet";
-        database.settings.localModelPath = undefined;
-        showNotice("Parakeet is ready for local CUDA dictation.");
+        showNotice("Parakeet is installed. Select it when you are ready to use it.");
       } catch (error) {
         showNotice(`Could not download Parakeet: ${String(error)}`);
       } finally {
@@ -2511,9 +2506,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
       render();
       try {
         modelStatus = await invoke<VoiceModelStatus>("download_nemotron_model");
-        database.settings.selectedVoiceEngine = "nemotron";
-        database.settings.localModelPath = undefined;
-        showNotice("Nemotron is ready for local CUDA dictation.");
+        showNotice("Nemotron is installed. Select it when you are ready to use it.");
       } catch (error) {
         showNotice(`Could not download Nemotron: ${String(error)}`);
       } finally {

@@ -5632,10 +5632,6 @@ async fn download_nemotron_model(
     tokio::fs::rename(&staging, &destination)
         .await
         .map_err(|error| format!("Could not install the Nemotron model: {error}"))?;
-    state.update(|database| {
-        database.settings.selected_voice_engine = VoiceEngine::Nemotron;
-        database.settings.local_model_path = None;
-    })?;
     nemotron_status(&state)
 }
 
@@ -5743,11 +5739,6 @@ async fn download_whisper_model(
         .await
         .map_err(|error| format!("Could not install the Whisper model: {error}"))?;
 
-    state.update(|database| {
-        database.settings.selected_voice_engine = VoiceEngine::Whisper;
-        database.settings.selected_model = model_id.clone();
-        database.settings.local_model_path = None;
-    })?;
     Ok(VoiceModelStatus {
         id: model_id,
         installed: true,
@@ -5900,11 +5891,6 @@ async fn download_parakeet_model(
     .map_err(|error| format!("Parakeet installation task failed: {error}"))?;
     let _ = tokio::fs::remove_file(&temporary).await;
     let destination = destination?;
-    state.update(|database| {
-        database.settings.selected_voice_engine = VoiceEngine::Parakeet;
-        database.settings.selected_model = parakeet::MODEL_ID.into();
-        database.settings.local_model_path = None;
-    })?;
     Ok(VoiceModelStatus {
         id: parakeet::MODEL_ID.into(),
         installed: true,
