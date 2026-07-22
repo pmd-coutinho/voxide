@@ -735,6 +735,52 @@ pub fn wav_bytes_from_16khz_mono(samples: &[f32]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// A deterministic synthetic utterance with a long internal pause. It is
+    /// intentionally not speech content: capture regression tests need a
+    /// consent-free waveform that still exposes timing, silence, and packet
+    /// boundary bugs.
+    fn pause_heavy_fixture(sample_rate: u32, channels: u16) -> Vec<f32> {
+        let frames = sample_rate as usize * 3;
+        let mut samples = Vec::with_capacity(frames * channels as usize);
+        for frame in 0..frames {
+            let seconds = frame as f32 / sample_rate as f32;
+            let speech = !(0.8..1.6).contains(&seconds);
+            let sample = if speech {
+                let envelope = if seconds < 0.08 {
+                    seconds / 0.08
+                } else if seconds > 2.92 {
+                    (3.0 - seconds) / 0.08
+                } else {
+                    1.0
+                };
+                envelope
+                    * ((seconds * std::f32::consts::TAU * 173.0).sin() * 0.25
+                        + (seconds * std::f32::consts::TAU * 311.0).sin() * 0.1)
+            } else {
+                0.0
+            };
+            for _ in 0..channels {
+                samples.push(sample);
+            }
+        }
+        samples
+    }
+
+    fn resample_packetized(input: &[f32], sample_rate: u32, channels: u16) -> Vec<f32> {
+        let mut resampler = StatefulMonoResampler::new(sample_rate, channels);
+        let mut output = Vec::new();
+        let packet_sizes = [1, 31, 257, 1_021, 4_093, 79];
+        let mut offset = 0;
+        let mut packet_index = 0;
+        while offset < input.len() {
+            let end = (offset + packet_sizes[packet_index % packet_sizes.len()]).min(input.len());
+            resampler.push_interleaved(&input[offset..end], &mut output);
+            offset = end;
+            packet_index += 1;
+        }
+        output
+    }
+
     #[test]
     fn file_transcription_requires_at_least_one_second_of_16khz_audio() {
         assert!(!has_minimum_transcription_samples(&vec![0.0; 15_999]));
@@ -810,6 +856,29 @@ mod tests {
             packet_index += 1;
         }
         assert_eq!(whole, packetized);
+    }
+
+    #[test]
+    fn pause_heavy_fixture_stays_synchronized_at_common_device_rates() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let input = pause_heavy_fixture(sample_rate, channels);
+            let mut whole_resampler = StatefulMonoResampler::new(sample_rate, channels);
+            let mut whole = Vec::new();
+            whole_resampler.push_interleaved(&input, &mut whole);
+            let packetized = resample_packetized(&input, sample_rate, channels);
+
+            assert_eq!(
+                packetized, whole,
+                "{sample_rate} Hz/{channels} channel fixture"
+            );
+            assert_eq!(whole.len(), WHISPER_SAMPLE_RATE as usize * 3);
+            assert!(
+                whole[WHISPER_SAMPLE_RATE as usize..WHISPER_SAMPLE_RATE as usize + 8_000]
+                    .iter()
+                    .all(|sample| sample.abs() < 1e-6),
+                "the internal silence must remain silence after resampling"
+            );
+        }
     }
 
     #[test]
