@@ -475,4 +475,47 @@ mod tests {
         assert_eq!(live.generation, 9);
         assert!(live.previous_full_text.is_empty());
     }
+
+    #[test]
+    fn nemotron_reservation_resets_adapter_state_for_the_admitted_generation() {
+        let capture_state = NativeCaptureState::default();
+        {
+            let mut live = capture_state
+                .nemotron_live
+                .try_lock()
+                .expect("Nemotron live lock");
+            live.generation = 4;
+            live.fed_samples = 1_024;
+            live.session_started = true;
+            live.start_error = Some("stale stream failure".into());
+        }
+
+        VoiceEngine::Nemotron
+            .begin_live_session(&capture_state, 9)
+            .expect("reservation should reset state before the CUDA stream starts");
+
+        let live = capture_state
+            .nemotron_live
+            .try_lock()
+            .expect("Nemotron live lock");
+        assert_eq!(live.generation, 9);
+        assert_eq!(live.fed_samples, 0);
+        assert!(!live.session_started);
+        assert!(live.start_error.is_none());
+    }
+
+    #[test]
+    fn nemotron_reservation_refuses_a_stream_that_is_still_finalizing() {
+        let capture_state = NativeCaptureState::default();
+        let _finalizing_stream = capture_state
+            .nemotron_live
+            .try_lock()
+            .expect("Nemotron live lock");
+
+        let error = VoiceEngine::Nemotron
+            .begin_live_session(&capture_state, 9)
+            .expect_err("an active finalization must retain the single Nemotron stream");
+
+        assert_eq!(error, "Nemotron is still finishing the previous dictation");
+    }
 }

@@ -510,8 +510,9 @@ preview, final, file, and preload dispatch. Command handlers retain only
 session admission, capture ownership, and post-processing.
 
 Adapter-local regressions now cover keyless preparation for a local
-OpenAI-compatible cloud endpoint and generation-scoped Parakeet reservation
-reset without requiring models or CUDA.
+OpenAI-compatible cloud endpoint, generation-scoped Parakeet and Nemotron
+reservation resets, and Nemotron's active-finalization admission refusal,
+without requiring models or CUDA.
 
 ### 8.2 Coordinator behavior
 
