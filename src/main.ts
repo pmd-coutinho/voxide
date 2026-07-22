@@ -302,7 +302,7 @@ interface AiProviderView {
 }
 
 interface OverlayUpdate {
-  state: "recording" | "processing" | "complete" | "hidden";
+  state: "recording" | "processing" | "complete" | "error" | "hidden";
   mode: string;
   text: string;
 }
@@ -1859,7 +1859,13 @@ function showNotice(message: string): void {
 }
 
 function renderOverlay(update: OverlayUpdate, audioLevel = 0): void {
-  const status = update.state === "recording" ? "Listening" : update.state === "processing" ? "Processing" : "Complete";
+  const status = update.state === "recording"
+    ? "Listening"
+    : update.state === "processing"
+      ? "Processing"
+      : update.state === "error"
+        ? "Microphone error"
+        : "Complete";
   // Mutate the existing nodes instead of rebuilding the subtree: this runs
   // at audio-level rate while recording, and WebKitGTK never paints frames
   // for a subtree that is replaced wholesale on every update.
