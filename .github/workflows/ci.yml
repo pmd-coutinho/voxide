@@ -104,6 +104,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, linux, x64, nvidia-cuda]
     timeout-minutes: 45
+    env:
+      # A repository variable points only at a runner-local, pinned Parakeet
+      # test model. It is intentionally not a user model directory or secret.
+      VOXIDE_PARAKEET_MODEL_DIR: ${{ vars.VOXIDE_PARAKEET_MODEL_DIR }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Verify NVIDIA/CUDA runner contract
@@ -112,6 +116,8 @@ jobs:
           nvcc --version
           pkg-config --modversion alsa
           pkg-config --modversion gtk+-3.0
+          test -n "$VOXIDE_PARAKEET_MODEL_DIR"
+          test -f "$VOXIDE_PARAKEET_MODEL_DIR/test_wavs/en.wav"
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
       - name: Check formatting
@@ -123,6 +129,9 @@ jobs:
       - name: Run CUDA Rust lifecycle tests
         working-directory: src-tauri
         run: cargo +1.89 test --lib --features cuda
+      - name: Run CUDA model inference fixtures
+        working-directory: src-tauri
+        run: cargo +1.89 test --lib --features cuda cuda_model -- --ignored
       - name: Lint CUDA Rust target
         working-directory: src-tauri
         run: cargo +1.89 clippy --lib --features cuda -- -D warnings

@@ -1407,5 +1407,11 @@ Completion checklist:
 - [x] Frontend build and portable Rust tests remain green.
 - [ ] CUDA feature build and runtime tests pass on the guarded NVIDIA runner.
 
+The guarded runner also requires the repository variable
+`VOXIDE_PARAKEET_MODEL_DIR` to identify its runner-local, pinned Parakeet test
+model. Its CUDA gate runs the normal feature test suite and the two targeted
+ignored model-inference fixtures; this keeps hardware/model evidence explicit
+without downloading a multi-hundred-megabyte test asset in general CI.
+
 Only after this deliverable is verified should the engine lifecycle refactor or
 Parakeet Flash experiment become the active implementation focus.
