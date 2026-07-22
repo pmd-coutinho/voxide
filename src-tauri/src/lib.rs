@@ -15,6 +15,7 @@ use directories::{BaseDirs, ProjectDirs};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -5506,6 +5507,31 @@ const NEMOTRON_MODEL_FILES: [&str; 6] = [
     "tokenizer_config.json",
 ];
 
+/// SHA-256 values for every downloaded artifact at `nemotron::MODEL_REVISION`.
+/// They are deliberately application-owned rather than trusting an HTTP
+/// response's mutable metadata or download-time size alone.
+fn nemotron_model_sha256(file: &str) -> Option<&'static str> {
+    match file {
+        "config.json" => Some("b6574a9110c3473053acebd5b6945ade927896e0121075886712a63dbeca8056"),
+        "generation_config.json" => {
+            Some("37dbba85d5e2c4c48319202e167ac2107684621aa658f65e422e072d6d58f52e")
+        }
+        "model.safetensors" => {
+            Some("9eebdd6590289cb3030f310858f3df93256600a800a3e8200c5993d5f967e174")
+        }
+        "processor_config.json" => {
+            Some("c3e6cbac505049ac27d5d6cde69be5a74d519a523fa9cd9ba6807f197f3a5153")
+        }
+        "tokenizer.json" => {
+            Some("f99d803848330edcb551b81ae77f5baad4ec01199a11b2c2dd5212298213cd77")
+        }
+        "tokenizer_config.json" => {
+            Some("9aac075ebd401089d4ddce37952580c88e01eec24483d55f712f66e13f3d8ea5")
+        }
+        _ => None,
+    }
+}
+
 fn nemotron_model_url(file: &str) -> String {
     format!(
         "https://huggingface.co/{}/resolve/{}/{file}?download=true",
@@ -5602,6 +5628,8 @@ async fn download_nemotron_model(
     let download_result = async {
         let mut downloaded_bytes = 0_u64;
         for file in NEMOTRON_MODEL_FILES {
+            let expected_digest = nemotron_model_sha256(file)
+                .ok_or_else(|| format!("No checksum is registered for Nemotron {file}"))?;
             let response = client
                 .get(nemotron_model_url(file))
                 .send()
@@ -5620,6 +5648,7 @@ async fn download_nemotron_model(
             use tokio::io::AsyncWriteExt;
             let mut stream = response.bytes_stream();
             let mut file_bytes = 0_u64;
+            let mut digest = Sha256::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| format!("The Nemotron {file} download was interrupted: {error}"))?;
                 output
@@ -5627,6 +5656,7 @@ async fn download_nemotron_model(
                     .await
                     .map_err(|error| format!("Could not save the Nemotron {file} download: {error}"))?;
                 let count = chunk.len() as u64;
+                digest.update(&chunk);
                 downloaded_bytes += count;
                 file_bytes += count;
                 let _ = app.emit(
@@ -5644,6 +5674,12 @@ async fn download_nemotron_model(
                 .map_err(|error| format!("Could not finalize the Nemotron {file} download: {error}"))?;
             if file_bytes == 0 {
                 return Err(format!("The Nemotron {file} download was empty"));
+            }
+            let actual_digest = format!("{:x}", digest.finalize());
+            if actual_digest != expected_digest {
+                return Err(format!(
+                    "The Nemotron {file} checksum did not match the pinned model revision"
+                ));
             }
             if file == "model.safetensors" && file_bytes < 1_000_000_000 {
                 return Err("The Nemotron model download is unexpectedly small; refusing to install it.".into());
@@ -9640,6 +9676,16 @@ mod tests {
         let url = nemotron_model_url("config.json");
         assert!(url.contains(nemotron::MODEL_REVISION));
         assert!(!url.contains("/resolve/main/"));
+    }
+
+    #[test]
+    fn nemotron_pinned_model_has_a_checksum_for_every_downloaded_file() {
+        for file in NEMOTRON_MODEL_FILES {
+            let checksum = nemotron_model_sha256(file)
+                .unwrap_or_else(|| panic!("missing checksum for {file}"));
+            assert_eq!(checksum.len(), 64);
+            assert!(checksum.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     #[test]
