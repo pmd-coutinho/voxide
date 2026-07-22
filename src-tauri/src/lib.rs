@@ -5825,11 +5825,11 @@ fn validate_parakeet_archive(
     expected_bytes: Option<u64>,
     downloaded_bytes: u64,
 ) -> Result<(), String> {
-    if downloaded_bytes < 50 * 1024 * 1024 {
-        return Err("The Parakeet download was unexpectedly small".into());
+    if downloaded_bytes != parakeet::MODEL_ARCHIVE_BYTES {
+        return Err("The Parakeet download size did not match the pinned release asset".into());
     }
-    if expected_bytes.is_some_and(|expected| expected != downloaded_bytes) {
-        return Err("The Parakeet download was incomplete".into());
+    if expected_bytes.is_some_and(|expected| expected != parakeet::MODEL_ARCHIVE_BYTES) {
+        return Err("The Parakeet server reported an unexpected release asset size".into());
     }
     let metadata = fs::metadata(path)
         .map_err(|error| format!("Could not verify the Parakeet download: {error}"))?;
@@ -5843,7 +5843,27 @@ fn validate_parakeet_archive(
     if &prefix != b"BZh" {
         return Err("The Parakeet download is not a bzip2 model archive".into());
     }
+    if sha256_file(path)? != parakeet::MODEL_ARCHIVE_SHA256 {
+        return Err("The Parakeet download checksum did not match the pinned release asset".into());
+    }
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("Could not hash a downloaded component: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Could not hash a downloaded component: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn install_parakeet_archive(
@@ -5945,7 +5965,13 @@ async fn download_parakeet_model(
             return Err(error);
         }
     };
-    if let Err(error) = validate_parakeet_archive(&temporary, total_bytes, downloaded_bytes) {
+    let archive_to_validate = temporary.clone();
+    let validation = tauri::async_runtime::spawn_blocking(move || {
+        validate_parakeet_archive(&archive_to_validate, total_bytes, downloaded_bytes)
+    })
+    .await
+    .map_err(|error| format!("Parakeet validation task failed: {error}"))?;
+    if let Err(error) = validation {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
@@ -9707,6 +9733,27 @@ mod tests {
             assert_eq!(checksum.len(), 64);
             assert!(checksum.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn parakeet_archive_is_pinned_to_a_digest_and_exact_size() {
+        assert_eq!(parakeet::MODEL_ARCHIVE_SHA256.len(), 64);
+        assert!(parakeet::MODEL_ARCHIVE_SHA256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(parakeet::MODEL_ARCHIVE_BYTES > 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn component_hashing_is_streamed_and_deterministic() {
+        let path =
+            std::env::temp_dir().join(format!("voxide-component-hash-{}", uuid::Uuid::new_v4()));
+        fs::write(&path, b"voxide").expect("component fixture writes");
+        assert_eq!(
+            sha256_file(&path).expect("component fixture hashes"),
+            "7bcd53ec8f339c1a407912b52875daaf8f04e7d69c19ca831172fb1f3f83343d"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
