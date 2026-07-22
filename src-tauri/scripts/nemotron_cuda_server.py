@@ -27,7 +27,6 @@ import json
 import queue
 import sys
 import threading
-import traceback
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -99,6 +98,40 @@ def validate_request(request: dict[str, Any]) -> tuple[str, int]:
         if type(lookahead) is not int or lookahead not in {0, 3, 6, 13}:
             raise ValueError("Nemotron lookaheadTokens must be one of 0, 3, 6, or 13")
     return action, request_id
+
+
+def safe_error_payload(error: Exception) -> dict[str, str]:
+    """Map failures to supportable categories without logging request content."""
+    message = str(error).lower()
+    if "out of memory" in message:
+        return {
+            "type": "error",
+            "code": "gpu_out_of_memory",
+            "message": "The GPU ran out of memory while transcribing.",
+        }
+    if isinstance(error, TimeoutError):
+        return {
+            "type": "error",
+            "code": "inference_timeout",
+            "message": "Nemotron did not finish transcription before its deadline.",
+        }
+    if isinstance(error, ValueError):
+        return {
+            "type": "error",
+            "code": "invalid_request",
+            "message": "The Nemotron service received an invalid request.",
+        }
+    if "cuda" in message or "nvidia" in message:
+        return {
+            "type": "error",
+            "code": "cuda_runtime_failure",
+            "message": "The Nemotron CUDA runtime failed. Verify the NVIDIA driver and CUDA runtime.",
+        }
+    return {
+        "type": "error",
+        "code": "inference_failed",
+        "message": "The Nemotron CUDA service could not complete transcription.",
+    }
 
 
 def pcm_from_base64(encoded: str | None):
@@ -417,8 +450,10 @@ def main() -> int:
                 respond({"type": "stopped"}, request_id)
                 return 0
         except Exception as error:  # noqa: BLE001 -- never crash the persistent service for a bad request.
-            traceback.print_exc(file=sys.stderr)
-            respond({"type": "error", "message": str(error)}, request_id)
+            payload = safe_error_payload(error)
+            sys.stderr.write(f"Nemotron service error: {payload['code']}\n")
+            sys.stderr.flush()
+            respond(payload, request_id)
     return 0
 
 
