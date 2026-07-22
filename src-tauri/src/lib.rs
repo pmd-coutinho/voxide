@@ -46,6 +46,7 @@ mod typing;
 mod update;
 
 const DATABASE_FILE: &str = "voxide.json";
+const DATABASE_SCHEMA_VERSION: u32 = 1;
 const BACKUP_VERSION: u32 = 1;
 const TRANSCRIPTION_PREVIEW_MIN_CHARACTERS: usize = 50;
 const TRANSCRIPTION_PREVIEW_MAX_CHARACTERS: usize = 800;
@@ -77,6 +78,42 @@ struct AppDatabase {
     custom_words: Vec<CustomWordEntry>,
     command_chats: Vec<CommandChat>,
     active_command_chat_id: Option<String>,
+}
+
+/// The on-disk envelope is deliberately separate from `AppDatabase` so schema
+/// migrations are explicit and a newer application never normalizes over data
+/// it does not understand. Older Voxide installs wrote `AppDatabase` directly;
+/// `OnDiskDatabase` retains that read path only for the one-time migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDatabase {
+    schema_version: u32,
+    data: AppDatabase,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OnDiskDatabase {
+    Versioned(PersistedDatabase),
+    Legacy(AppDatabase),
+}
+
+fn decode_persisted_database(contents: &str) -> Result<(AppDatabase, bool), String> {
+    match serde_json::from_str(contents).map_err(|error| error.to_string())? {
+        OnDiskDatabase::Versioned(envelope) => {
+            if envelope.schema_version > DATABASE_SCHEMA_VERSION {
+                return Err(format!(
+                    "this data uses schema version {}, but this Voxide version supports up to {}",
+                    envelope.schema_version, DATABASE_SCHEMA_VERSION
+                ));
+            }
+            Ok((
+                envelope.data,
+                envelope.schema_version != DATABASE_SCHEMA_VERSION,
+            ))
+        }
+        OnDiskDatabase::Legacy(database) => Ok((database, true)),
+    }
 }
 
 impl Default for AppDatabase {
@@ -1277,28 +1314,61 @@ impl AppState {
         fs::create_dir_all(&root)
             .map_err(|error| format!("Could not create application-data directory: {error}"))?;
         let path = root.join(DATABASE_FILE);
-        let mut database = match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)
+        let (mut database, needs_schema_migration) = match fs::read_to_string(&path) {
+            Ok(contents) => decode_persisted_database(&contents)
                 .map_err(|error| format!("Could not read Voxide data: {error}"))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppDatabase::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (AppDatabase::default(), false)
+            }
             Err(error) => return Err(format!("Could not open Voxide data: {error}")),
         };
         normalize_database(&mut database);
 
-        Ok(Self {
+        let state = Self {
             database: Mutex::new(database),
             path,
-        })
+        };
+        if needs_schema_migration {
+            state.back_up_pre_migration_database()?;
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+            state.persist(&database)?;
+        }
+        Ok(state)
     }
 
     fn persist(&self, database: &AppDatabase) -> Result<(), String> {
-        let contents = serde_json::to_vec_pretty(database)
-            .map_err(|error| format!("Could not encode Voxide data: {error}"))?;
+        let contents = serde_json::to_vec_pretty(&PersistedDatabase {
+            schema_version: DATABASE_SCHEMA_VERSION,
+            data: database.clone(),
+        })
+        .map_err(|error| format!("Could not encode Voxide data: {error}"))?;
         let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, contents)
+        let mut temporary = fs::File::create(&temporary_path)
             .map_err(|error| format!("Could not save Voxide data: {error}"))?;
+        temporary
+            .write_all(&contents)
+            .and_then(|()| temporary.sync_all())
+            .map_err(|error| format!("Could not save Voxide data: {error}"))?;
+        drop(temporary);
         fs::rename(&temporary_path, &self.path)
             .map_err(|error| format!("Could not finalize Voxide data: {error}"))
+    }
+
+    fn back_up_pre_migration_database(&self) -> Result<(), String> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let backup = self.path.with_extension("json.pre-schema-v1-backup");
+        if backup.exists() {
+            return Ok(());
+        }
+        fs::copy(&self.path, &backup).map_err(|error| {
+            format!("Could not back up Voxide data before schema migration: {error}")
+        })?;
+        Ok(())
     }
 
     fn models_directory(&self) -> Result<PathBuf, String> {
@@ -9414,6 +9484,56 @@ mod tests {
             serde_json::from_slice(&encoded).expect("backup should decode");
         assert_eq!(decoded.version, BACKUP_VERSION);
         assert_eq!(decoded.database.settings.selected_ai_provider, "openai");
+    }
+
+    #[test]
+    fn persisted_database_wraps_current_schema_and_reads_legacy_data() {
+        let database = AppDatabase::default();
+        let wrapped = serde_json::to_string(&PersistedDatabase {
+            schema_version: DATABASE_SCHEMA_VERSION,
+            data: database.clone(),
+        })
+        .expect("versioned database serializes");
+        let (decoded, needs_migration) =
+            decode_persisted_database(&wrapped).expect("versioned database decodes");
+        assert!(!needs_migration);
+        assert_eq!(decoded.settings.selected_ai_provider, "openai");
+
+        let legacy = serde_json::to_string(&database).expect("legacy database serializes");
+        let (decoded, needs_migration) =
+            decode_persisted_database(&legacy).expect("legacy database decodes");
+        assert!(needs_migration);
+        assert_eq!(decoded.settings.selected_ai_provider, "openai");
+    }
+
+    #[test]
+    fn persisted_database_rejects_a_newer_schema_without_normalizing_it() {
+        let contents = format!(
+            r#"{{"schemaVersion":{},"data":{}}}"#,
+            DATABASE_SCHEMA_VERSION + 1,
+            serde_json::to_string(&AppDatabase::default()).expect("database serializes")
+        );
+        assert!(decode_persisted_database(&contents)
+            .expect_err("future schema must be rejected")
+            .contains("supports up to"));
+    }
+
+    #[test]
+    fn database_persistence_writes_a_versioned_envelope() {
+        let root =
+            std::env::temp_dir().join(format!("voxide-persistence-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("temporary data directory creates");
+        let state = AppState {
+            database: Mutex::new(AppDatabase::default()),
+            path: root.join(DATABASE_FILE),
+        };
+        let database = state.database.lock().expect("database lock").clone();
+        state.persist(&database).expect("database persists");
+        let contents = fs::read_to_string(&state.path).expect("database file reads");
+        let json: Value = serde_json::from_str(&contents).expect("database JSON parses");
+        assert_eq!(json["schemaVersion"], DATABASE_SCHEMA_VERSION);
+        assert!(json["data"].is_object());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
