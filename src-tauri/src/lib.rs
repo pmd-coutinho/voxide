@@ -1320,6 +1320,27 @@ impl VoiceEngine {
         }
     }
 
+    /// Content-free implementation/runtime identifier for diagnostics and
+    /// support exports. It must never contain a local path, transcript, or
+    /// provider credential.
+    fn diagnostic_runtime_version(self, state: &AppState) -> String {
+        match self {
+            Self::Whisper => "whisper-rs 0.16.0".into(),
+            Self::Parakeet => "sherpa-onnx 1.13.4 CUDA 12/cuDNN 9".into(),
+            Self::Nemotron => nemotron_runtime_path(state)
+                .ok()
+                .and_then(|runtime| nemotron_runtime_version(&runtime))
+                .unwrap_or_else(|| {
+                    format!(
+                        "Nemotron runtime receipt v{NEMOTRON_RUNTIME_VERSION}, model {}",
+                        &nemotron::MODEL_REVISION[..12]
+                    )
+                }),
+            Self::AppleSpeech => "Apple Speech.framework".into(),
+            Self::Cloud => "OpenAI-compatible HTTP API".into(),
+        }
+    }
+
     fn runtime_available(self) -> bool {
         match self {
             Self::Parakeet => parakeet::is_compiled(),
@@ -3087,13 +3108,22 @@ fn open_feedback_issue() -> Result<(), String> {
 /// Environment summary plus recent diagnostic log lines, for the user to
 /// paste into an issue when relevant.
 #[tauri::command]
-fn feedback_debug_information() -> String {
+fn feedback_debug_information(state: State<'_, AppState>) -> String {
+    let settings = state
+        .database
+        .lock()
+        .map(|database| database.settings.clone())
+        .unwrap_or_default();
+    let engine = settings.selected_voice_engine;
     let mut information = format!(
-        "App Version: {}\nOS: {}\nArchitecture: {}\nDate: {}\n",
+        "App Version: {}\nOS: {}\nArchitecture: {}\nDate: {}\nSpeech Engine: {}\nEngine Runtime: {}\nEngine Model: {}\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         Utc::now().to_rfc3339(),
+        asr::SpeechEngine::engine_id(&engine),
+        engine.diagnostic_runtime_version(&state),
+        engine.audio_model_id(&settings),
     );
     let recent_log_entries = debug_log::recent_lines(30);
     if !recent_log_entries.is_empty() {
@@ -5872,6 +5902,26 @@ fn nemotron_runtime_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(nemotron::runtime_directory(&state.data_directory()?))
 }
 
+fn nemotron_runtime_version(runtime_directory: &Path) -> Option<String> {
+    let metadata = fs::read(runtime_directory.join(NEMOTRON_RUNTIME_HEALTH_FILE)).ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata).ok()?;
+    let torch = diagnostic_version_value(metadata.get("torch")?)?;
+    let cuda = diagnostic_version_value(metadata.get("cuda")?)?;
+    Some(format!(
+        "PyTorch {torch}, CUDA {cuda}, model {}",
+        &nemotron::MODEL_REVISION[..12]
+    ))
+}
+
+fn diagnostic_version_value(value: &serde_json::Value) -> Option<&str> {
+    let value = value.as_str()?;
+    (value.len() <= 64
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_')
+        }))
+    .then_some(value)
+}
+
 /// Materialize the embedded sidecar beside the user-local Python environment.
 /// This lets an installed app run the exact server it was built with, while a
 /// source checkout needs no fragile path assumptions in development.
@@ -7164,8 +7214,9 @@ fn start_native_dictation(
     drop(capture_started_at);
     drop(capture);
     debug_log::append(&format!(
-        "Dictation capture started (session: {preview_generation}, engine: {}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
+        "Dictation capture started (session: {preview_generation}, engine: {}, runtime: {}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
         asr::SpeechEngine::engine_id(&settings.selected_voice_engine),
+        settings.selected_voice_engine.diagnostic_runtime_version(&state),
         settings.enable_streaming_preview
     ));
     spawn_capture_error_monitor(app.clone(), preview_generation);
@@ -10805,6 +10856,17 @@ mod tests {
         assert!(!owned.exists());
         assert!(unrelated.exists());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn diagnostic_runtime_versions_accept_only_safe_version_tokens() {
+        assert_eq!(
+            diagnostic_version_value(&Value::String("2.9.1+cu128".into())),
+            Some("2.9.1+cu128")
+        );
+        assert!(diagnostic_version_value(&Value::String("/home/alice/secret".into())).is_none());
+        assert!(diagnostic_version_value(&Value::String("version\nsecret".into())).is_none());
+        assert!(diagnostic_version_value(&Value::String("x".repeat(65))).is_none());
     }
 
     #[test]
