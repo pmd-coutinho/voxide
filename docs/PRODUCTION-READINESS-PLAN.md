@@ -1051,6 +1051,11 @@ Requirements:
   file creation and database commit.
 - Periodically remove orphaned owned WAV/staging files after a grace period.
 
+Every persisted database replacement now retains the prior version in a
+three-slot, same-directory backup rotation and flushes the newest backup before
+the live file is replaced. Startup recovery selection remains a separate
+follow-up so a future-schema database is never silently replaced.
+
 ### 13.4 Backup format
 
 - Explicit major/minor schema.

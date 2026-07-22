@@ -50,6 +50,7 @@ mod update;
 
 const DATABASE_FILE: &str = "voxide.json";
 const DATABASE_SCHEMA_VERSION: u32 = 1;
+const DATABASE_BACKUP_COUNT: usize = 3;
 const BACKUP_VERSION: u32 = 1;
 const TRANSCRIPTION_PREVIEW_MIN_CHARACTERS: usize = 50;
 const TRANSCRIPTION_PREVIEW_MAX_CHARACTERS: usize = 800;
@@ -1917,6 +1918,7 @@ impl AppState {
             .and_then(|()| temporary.sync_all())
             .map_err(|error| format!("Could not save Voxide data: {error}"))?;
         drop(temporary);
+        rotate_database_backups(&self.path)?;
         fs::rename(&temporary_path, &self.path)
             .map_err(|error| format!("Could not finalize Voxide data: {error}"))
     }
@@ -1977,6 +1979,47 @@ impl AppState {
         self.persist(&database)?;
         Ok(value)
     }
+}
+
+/// Retain a short, ordered history of complete database snapshots before an
+/// atomic replacement. All files stay beside the live database so copies and
+/// renames remain on the same filesystem.
+fn rotate_database_backups(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    for index in (1..DATABASE_BACKUP_COUNT).rev() {
+        let source = database_backup_path(path, index - 1);
+        if source.is_file() {
+            let destination = database_backup_path(path, index);
+            fs::copy(&source, &destination).map_err(|error| {
+                format!(
+                    "Could not rotate Voxide database backup {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+    let newest = database_backup_path(path, 0);
+    fs::copy(path, &newest).map_err(|error| {
+        format!(
+            "Could not create a Voxide database backup at {}: {error}",
+            newest.display()
+        )
+    })?;
+    fs::File::open(&newest)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Could not flush Voxide database backup: {error}"))?;
+    Ok(())
+}
+
+fn database_backup_path(path: &Path, index: usize) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DATABASE_FILE);
+    path.with_file_name(format!("{filename}.backup-{index}"))
 }
 
 struct NativeCaptureState {
@@ -11080,6 +11123,44 @@ mod tests {
         assert_eq!(json["schemaVersion"], DATABASE_SCHEMA_VERSION);
         assert!(json["data"].is_object());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn database_persistence_rotates_last_known_good_snapshots() {
+        let directory = std::env::temp_dir().join(format!(
+            "voxide-database-backup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join(DATABASE_FILE);
+        fs::write(&path, "initial snapshot").expect("initial database");
+        let state = AppState {
+            database: Mutex::new(AppDatabase::default()),
+            path: path.clone(),
+        };
+
+        let first = AppDatabase::default();
+        state.persist(&first).expect("first persistence");
+        let first_snapshot = fs::read_to_string(&path).expect("first live database");
+        assert_eq!(
+            fs::read_to_string(database_backup_path(&path, 0)).expect("newest backup"),
+            "initial snapshot"
+        );
+
+        let mut second = AppDatabase::default();
+        second.settings.language = "pt".into();
+        state.persist(&second).expect("second persistence");
+        assert_eq!(
+            fs::read_to_string(database_backup_path(&path, 0)).expect("newest backup"),
+            first_snapshot
+        );
+        assert_eq!(
+            fs::read_to_string(database_backup_path(&path, 1)).expect("previous backup"),
+            "initial snapshot"
+        );
+        assert!(!database_backup_path(&path, DATABASE_BACKUP_COUNT).exists());
+
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
