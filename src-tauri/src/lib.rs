@@ -1367,7 +1367,7 @@ impl VoiceEngine {
                     return Err("Parakeet is available in Voxide's CUDA build".into());
                 }
                 let model = parakeet_model_path(state)?;
-                if parakeet::model_is_installed(&model) {
+                if parakeet_model_is_verified(&model) {
                     Ok(())
                 } else {
                     Err("The Parakeet model is missing. Download it before recording.".into())
@@ -1382,7 +1382,7 @@ impl VoiceEngine {
                     return Err("Install the Nemotron CUDA runtime from Voice Engine before dictating.".into());
                 }
                 let model = nemotron_model_path(state)?;
-                if !nemotron::model_is_installed(&model) {
+                if !nemotron_model_is_verified(&model) {
                     return Err("Download the Nemotron model from Voice Engine before dictating.".into());
                 }
                 ensure_nemotron_server_script(&runtime).map(|_| ())
@@ -1655,7 +1655,7 @@ impl VoiceEngine {
                     return Err("Parakeet is available in Voxide's CUDA build".into());
                 }
                 let model = parakeet_model_path(state)?;
-                if !parakeet::model_is_installed(&model) {
+                if !parakeet_model_is_verified(&model) {
                     return Err(
                         "The Parakeet model is missing. Download it before transcribing a file."
                             .into(),
@@ -1739,7 +1739,7 @@ impl VoiceEngine {
             }
             Self::Parakeet if parakeet::is_compiled() => {
                 let model = match parakeet_model_path(state) {
-                    Ok(path) if parakeet::model_is_installed(&path) => path,
+                    Ok(path) if parakeet_model_is_verified(&path) => path,
                     _ => return,
                 };
                 let _ = tauri::async_runtime::spawn_blocking(move || {
@@ -2611,7 +2611,7 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
                 return Err("Parakeet is available in Voxide's CUDA build".into());
             }
             let model_path = parakeet_model_path(&state)?;
-            if !parakeet::model_is_installed(&model_path) {
+            if !parakeet_model_is_verified(&model_path) {
                 return Err("Download the Parakeet model before completing setup".into());
             }
         }
@@ -2624,7 +2624,7 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
                 return Err("Install the Nemotron CUDA runtime before completing setup".into());
             }
             let model = nemotron_model_path(&state)?;
-            if !nemotron::model_is_installed(&model) {
+            if !nemotron_model_is_verified(&model) {
                 return Err("Download the Nemotron model before completing setup".into());
             }
         }
@@ -3238,7 +3238,7 @@ async fn transcribe_nemotron_media_file(
     if !nemotron_runtime_is_verified(&runtime) {
         return Err("Install the Nemotron CUDA runtime before transcribing a file".into());
     }
-    if !nemotron::model_is_installed(&model) {
+    if !nemotron_model_is_verified(&model) {
         return Err("Download the Nemotron model before transcribing a file".into());
     }
     let script = ensure_nemotron_server_script(&runtime)?;
@@ -5884,7 +5884,7 @@ fn nemotron_status(state: &AppState) -> Result<VoiceModelStatus, String> {
     let model = nemotron_model_path(state)?;
     let runtime = nemotron_runtime_path(state)?;
     let runtime_installed = nemotron_runtime_is_verified(&runtime);
-    let model_installed = nemotron::model_is_installed(&model);
+    let model_installed = nemotron_model_is_verified(&model);
     let ready = nemotron::is_compiled() && runtime_installed && model_installed;
     let path = if !nemotron::is_compiled() {
         "Nemotron is included in Voxide's CUDA build for Linux/NVIDIA".into()
@@ -5986,7 +5986,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
             let path = parakeet_model_path(&state)?;
             Ok(VoiceModelStatus {
                 id: parakeet::MODEL_ID.into(),
-                installed: parakeet::is_compiled() && parakeet::model_is_installed(&path),
+                installed: parakeet::is_compiled() && parakeet_model_is_verified(&path),
                 path: if parakeet::is_compiled() {
                     path.display().to_string()
                 } else {
@@ -6370,12 +6370,12 @@ async fn download_nemotron_model(
         return Err("Nemotron is included in Voxide's CUDA build for Linux/NVIDIA. Install a CUDA build first.".into());
     }
     let runtime = nemotron_runtime_path(&state)?;
-    if !nemotron::runtime_is_installed(&runtime) {
+    if !nemotron_runtime_is_verified(&runtime) {
         return Err("Install the Nemotron CUDA runtime before downloading the model.".into());
     }
     let models = state.models_directory()?;
     let destination = nemotron::model_directory(&models);
-    if nemotron::model_is_installed(&destination) {
+    if nemotron_model_is_verified(&destination) {
         return nemotron_status(&state);
     }
     let staging = models.join(format!(
@@ -6718,6 +6718,53 @@ fn component_receipt_is_verified(
                     .map(|actual_digest| actual_digest == expected_digest)
                     .unwrap_or(false)
         })
+}
+
+/// Fast readiness check for a component that was fully hashed before atomic
+/// activation. Rehashing a multi-gigabyte speech model at every hotkey would
+/// turn a safety check into a reliability regression; ordinary readiness
+/// instead checks the immutable receipt identity and complete file inventory.
+/// `component_receipt_is_verified` remains the full-content verifier for
+/// installation and explicit integrity checks.
+fn component_receipt_is_recorded(
+    directory: &Path,
+    expected_id: &str,
+    expected_version: &str,
+    expected_files: &[&str],
+) -> bool {
+    let receipt = fs::read(directory.join(COMPONENT_RECEIPT_FILE))
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<ComponentReceipt>(&contents).ok());
+    let Some(receipt) = receipt else {
+        return false;
+    };
+    receipt.schema == COMPONENT_RECEIPT_SCHEMA
+        && receipt.id == expected_id
+        && receipt.version == expected_version
+        && receipt.files.len() == expected_files.len()
+        && expected_files
+            .iter()
+            .all(|file| receipt.files.contains_key(*file))
+}
+
+pub(crate) fn parakeet_model_is_verified(model_directory: &Path) -> bool {
+    parakeet::model_is_installed(model_directory)
+        && component_receipt_is_recorded(
+            model_directory,
+            parakeet::MODEL_ID,
+            parakeet::MODEL_ARCHIVE_SHA256,
+            parakeet::required_files(),
+        )
+}
+
+fn nemotron_model_is_verified(model_directory: &Path) -> bool {
+    nemotron::model_is_installed(model_directory)
+        && component_receipt_is_recorded(
+            model_directory,
+            nemotron::MODEL_ID,
+            nemotron::MODEL_REVISION,
+            &NEMOTRON_MODEL_FILES,
+        )
 }
 
 fn nemotron_runtime_is_verified(runtime_directory: &Path) -> bool {

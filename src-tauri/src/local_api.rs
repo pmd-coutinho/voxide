@@ -775,7 +775,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                 Ok(path) => path,
                 Err(message) => return error(StatusCode::BAD_REQUEST, message),
             };
-            if !parakeet::model_is_installed(&model_path) {
+            if !crate::parakeet_model_is_verified(&model_path) {
                 return error(
                     StatusCode::BAD_REQUEST,
                     "The Parakeet model is missing. Download it before using local API inference.",
