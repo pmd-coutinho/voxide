@@ -323,6 +323,24 @@ fn supported_extensions() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    fn spoken_fixture_path() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "voxide-spoken-fixture-{}-{}.wav",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let encoded = include_str!("../fixtures/spoken-a-espeak-ng-8khz.wav.b64").trim();
+        std::fs::write(
+            &path,
+            STANDARD
+                .decode(encoded)
+                .expect("checked-in WAV fixture should be valid base64"),
+        )
+        .expect("spoken fixture should be written");
+        path
+    }
 
     #[test]
     fn supports_common_audio_and_video_extensions() {
@@ -367,6 +385,23 @@ mod tests {
         assert_eq!(portable_audio.sample_rate, 16_000);
         assert_eq!(portable_audio.channels, 1);
         assert_eq!(portable_audio.samples.len(), 8_000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_checked_in_spoken_audio_fixture_without_ffmpeg() {
+        let path = spoken_fixture_path();
+        let audio = decode_audio_segment(&path, 0.0, 1.0)
+            .expect("checked-in spoken WAV fixture should decode");
+
+        assert_eq!(audio.sample_rate, 8_000);
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.samples.len(), 554);
+        assert_eq!(audio.duration_ms, 69);
+        assert!(
+            audio.samples.iter().any(|sample| sample.abs() > 0.1),
+            "spoken fixture must contain audible, non-silent samples"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

@@ -674,6 +674,9 @@ Run every engine adapter against a fake engine/timeline harness:
 #### Audio integration tests
 
 - Checked-in WAV fixtures with expected duration/sample count.
+- A checked-in synthetic spoken-vowel fixture verifies the built-in WAV decoder
+  without requiring FFmpeg or a text-to-speech tool at test time. It proves
+  media decoding only; it is not a substitute for a labeled ASR/WER corpus.
 - Packetized versions of those fixtures at several device rates.
 - Capture simulation with route changes and discontinuities.
 - Preview sequence recording, not only final text.
@@ -1366,7 +1369,8 @@ Completion checklist:
 - [x] Pause-heavy dictation fixture produces multiple preview updates.
 - [x] Silence-only suffix does not append preview text in the behavioral test.
 - [x] Existing final transcription tests remain green.
-- [ ] Frontend build and portable/CUDA feature builds remain green.
+- [x] Frontend build and portable Rust tests remain green.
+- [ ] CUDA feature build and runtime tests pass on the guarded NVIDIA runner.
 
 Only after this deliverable is verified should the engine lifecycle refactor or
 Parakeet Flash experiment become the active implementation focus.
