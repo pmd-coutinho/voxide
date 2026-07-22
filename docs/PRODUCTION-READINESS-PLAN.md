@@ -837,6 +837,9 @@ remove the app-owned Python/CUDA directory while capture, finalization, or the
 cache-aware sidecar is active, and intentionally leaves the separately managed
 model in place for a later runtime repair.
 
+CUDA engine settings can open only their application-owned component storage;
+custom user-supplied Whisper paths are never followed by that action.
+
 ### 11.5 Sidecar supervision
 
 Nemotron already uses a child process, but production supervision should add:

@@ -785,6 +785,9 @@ function renderVoiceEngine(): void {
   const verificationAction = (isParakeet || isNemotron) && modelStatus?.installed
     ? `<button data-action="verify-voice-engine-installation" ${verifyingVoiceEngineInstallation ? "disabled" : ""}>${verifyingVoiceEngineInstallation ? "Verifying…" : "Verify installation"}</button>`
     : "";
+  const storageAction = isParakeet || isNemotron
+    ? `<button data-action="open-voice-engine-storage">Open component storage</button>`
+    : "";
   const engineCapabilities = (engine: VoiceEngineDescriptor): string => {
     const preview = engine.previewMode === "incremental"
       ? "Live streaming preview"
@@ -803,7 +806,7 @@ function renderVoiceEngine(): void {
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
       ${isParakeet || isNemotron ? "" : microphoneInput}
-      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}${verificationAction}</div>
+      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}${verificationAction}${storageAction}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
     </section>`);
@@ -2542,6 +2545,14 @@ async function handleAction(element: HTMLElement): Promise<void> {
         render();
       } catch (error) {
         showNotice(`Could not remove the Nemotron CUDA runtime: ${String(error)}`);
+      }
+      break;
+    }
+    case "open-voice-engine-storage": {
+      try {
+        await invoke("open_voice_engine_storage");
+      } catch (error) {
+        showNotice(`Could not open component storage: ${String(error)}`);
       }
       break;
     }

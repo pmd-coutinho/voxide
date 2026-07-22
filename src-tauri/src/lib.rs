@@ -6252,6 +6252,41 @@ async fn remove_nemotron_cuda_runtime(
     nemotron_status(&state)
 }
 
+/// Open only an application-owned component directory; this command never
+/// follows a custom Whisper model path supplied by the user.
+#[tauri::command]
+fn open_voice_engine_storage(state: State<'_, AppState>) -> Result<(), String> {
+    let engine = state
+        .database
+        .lock()
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?
+        .settings
+        .selected_voice_engine;
+    let directory = match engine {
+        VoiceEngine::Parakeet => {
+            let model = parakeet_model_path(&state)?;
+            if model.is_dir() {
+                model
+            } else {
+                state.models_directory()?
+            }
+        }
+        VoiceEngine::Nemotron => {
+            let runtime = nemotron_runtime_path(&state)?;
+            if runtime.is_dir() {
+                runtime
+            } else {
+                state.data_directory()?
+            }
+        }
+        VoiceEngine::Whisper | VoiceEngine::Cloud | VoiceEngine::AppleSpeech => {
+            state.models_directory()?
+        }
+    };
+    tauri_plugin_opener::open_path(&directory, None::<&str>)
+        .map_err(|error| format!("Could not open the component storage location: {error}"))
+}
+
 #[tauri::command]
 async fn install_nemotron_cuda_runtime(
     app: AppHandle,
@@ -9489,6 +9524,7 @@ pub fn run() {
             download_parakeet_model,
             install_nemotron_cuda_runtime,
             remove_nemotron_cuda_runtime,
+            open_voice_engine_storage,
             download_nemotron_model,
             start_native_dictation,
             stop_native_dictation,
