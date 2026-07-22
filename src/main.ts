@@ -481,6 +481,7 @@ let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
 let voiceEngineAvailability: VoiceEngineAvailability = { engines: [] };
 let modelDownloadProgress: ModelDownloadProgress | undefined;
+let verifyingVoiceEngineInstallation = false;
 let audioDevices: string[] = [];
 let providers: AiProviderView[] = [];
 let editingProviderId: string | undefined;
@@ -781,6 +782,9 @@ function renderVoiceEngine(): void {
           ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
           : `${modelStatus?.installed ? "" : `<button data-action="download-nemotron-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Nemotron model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-nemotron-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`)
     : "";
+  const verificationAction = (isParakeet || isNemotron) && modelStatus?.installed
+    ? `<button data-action="verify-voice-engine-installation" ${verifyingVoiceEngineInstallation ? "disabled" : ""}>${verifyingVoiceEngineInstallation ? "Verifying…" : "Verify installation"}</button>`
+    : "";
   const engineCapabilities = (engine: VoiceEngineDescriptor): string => {
     const preview = engine.previewMode === "incremental"
       ? "Live streaming preview"
@@ -799,7 +803,7 @@ function renderVoiceEngine(): void {
       ${engineConfiguration}
       ${isWhisper || isCloud || isNemotron ? `<label>Recognition language<input id="language" value="${escapeHtml(database.settings.language)}" placeholder="en"><small>Use auto, a language code such as pt, or a locale such as pt-PT. Nemotron uses this as a language prompt.</small></label>` : ""}
       ${isParakeet || isNemotron ? "" : microphoneInput}
-      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}</div>
+      <div class="button-row"><button class="primary" data-action="save-engine">Save voice engine</button>${modelActions}${verificationAction}</div>
       ${downloadDetail ? `<p class="muted">Download progress: ${escapeHtml(downloadDetail)}</p>` : ""}
       ${modelStatus ? `<small class="muted">${escapeHtml(modelStatus.path)}</small>` : ""}
     </section>`);
@@ -2553,6 +2557,20 @@ async function handleAction(element: HTMLElement): Promise<void> {
         render();
       } catch (error) {
         showNotice(`Could not remove Nemotron: ${String(error)}`);
+      }
+      break;
+    }
+    case "verify-voice-engine-installation": {
+      verifyingVoiceEngineInstallation = true;
+      render();
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("verify_voice_engine_installation");
+        showNotice("Installation verified against its recorded component digests.");
+      } catch (error) {
+        showNotice(`Installation verification failed: ${String(error)}`);
+      } finally {
+        verifyingVoiceEngineInstallation = false;
+        render();
       }
       break;
     }

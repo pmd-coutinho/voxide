@@ -826,6 +826,12 @@ recursively removes arbitrary application-data directories.
   actions.
 - Report actual GPU/provider selection in diagnostics.
 
+Current implementation: CUDA engine settings expose an explicit `Verify
+installation` action. It rehashes the runtime/model artifacts against their
+component receipts only when requested, while ordinary recording readiness uses
+the verified install receipt and required-file inventory so it does not block a
+hotkey by hashing multi-gigabyte model weights.
+
 ### 11.5 Sidecar supervision
 
 Nemotron already uses a child process, but production supervision should add:

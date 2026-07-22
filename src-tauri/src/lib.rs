@@ -6000,6 +6000,74 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
     }
 }
 
+/// Rehash CUDA components only on explicit user request. Normal recording
+/// readiness relies on the receipt written after install so a 2.6 GB model
+/// never delays a hotkey; this command provides the deliberate repair check.
+#[tauri::command]
+async fn verify_voice_engine_installation(
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    let settings = state
+        .database
+        .lock()
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?
+        .settings
+        .clone();
+    match settings.selected_voice_engine {
+        VoiceEngine::Parakeet => {
+            if !parakeet::is_compiled() {
+                return Err("Parakeet is available in Voxide's CUDA build".into());
+            }
+            let model = parakeet_model_path(&state)?;
+            let verified = tauri::async_runtime::spawn_blocking(move || {
+                parakeet::model_is_installed(&model)
+                    && component_receipt_is_verified(
+                        &model,
+                        parakeet::MODEL_ID,
+                        parakeet::MODEL_ARCHIVE_SHA256,
+                    )
+            })
+            .await
+            .map_err(|error| format!("Parakeet verification task failed: {error}"))?;
+            if !verified {
+                return Err(
+                    "Parakeet verification failed. Download the model again to repair it.".into(),
+                );
+            }
+        }
+        VoiceEngine::Nemotron => {
+            if !nemotron::is_compiled() {
+                return Err("Nemotron is available in Voxide's CUDA build for Linux/NVIDIA".into());
+            }
+            let runtime = nemotron_runtime_path(&state)?;
+            let model = nemotron_model_path(&state)?;
+            let verified = tauri::async_runtime::spawn_blocking(move || {
+                nemotron::runtime_is_installed(&runtime)
+                    && component_receipt_is_verified(
+                        &runtime,
+                        NEMOTRON_RUNTIME_ID,
+                        NEMOTRON_RUNTIME_VERSION,
+                    )
+                    && nemotron::model_is_installed(&model)
+                    && component_receipt_is_verified(
+                        &model,
+                        nemotron::MODEL_ID,
+                        nemotron::MODEL_REVISION,
+                    )
+            })
+            .await
+            .map_err(|error| format!("Nemotron verification task failed: {error}"))?;
+            if !verified {
+                return Err("Nemotron verification failed. Reinstall the CUDA runtime or download the model again to repair it.".into());
+            }
+        }
+        VoiceEngine::Whisper | VoiceEngine::Cloud | VoiceEngine::AppleSpeech => {
+            return voice_model_status(state);
+        }
+    }
+    voice_model_status(state)
+}
+
 #[tauri::command]
 fn voice_engine_availability() -> VoiceEngineAvailability {
     VoiceEngineAvailability {
@@ -9292,6 +9360,7 @@ pub fn run() {
             replace_selected_text,
             usage_stats,
             voice_model_status,
+            verify_voice_engine_installation,
             voice_engine_availability,
             delete_whisper_model,
             delete_parakeet_model,
