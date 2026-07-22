@@ -504,6 +504,11 @@ src-tauri/src/components/
 The exact layout is flexible; the important goal is to move engine and session
 logic out of `lib.rs` without a behavior-changing big-bang rewrite.
 
+The current incremental boundary is `asr.rs` for the shared capability
+contract and `asr_adapter.rs` for live preparation, session reservation,
+preview, final, file, and preload dispatch. Command handlers retain only
+session admission, capture ownership, and post-processing.
+
 ### 8.2 Coordinator behavior
 
 - Resolve a complete immutable session configuration at record start.
