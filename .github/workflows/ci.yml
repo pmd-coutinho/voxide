@@ -56,3 +56,43 @@ jobs:
       - name: Compile portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 build --release --no-default-features
+
+  rust-macos:
+    name: Rust portable checks (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo +1.89 fmt --check
+      - name: Run portable Rust tests
+        working-directory: src-tauri
+        run: cargo +1.89 test --lib --no-default-features
+      - name: Lint portable Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
+      - name: Compile portable Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 build --release --no-default-features
+
+  rust-windows:
+    name: Rust portable checks (Windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo +1.89 fmt --check
+      - name: Run portable Rust tests
+        working-directory: src-tauri
+        run: cargo +1.89 test --lib --no-default-features
+      - name: Lint portable Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
+      - name: Compile portable Rust target
+        working-directory: src-tauri
+        run: cargo +1.89 build --release --no-default-features
