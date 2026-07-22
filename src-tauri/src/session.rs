@@ -14,6 +14,7 @@ pub enum SessionState {
 pub struct Coordinator {
     next_id: u64,
     state: SessionState,
+    preview_in_flight: Option<u64>,
 }
 
 impl Default for SessionState {
@@ -46,12 +47,33 @@ impl Coordinator {
         }
     }
 
+    /// Admits at most one display-only preview task for the active recording.
+    /// Finalization changes the state before it begins final inference, so no
+    /// newly admitted preview can delay or overwrite a terminal result.
+    pub fn begin_preview(&mut self, id: u64) -> bool {
+        if self.state != (SessionState::Recording { id }) || self.preview_in_flight.is_some() {
+            return false;
+        }
+        self.preview_in_flight = Some(id);
+        true
+    }
+
+    pub fn finish_preview(&mut self, id: u64) -> bool {
+        if self.preview_in_flight == Some(id) {
+            self.preview_in_flight = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cancel(&mut self, id: u64) -> bool {
         match self.state {
             SessionState::Recording { id: active } | SessionState::Finalizing { id: active }
                 if active == id =>
             {
                 self.state = SessionState::Idle;
+                self.preview_in_flight = None;
                 true
             }
             _ => false,
@@ -61,6 +83,7 @@ impl Coordinator {
     pub fn finish(&mut self, id: u64) -> bool {
         if self.state == (SessionState::Finalizing { id }) {
             self.state = SessionState::Idle;
+            self.preview_in_flight = None;
             true
         } else {
             false
@@ -92,5 +115,17 @@ mod tests {
         assert!(coordinator.cancel(id));
         assert!(!coordinator.begin_finalizing(id));
         assert!(!coordinator.finish(id));
+    }
+
+    #[test]
+    fn finalization_stops_new_previews_without_waiting_for_the_old_one() {
+        let mut coordinator = Coordinator::default();
+        let id = coordinator.start().expect("session starts");
+        assert!(coordinator.begin_preview(id));
+        assert!(!coordinator.begin_preview(id));
+        assert!(coordinator.begin_finalizing(id));
+        assert!(!coordinator.begin_preview(id));
+        assert!(coordinator.finish_preview(id));
+        assert!(coordinator.finish(id));
     }
 }

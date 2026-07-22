@@ -1458,6 +1458,20 @@ impl Default for NativeCaptureState {
     }
 }
 
+fn begin_preview(capture_state: &NativeCaptureState, session_id: u64) -> bool {
+    capture_state
+        .session
+        .lock()
+        .map(|mut coordinator| coordinator.begin_preview(session_id))
+        .unwrap_or(false)
+}
+
+fn finish_preview(capture_state: &NativeCaptureState, session_id: u64) {
+    if let Ok(mut coordinator) = capture_state.session.lock() {
+        coordinator.finish_preview(session_id);
+    }
+}
+
 /// Ensures finalization cannot leave the coordinator stuck when any later
 /// transcription, post-processing, or insertion step returns an error.
 struct FinishDictationSession {
@@ -6476,6 +6490,9 @@ fn spawn_live_whisper_preview(
                 Ok(samples) => samples,
                 Err(_) => continue,
             };
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
             let model_path = model_path.clone();
             let vad_model = vad_model.clone();
             let language = language.clone();
@@ -6495,6 +6512,7 @@ fn spawn_live_whisper_preview(
             .await
             .map_err(|error| format!("preview task failed: {error}"))
             .and_then(|result| result);
+            finish_preview(&capture_state, preview_generation);
             interval = transcription_started
                 .elapsed()
                 .mul_f32(1.5)
@@ -6599,6 +6617,9 @@ fn spawn_live_parakeet_preview(
             if samples.len() < MINIMUM_PREVIEW_SAMPLES {
                 continue;
             }
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
             let sample_count = samples.len();
             let started = Instant::now();
             let model_path = model_path.clone();
@@ -6608,6 +6629,7 @@ fn spawn_live_parakeet_preview(
             .await
             .map_err(|error| format!("preview task failed: {error}"))
             .and_then(|result| result);
+            finish_preview(&capture_state, preview_generation);
             let elapsed = started.elapsed();
             skip_next_snapshot = elapsed > PREVIEW_INTERVAL;
             let capture_state = app.state::<NativeCaptureState>();
@@ -6868,6 +6890,9 @@ fn spawn_live_cloud_preview(
                 Ok(wav) => wav,
                 Err(_) => continue,
             };
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
             let partial = tokio::time::timeout(
                 Duration::from_secs(20),
                 provider::transcribe_openai_compatible_audio(
@@ -6881,6 +6906,7 @@ fn spawn_live_cloud_preview(
             .await
             .ok()
             .and_then(Result::ok);
+            finish_preview(&capture_state, preview_generation);
             if let Some(partial) = partial.filter(|partial| !partial.trim().is_empty()) {
                 let capture_state = app.state::<NativeCaptureState>();
                 if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation {
@@ -6924,6 +6950,9 @@ fn spawn_live_apple_speech_preview(
                 Ok(samples) => samples,
                 Err(_) => continue,
             };
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
             let language = language.clone();
             let custom_words = custom_words.clone();
             let partial = tokio::time::timeout(
@@ -6936,6 +6965,7 @@ fn spawn_live_apple_speech_preview(
             .ok()
             .and_then(Result::ok)
             .and_then(Result::ok);
+            finish_preview(&capture_state, preview_generation);
             if let Some(partial) = partial.filter(|partial| !partial.trim().is_empty()) {
                 let capture_state = app.state::<NativeCaptureState>();
                 if capture_state.preview_generation.load(Ordering::SeqCst) == preview_generation {
