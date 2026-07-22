@@ -7475,11 +7475,18 @@ fn spawn_live_whisper_preview(
 }
 
 /// Mirrors FluidVoice's Parakeet TDT v2 preview cadence. TDT is an offline
-/// model, so every snapshot is a fresh decode of the complete capture—not
-/// VAD-sliced audio and not a stateful streaming decoder. Voxide additionally
-/// hides the timestamped, still-tentative tail of each CUDA hypothesis before
-/// showing it, because Sherpa's INT8 ONNX decoder can otherwise invent words
-/// at the live endpoint that disappear in the final full decode.
+/// model, so each snapshot is a fresh decode—not VAD-sliced audio and not a
+/// stateful streaming decoder. The decode is bounded to a trailing window
+/// (like the cloud preview) rather than the whole capture: re-decoding a
+/// growing recording every tick is O(total) work that holds `INFERENCE_LOCK`
+/// progressively longer and starves the final decode. The overlay only shows
+/// the recent tail anyway, and `fluidvoice_preview_reconcile` gracefully falls
+/// back to current-only text once the window slides past the recording start,
+/// so bounding the window costs no visible context. The authoritative final
+/// pass still decodes the complete capture. Voxide additionally hides the
+/// timestamped, still-tentative tail of each CUDA hypothesis before showing
+/// it, because Sherpa's INT8 ONNX decoder can otherwise invent words at the
+/// live endpoint that disappear in the final full decode.
 fn spawn_live_parakeet_preview(
     app: AppHandle,
     preview_generation: u64,
@@ -7491,6 +7498,10 @@ fn spawn_live_parakeet_preview(
     tauri::async_runtime::spawn(async move {
         const PREVIEW_INTERVAL: Duration = Duration::from_millis(600);
         const MINIMUM_PREVIEW_SAMPLES: usize = audio::WHISPER_SAMPLE_RATE as usize;
+        // Trailing audio window each preview decodes. Bounds per-tick cost so a
+        // long recording cannot grow the decode (and its `INFERENCE_LOCK` hold)
+        // without limit; matches the cloud preview's window.
+        const PARAKEET_PREVIEW_WINDOW: Duration = Duration::from_secs(20);
 
         let mut skip_next_snapshot = false;
         loop {
@@ -7507,7 +7518,9 @@ fn spawn_live_parakeet_preview(
             let captured = capture_state.capture.lock().ok().and_then(|capture| {
                 capture
                     .as_ref()
-                    .and_then(|capture| capture.snapshot_all().ok())
+                    // Bound preview decode cost to a recent window instead of
+                    // the whole (growing) capture, matching the cloud preview.
+                    .and_then(|capture| capture.snapshot_recent(PARAKEET_PREVIEW_WINDOW).ok())
             });
             let Some(captured) = captured else {
                 return;
