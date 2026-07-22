@@ -1419,6 +1419,7 @@ impl AppState {
 
 struct NativeCaptureState {
     capture: Mutex<Option<audio::AudioCapture>>,
+    capture_started_at: Mutex<Option<Instant>>,
     session: Arc<Mutex<session::Coordinator>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
@@ -1431,6 +1432,7 @@ impl Default for NativeCaptureState {
     fn default() -> Self {
         Self {
             capture: Mutex::new(None),
+            capture_started_at: Mutex::new(None),
             session: Arc::new(Mutex::new(session::Coordinator::default())),
             context: Mutex::new(DictationContext::default()),
             continuous_context: Mutex::new(ContinuousDictationContext::default()),
@@ -6050,10 +6052,6 @@ fn start_native_dictation(
             "Could not apply dictation overlay layout: {error}"
         ));
     }
-    debug_log::append(&format!(
-        "Dictation capture started (engine: {:?}, streaming preview: {})",
-        settings.selected_voice_engine, settings.enable_streaming_preview
-    ));
     let preview_generation = capture_state
         .session
         .lock()
@@ -6108,8 +6106,18 @@ fn start_native_dictation(
     };
     let sample_rate = started.sample_rate();
     let channels = started.channels();
+    let mut capture_started_at = capture_state
+        .capture_started_at
+        .lock()
+        .map_err(|_| "Dictation capture timing lock was poisoned".to_string())?;
     *capture = Some(started);
+    *capture_started_at = Some(Instant::now());
+    drop(capture_started_at);
     drop(capture);
+    debug_log::append(&format!(
+        "Dictation capture started (session: {preview_generation}, engine: {:?}, streaming_preview: {}, sample_rate: {sample_rate}, channels: {channels})",
+        settings.selected_voice_engine, settings.enable_streaming_preview
+    ));
     update_tray_status(&app, TrayVisualState::Recording);
     if matches!(&settings.selected_voice_engine, VoiceEngine::Parakeet) {
         *capture_state
@@ -6924,6 +6932,11 @@ async fn stop_native_dictation(
         .map_err(|_| "Audio capture lock was poisoned".to_string())?
         .take()
         .ok_or("Dictation is not recording")?;
+    let capture_started_at = capture_state
+        .capture_started_at
+        .lock()
+        .map_err(|_| "Dictation capture timing lock was poisoned".to_string())?
+        .take();
     let finalizing = capture_state
         .session
         .lock()
@@ -6944,8 +6957,12 @@ async fn stop_native_dictation(
     update_tray_status(&app, TrayVisualState::Processing);
     let _reset_tray = ResetTrayWhenDropped { app: app.clone() };
     let (captured, capture_health) = capture.finish_with_health()?;
+    let wall_duration_ms = capture_started_at
+        .map(|started_at| started_at.elapsed().as_millis() as u64)
+        .unwrap_or(captured.duration_ms);
     debug_log::append(&format!(
-        "Capture health (session: {recording_generation}, callbacks: {}, input_samples: {}, accepted_samples: {}, dropped_samples: {}, overflow_blocks: {}, ring_high_water_samples: {}, canonical_samples: {}, stream_errors: {})",
+        "Capture health (session: {recording_generation}, wall_duration_ms: {wall_duration_ms}, canonical_duration_ms: {}, callbacks: {}, input_samples: {}, accepted_samples: {}, dropped_samples: {}, overflow_blocks: {}, ring_high_water_samples: {}, canonical_samples: {}, stream_errors: {})",
+        captured.duration_ms,
         capture_health.callback_blocks,
         capture_health.input_samples,
         capture_health.accepted_samples,
@@ -7675,6 +7692,10 @@ fn cancel_native_dictation(
         .take();
     let cancelled = capture.is_some();
     if cancelled {
+        let _ = capture_state
+            .capture_started_at
+            .lock()
+            .map(|mut started_at| started_at.take());
         let _ = capture_state
             .session
             .lock()
