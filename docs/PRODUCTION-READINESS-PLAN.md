@@ -526,6 +526,8 @@ The regression tests also prove an old failure cannot roll back a newer session.
 Focused-window context and preceding text are cleared whenever finalization
 leaves scope, including failure paths, and capture-device failure uses the same
 generation guard before it cleans up.
+Saving settings now rejects a selected-engine change while the coordinator is
+recording or finalizing, while allowing unrelated preferences to be saved.
 
 ### 8.3 Model readiness
 

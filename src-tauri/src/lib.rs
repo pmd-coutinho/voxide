@@ -2039,6 +2039,19 @@ fn finish_preview(capture_state: &NativeCaptureState, session_id: u64) {
     }
 }
 
+fn validate_voice_engine_switch(
+    current: VoiceEngine,
+    requested: VoiceEngine,
+    coordinator: &session::Coordinator,
+) -> Result<(), String> {
+    if current != requested && !coordinator.is_idle() {
+        return Err(
+            "Stop or cancel the current dictation before changing the voice engine.".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Invalidates only the specified generation. A stale startup failure must not
 /// suppress previews from a newer recording that has already replaced it.
 fn invalidate_preview_generation(capture_state: &NativeCaptureState, session_id: u64) -> bool {
@@ -2500,25 +2513,55 @@ fn launched_from_autostart(arguments: impl IntoIterator<Item = String>) -> bool 
 fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
+    capture_state: State<'_, NativeCaptureState>,
     settings: Settings,
 ) -> Result<Settings, String> {
-    let (previous_analytics_enabled, previous_audio_history_budget_gb) = state
-        .database
-        .lock()
-        .map(|database| {
-            (
-                database.settings.share_anonymous_analytics,
-                database.settings.audio_history_budget_gb,
-            )
-        })
-        .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+    let (previous_analytics_enabled, previous_audio_history_budget_gb, previous_voice_engine) =
+        state
+            .database
+            .lock()
+            .map(|database| {
+                (
+                    database.settings.share_anonymous_analytics,
+                    database.settings.audio_history_budget_gb,
+                    database.settings.selected_voice_engine,
+                )
+            })
+            .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+    if previous_voice_engine != settings.selected_voice_engine {
+        let coordinator = capture_state
+            .session
+            .lock()
+            .map_err(|_| "Dictation session lock was poisoned".to_string())?;
+        validate_voice_engine_switch(
+            previous_voice_engine,
+            settings.selected_voice_engine,
+            &coordinator,
+        )?;
+    }
     apply_launch_at_startup(&app, settings.launch_at_startup)?;
     apply_taskbar_visibility(&app, settings.show_in_dock)?;
-    let saved = state.update(|database| {
-        database.settings = settings.clone();
-        normalize_database(database);
-        database.settings.clone()
-    })?;
+    let save = || {
+        state.update(|database| {
+            database.settings = settings.clone();
+            normalize_database(database);
+            database.settings.clone()
+        })
+    };
+    let saved = if previous_voice_engine != settings.selected_voice_engine {
+        let coordinator = capture_state
+            .session
+            .lock()
+            .map_err(|_| "Dictation session lock was poisoned".to_string())?;
+        validate_voice_engine_switch(
+            previous_voice_engine,
+            settings.selected_voice_engine,
+            &coordinator,
+        )?;
+        save()?
+    } else {
+        save()?
+    };
     if let Err(error) = apply_overlay_window_layout(&app, &saved) {
         debug_log::append(&format!("Could not apply updated overlay layout: {error}"));
     }
@@ -9718,6 +9761,35 @@ mod tests {
         assert!(context.source_window_title.is_none());
         assert!(context.prompt_profile_id.is_none());
         assert!(context.preceding_text.is_empty());
+    }
+
+    #[test]
+    fn voice_engine_switch_is_rejected_while_a_session_is_active() {
+        let mut coordinator = session::Coordinator::default();
+        assert!(validate_voice_engine_switch(
+            VoiceEngine::Whisper,
+            VoiceEngine::Cloud,
+            &coordinator
+        )
+        .is_ok());
+        let session_id = coordinator.start().expect("session starts");
+        assert_eq!(
+            validate_voice_engine_switch(VoiceEngine::Whisper, VoiceEngine::Cloud, &coordinator)
+                .expect_err("engine switch must be rejected"),
+            "Stop or cancel the current dictation before changing the voice engine."
+        );
+        assert!(
+            validate_voice_engine_switch(VoiceEngine::Whisper, VoiceEngine::Whisper, &coordinator)
+                .is_ok(),
+            "saving unrelated settings remains allowed"
+        );
+        assert!(coordinator.cancel(session_id));
+        assert!(validate_voice_engine_switch(
+            VoiceEngine::Whisper,
+            VoiceEngine::Cloud,
+            &coordinator
+        )
+        .is_ok());
     }
 
     #[test]
