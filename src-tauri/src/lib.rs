@@ -1613,6 +1613,157 @@ impl VoiceEngine {
             }
         }
     }
+
+    /// File transcription shares the same selected-engine adapter as live
+    /// dictation, but intentionally keeps its independent media decoding and
+    /// progress semantics. The command layer receives only a final result.
+    async fn transcribe_file(
+        self,
+        state: &AppState,
+        settings: &Settings,
+        path: PathBuf,
+        custom_words: Vec<String>,
+        progress: speech::ProgressCallback,
+    ) -> Result<(String, u64), String> {
+        match self {
+            Self::Whisper => {
+                let model = whisper_model_path(settings, state)?;
+                if !valid_whisper_model_file(&model) {
+                    return Err("The selected Whisper model is missing, empty, or invalid. Download it again before transcribing a file.".into());
+                }
+                let language = settings.language.clone();
+                let vad_model = vad_model_path(state);
+                let beam_size = settings.whisper_beam_size;
+                tauri::async_runtime::spawn_blocking(move || {
+                    speech::transcribe_media_file(
+                        &path,
+                        &model,
+                        vad_model.as_deref(),
+                        &language,
+                        &custom_words,
+                        beam_size,
+                        Some(progress),
+                    )
+                })
+                .await
+                .map_err(|error| format!("File transcription task failed: {error}"))?
+            }
+            Self::Parakeet => {
+                if !parakeet::is_compiled() {
+                    return Err("Parakeet is available in Voxide's CUDA build".into());
+                }
+                let model = parakeet_model_path(state)?;
+                if !parakeet::model_is_installed(&model) {
+                    return Err(
+                        "The Parakeet model is missing. Download it before transcribing a file."
+                            .into(),
+                    );
+                }
+                tauri::async_runtime::spawn_blocking(move || {
+                    parakeet::transcribe_media_file(&path, &model, Some(progress))
+                })
+                .await
+                .map_err(|error| format!("Parakeet file transcription task failed: {error}"))?
+            }
+            Self::Nemotron => {
+                transcribe_nemotron_media_file(
+                    state,
+                    &path,
+                    &settings.language,
+                    settings.nemotron_streaming_mode.lookahead_tokens(),
+                    Some(progress),
+                )
+                .await
+            }
+            Self::Cloud => {
+                let profile = {
+                    let database = state
+                        .database
+                        .lock()
+                        .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+                    selected_provider(&database, None)?
+                };
+                let api_key = provider_api_key(&profile.id)?;
+                provider::transcribe_openai_compatible_media(
+                    &profile,
+                    api_key.as_deref(),
+                    &settings.cloud_transcription_model,
+                    &settings.language,
+                    &path,
+                    Some(progress),
+                )
+                .await
+            }
+            Self::AppleSpeech => {
+                let language = settings.apple_speech_locale.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    transcribe_apple_media_file(&path, &language, &custom_words, Some(progress))
+                })
+                .await
+                .map_err(|error| format!("Apple Speech task failed: {error}"))?
+            }
+        }
+    }
+
+    /// Best-effort warm-up for the selected local engine. It never changes
+    /// readiness or selection: a failed preload is merely recorded and the
+    /// regular adapter still performs its normal validation on use.
+    async fn preload(self, state: &AppState, settings: &Settings, vocabulary: Vec<String>) {
+        match self {
+            Self::Whisper => {
+                ensure_vad_model(state).await;
+                let vad = vad_model_path(state);
+                let model = match whisper_model_path(settings, state) {
+                    Ok(path) if path.is_file() => path,
+                    _ => return,
+                };
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    if let Some(vad) = vad {
+                        match speech::preload_vad(&vad) {
+                            Ok(()) => debug_log::append("Whisper VAD model preloaded"),
+                            Err(error) => {
+                                debug_log::append(&format!("Whisper VAD preload failed: {error}"))
+                            }
+                        }
+                    }
+                    match speech::preload_whisper(&model) {
+                        Ok(()) => debug_log::append("Whisper model preloaded"),
+                        Err(error) => {
+                            debug_log::append(&format!("Whisper preload failed: {error}"))
+                        }
+                    }
+                })
+                .await;
+            }
+            Self::Parakeet if parakeet::is_compiled() => {
+                let model = match parakeet_model_path(state) {
+                    Ok(path) if parakeet::model_is_installed(&path) => path,
+                    _ => return,
+                };
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    match parakeet::preload(&model) {
+                        Ok(()) => debug_log::append("Parakeet CUDA preview model preloaded"),
+                        Err(error) => debug_log::append(&format!(
+                            "Parakeet preview preload failed: {error}"
+                        )),
+                    }
+                    if vocabulary.is_empty() {
+                        return;
+                    }
+                    match parakeet::preload_with_vocabulary(&model, &vocabulary) {
+                        Ok(()) => {
+                            debug_log::append("Parakeet CUDA vocabulary final model preloaded")
+                        }
+                        Err(error) => debug_log::append(&format!(
+                            "Parakeet vocabulary preload failed; final dictation will fall back if needed: {error}"
+                        )),
+                    }
+                })
+                .await;
+            }
+            Self::Parakeet | Self::Nemotron | Self::Cloud | Self::AppleSpeech => {}
+        }
+    }
 }
 
 struct EngineFinalTranscript {
@@ -3156,85 +3307,10 @@ async fn transcribe_file(
             },
         );
     });
-    let (raw_text, duration_ms) = match settings.selected_voice_engine {
-        VoiceEngine::Whisper => {
-            let model_path = whisper_model_path(&settings, &state)?;
-            if !valid_whisper_model_file(&model_path) {
-                return Err("The selected Whisper model is missing, empty, or invalid. Download it again before transcribing a file.".into());
-            }
-            let language = settings.language.clone();
-            let media_path = path.clone();
-            let vad_model = vad_model_path(&state);
-            tauri::async_runtime::spawn_blocking(move || {
-                speech::transcribe_media_file(
-                    &media_path,
-                    &model_path,
-                    vad_model.as_deref(),
-                    &language,
-                    &custom_words,
-                    settings.whisper_beam_size,
-                    Some(progress),
-                )
-            })
-            .await
-            .map_err(|error| format!("File transcription task failed: {error}"))??
-        }
-        VoiceEngine::Parakeet => {
-            if !parakeet::is_compiled() {
-                return Err("Parakeet is available in Voxide's CUDA build".into());
-            }
-            let model_path = parakeet_model_path(&state)?;
-            if !parakeet::model_is_installed(&model_path) {
-                return Err(
-                    "The Parakeet model is missing. Download it before transcribing a file.".into(),
-                );
-            }
-            let media_path = path.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                parakeet::transcribe_media_file(&media_path, &model_path, Some(progress))
-            })
-            .await
-            .map_err(|error| format!("Parakeet file transcription task failed: {error}"))??
-        }
-        VoiceEngine::Nemotron => {
-            transcribe_nemotron_media_file(
-                &state,
-                &path,
-                &settings.language,
-                settings.nemotron_streaming_mode.lookahead_tokens(),
-                Some(progress),
-            )
-            .await?
-        }
-        VoiceEngine::Cloud => {
-            let profile = {
-                let database = state
-                    .database
-                    .lock()
-                    .map_err(|_| "Voxide data lock was poisoned".to_string())?;
-                selected_provider(&database, None)?
-            };
-            let api_key = provider_api_key(&profile.id)?;
-            provider::transcribe_openai_compatible_media(
-                &profile,
-                api_key.as_deref(),
-                &settings.cloud_transcription_model,
-                &settings.language,
-                &path,
-                Some(progress),
-            )
-            .await?
-        }
-        VoiceEngine::AppleSpeech => {
-            let language = settings.apple_speech_locale.clone();
-            let media_path = path.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                transcribe_apple_media_file(&media_path, &language, &custom_words, Some(progress))
-            })
-            .await
-            .map_err(|error| format!("Apple Speech task failed: {error}"))??
-        }
-    };
+    let (raw_text, duration_ms) = settings
+        .selected_voice_engine
+        .transcribe_file(&state, &settings, path.clone(), custom_words, progress)
+        .await?;
     // Meeting/file transcription is intentionally separate from live
     // dictation. Voxide returns the ASR provider's file result directly,
     // without applying dictation formatting, dictionary replacement, or an
@@ -8794,72 +8870,18 @@ pub fn run() {
                 // not pay model-load latency. Whisper additionally fetches
                 // its VAD model; FluidVoice-style Parakeet does not use it.
                 let state = preload_handle.state::<AppState>();
-                let Ok((settings, vocabulary)) = state
-                    .database
-                    .lock()
-                    .map(|database| {
-                        let settings = database.settings.clone();
-                        let vocabulary =
-                            active_recognition_vocabulary(&settings, &database.custom_words);
-                        (settings, vocabulary)
-                    })
-                else {
+                let Ok((settings, vocabulary)) = state.database.lock().map(|database| {
+                    let settings = database.settings.clone();
+                    let vocabulary =
+                        active_recognition_vocabulary(&settings, &database.custom_words);
+                    (settings, vocabulary)
+                }) else {
                     return;
                 };
-                match settings.selected_voice_engine {
-                    VoiceEngine::Whisper => {
-                        ensure_vad_model(&state).await;
-                        let vad = vad_model_path(&state);
-                        let model = match whisper_model_path(&settings, &state) {
-                            Ok(path) if path.is_file() => path,
-                            _ => return,
-                        };
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            if let Some(vad) = vad {
-                                match speech::preload_vad(&vad) {
-                                    Ok(()) => debug_log::append("Whisper VAD model preloaded"),
-                                    Err(error) => debug_log::append(&format!(
-                                        "Whisper VAD preload failed: {error}"
-                                    )),
-                                }
-                            }
-                            match speech::preload_whisper(&model) {
-                                Ok(()) => debug_log::append("Whisper model preloaded"),
-                                Err(error) => {
-                                    debug_log::append(&format!("Whisper preload failed: {error}"))
-                                }
-                            }
-                        })
-                        .await;
-                    }
-                    VoiceEngine::Parakeet if parakeet::is_compiled() => {
-                        let model = match parakeet_model_path(&state) {
-                            Ok(path) if parakeet::model_is_installed(&path) => path,
-                            _ => return,
-                        };
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            match parakeet::preload(&model) {
-                                Ok(()) => debug_log::append("Parakeet CUDA preview model preloaded"),
-                                Err(error) => debug_log::append(&format!(
-                                    "Parakeet preview preload failed: {error}"
-                                )),
-                            }
-                            if vocabulary.is_empty() {
-                                return;
-                            }
-                            match parakeet::preload_with_vocabulary(&model, &vocabulary) {
-                                Ok(()) => debug_log::append(
-                                    "Parakeet CUDA vocabulary final model preloaded",
-                                ),
-                                Err(error) => debug_log::append(&format!(
-                                    "Parakeet vocabulary preload failed; final dictation will fall back if needed: {error}"
-                                )),
-                            }
-                        })
-                        .await;
-                    }
-                    _ => {}
-                }
+                settings
+                    .selected_voice_engine
+                    .preload(&state, &settings, vocabulary)
+                    .await;
             });
             let capture_prewarm_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
