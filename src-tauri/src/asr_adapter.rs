@@ -428,3 +428,51 @@ impl VoiceEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_openai_compatible_cloud_engine_prepares_without_a_key_or_network() {
+        let mut database = AppDatabase::default();
+        database.settings.selected_voice_engine = VoiceEngine::Cloud;
+        database.settings.selected_ai_provider = "ollama".into();
+        database.settings.cloud_transcription_model = "whisper-1".into();
+        let state = AppState {
+            database: Mutex::new(database.clone()),
+            path: std::env::temp_dir().join(format!(
+                "voxide-asr-adapter-test-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        };
+
+        VoiceEngine::Cloud
+            .prepare_live_capture(&database.settings, &state)
+            .expect("local OpenAI-compatible endpoints do not require a key at capture start");
+    }
+
+    #[test]
+    fn parakeet_reservation_resets_adapter_state_for_the_admitted_generation() {
+        let capture_state = NativeCaptureState::default();
+        {
+            let mut live = capture_state
+                .parakeet_live
+                .lock()
+                .expect("Parakeet live lock");
+            live.generation = 4;
+            live.previous_full_text = "stale preview".into();
+        }
+
+        VoiceEngine::Parakeet
+            .begin_live_session(&capture_state, 9)
+            .expect("reservation should not require a CUDA model");
+
+        let live = capture_state
+            .parakeet_live
+            .lock()
+            .expect("Parakeet live lock");
+        assert_eq!(live.generation, 9);
+        assert!(live.previous_full_text.is_empty());
+    }
+}
