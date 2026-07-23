@@ -62,6 +62,26 @@ fn stable_preview_text(
     Some(tokens[..stable_token_count].concat().trim().to_owned())
 }
 
+/// Parakeet's int8 encoder loses robustness on quiet input: a faint utterance
+/// can decode to confident nonsense (measured on real capture — a clip at peak
+/// 0.05 gave "good afternoon" -> "good left to know", fixed once lifted). Peak-
+/// normalize toward a healthy level before decoding, with a gain cap so faint
+/// background is never blown up and near-silence is left untouched.
+#[cfg(any(feature = "parakeet", test))]
+fn normalize_for_decode(samples: &[f32]) -> std::borrow::Cow<'_, [f32]> {
+    const TARGET_PEAK: f32 = 0.9;
+    const MAX_GAIN: f32 = 8.0;
+    const SILENCE_FLOOR: f32 = 1e-3;
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |maximum, &s| maximum.max(s.abs()));
+    if peak < SILENCE_FLOOR || peak >= TARGET_PEAK {
+        return std::borrow::Cow::Borrowed(samples);
+    }
+    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    std::borrow::Cow::Owned(samples.iter().map(|&s| s * gain).collect())
+}
+
 pub fn is_compiled() -> bool {
     cfg!(feature = "parakeet")
 }
@@ -377,7 +397,7 @@ mod implementation {
         let stream = hotwords
             .map(|hotwords| recognizer.create_stream_with_hotwords(hotwords))
             .unwrap_or_else(|| recognizer.create_stream());
-        stream.accept_waveform(16_000, samples);
+        stream.accept_waveform(16_000, &super::normalize_for_decode(samples));
         recognizer.decode(&stream);
         stream
             .get_result()
@@ -446,6 +466,27 @@ mod tests {
         }
         assert!(model_is_installed(&directory));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn normalize_lifts_quiet_audio_but_leaves_healthy_and_silent_audio() {
+        // Quiet speech is amplified toward the target (capped at 8x).
+        let quiet = [0.05f32, -0.05, 0.025];
+        let lifted = normalize_for_decode(&quiet);
+        let peak = lifted.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!((peak - 0.4).abs() < 1e-4, "peak {peak} (0.05 * 8x cap)");
+        // Already-healthy audio is passed through untouched (borrowed, no gain).
+        let healthy = [0.9f32, -0.5, 0.2];
+        assert!(matches!(
+            normalize_for_decode(&healthy),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Near-silence is left alone so faint background is never blown up.
+        let silence = [0.0002f32, -0.0003];
+        assert!(matches!(
+            normalize_for_decode(&silence),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
