@@ -195,6 +195,19 @@ Separately shippable but touch the same path; best done together.
 
 ### 8. Pre-gate AI post-processing on a verified provider fingerprint
 - **Category:** architecture · **Impact:** medium · **Effort:** medium · **Verdict:** CONFIRMED
+- **Status:** ✅ Implemented. `Settings.verified_provider_fingerprints` +
+  `provider_fingerprint()` + `ensure_provider_verified()`; the automatic
+  dictation path (`post_process_dictation_outcome`) now falls back to
+  deterministic text (surfacing the reason) unless the live `SHA256(base|key)`
+  matches a stored one. Fingerprint is captured on success in both
+  `fetch_ai_provider_models` (the "Fetch models" control) and `enhance_text`
+  (playground/rewrite — verifies over the chat endpoint, so providers without a
+  `/models` endpoint verify too). Reviewed clean for gate correctness.
+  **Scope:** dictation-only. Rewrite mode (`enhance_text`) and command mode
+  (`request_command_plan`) are explicit user-initiated actions and remain
+  ungated by design; their success doubles as verification for dictation. If a
+  future guarantee should cover rewrite/command payloads too, that's a
+  follow-up.
 - **Gap:** `post_process_dictation_outcome` (`lib.rs:4928`) fires whenever
   enhancement is enabled — a rotated key / edited base URL / removed model is
   not caught, and **the transcript is transmitted to an unverified endpoint**.
