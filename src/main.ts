@@ -61,6 +61,7 @@ interface Settings {
   vocabularyBoostingEnabled: boolean;
   vocabularyBoost: number;
   vocabularyMinTermLength: number;
+  pronunciationMatchingEnabled: boolean;
   userTypingWpm: number;
   weekendsDontBreakStreak: boolean;
   audioHistoryEnabled: boolean;
@@ -198,12 +199,25 @@ interface DictionaryLearningSuggestion {
   occurrences: number;
 }
 
+interface PronunciationEnrollment { values: number[]; frames: number; }
+interface PronunciationProfile {
+  dictionaryEntryId: string;
+  label: string;
+  modelKey: string;
+  hiddenSize: number;
+  enrollments: PronunciationEnrollment[];
+  createdAt: string;
+}
+interface PronunciationRuntimeStatus { installed: boolean; version?: string; }
+interface EnrollmentStatus { enrollmentCount: number; ready: boolean; }
+
 interface AppDatabase {
   settings: Settings;
   dictationHistory: DictationEntry[];
   fileTranscriptionHistory: FileTranscriptionEntry[];
   dictionary: DictionaryEntry[];
   customWords: CustomWord[];
+  pronunciationProfiles: PronunciationProfile[];
   promptProfiles: PromptProfile[];
   dictationPromptConfigurations: DictationPromptConfiguration[];
   appPromptBindings: AppPromptBinding[];
@@ -495,6 +509,9 @@ let recording = false;
 let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
 let voiceEngineAvailability: VoiceEngineAvailability = { engines: [] };
+let pronunciationRuntimeInstalled = false;
+// The dictionary entry whose pronunciation is being recorded right now, if any.
+let enrollingEntryId: string | null = null;
 let modelDownloadProgress: ModelDownloadProgress | undefined;
 let verifyingVoiceEngineInstallation = false;
 interface AudioInputDevice {
@@ -954,6 +971,80 @@ function renderEnhancement(): void {
     </section>`);
 }
 
+function pronunciationToggleHtml(): string {
+  if (database.settings.selectedVoiceEngine !== "parakeet") return "";
+  const installNeeded =
+    database.settings.pronunciationMatchingEnabled && !pronunciationRuntimeInstalled;
+  return (
+    settingToggle(
+      "pronunciationMatchingEnabled",
+      "Match my pronunciation",
+      "Record how you say a hard word on its correction below; matching speech is rewritten to the correction. Uses the Parakeet engine and a one-time on-device install."
+    ) +
+    (installNeeded
+      ? `<div class="setting-row"><span><strong>Pronunciation support</strong><small>A small on-device runtime (~200 MB) that recognizes your enrolled words.</small></span><button data-install-pronunciation>Install</button></div>`
+      : "")
+  );
+}
+
+function enrollCellHtml(entry: DictionaryEntry): string {
+  if (database.settings.selectedVoiceEngine !== "parakeet" || !pronunciationRuntimeInstalled) {
+    return "";
+  }
+  const count =
+    database.pronunciationProfiles?.find((profile) => profile.dictionaryEntryId === entry.id)
+      ?.enrollments.length ?? 0;
+  const recording = enrollingEntryId === entry.id;
+  const record = `<button data-enroll="${entry.id}" data-enroll-label="${escapeHtml(entry.replacement)}" title="Record how you say this word">${recording ? "⏹ Stop &amp; save" : `🎙 ${count}/3`}</button>`;
+  const clear =
+    count > 0 && !recording
+      ? `<button data-clear-pronunciation="${entry.id}" title="Remove recorded pronunciations">Clear voice</button>`
+      : "";
+  return record + clear;
+}
+
+async function handleEnroll(id: string, label: string): Promise<void> {
+  try {
+    if (enrollingEntryId === id) {
+      const status = await invoke<EnrollmentStatus>("finish_enroll_capture", {
+        dictionaryEntryId: id,
+        label,
+      });
+      enrollingEntryId = null;
+      if (!database.pronunciationProfiles) database.pronunciationProfiles = [];
+      const placeholder = Array.from({ length: status.enrollmentCount }, () => ({
+        values: [],
+        frames: 0,
+      }));
+      const existing = database.pronunciationProfiles.find(
+        (profile) => profile.dictionaryEntryId === id
+      );
+      if (existing) {
+        existing.enrollments = placeholder;
+        existing.label = label;
+      } else {
+        database.pronunciationProfiles.push({
+          dictionaryEntryId: id,
+          label,
+          modelKey: "parakeet-tdt-0.6b-v2",
+          hiddenSize: 0,
+          enrollments: placeholder,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      render();
+    } else if (enrollingEntryId === null) {
+      await invoke("start_enroll_capture");
+      enrollingEntryId = id;
+      render();
+    }
+  } catch (error) {
+    enrollingEntryId = null;
+    render();
+    showNotice(String(error));
+  }
+}
+
 function renderDictionary(): void {
   const customWords = database.customWords.length
     ? database.customWords.map((word, index) => `<div class="table-row"><span>${escapeHtml(word.text)}</span><span>${escapeHtml(word.aliases.join(", ") || "Recognition hint")}</span><span class="vocab-actions"><select data-word-strength="${index}" title="Boost strength">${boostPresetOptions(word.weight)}</select><button data-delete-custom-word="${index}">Remove</button></span></div>`).join("")
@@ -962,8 +1053,8 @@ function renderDictionary(): void {
   renderShell(`
     ${pageTitle("Custom Dictionary", "Correct names, product terms, and repeated transcription mistakes automatically.", `<div class="button-row"><button data-action="import-dictionary">Import</button><button data-action="export-dictionary">Export</button><button data-action="new-dictionary-entry">Add term</button></div>`)}
     <section class="card form-card"><h2>Automatic correction learning</h2>${settingToggle("automaticDictionaryLearningEnabled", "Learn from saved-history corrections", "After the same small correction is made twice in saved history, offer it here for explicit review. No replacement is added automatically.")}${learningSuggestions || `<p class="muted">No reviewed correction suggestions are ready yet.</p>`}</section>
-    <section class="card"><div class="dictionary-table"><div class="table-row heading"><span>Spoken phrase</span><span>Replace with</span><span></span></div>
-      ${database.dictionary.length ? database.dictionary.map((entry) => `<div class="table-row"><span>${escapeHtml(entry.spoken)}</span><span>${escapeHtml(entry.replacement)}</span><button data-delete-dictionary="${entry.id}">Remove</button></div>`).join("") : `<div class="empty">No corrections yet. Add terms that your voice engine commonly gets wrong.</div>`}
+    <section class="card">${pronunciationToggleHtml()}<div class="dictionary-table"><div class="table-row heading"><span>Spoken phrase</span><span>Replace with</span><span></span></div>
+      ${database.dictionary.length ? database.dictionary.map((entry) => `<div class="table-row"><span>${escapeHtml(entry.spoken)}</span><span>${escapeHtml(entry.replacement)}</span><span class="vocab-actions"><button data-delete-dictionary="${entry.id}">Remove</button>${enrollCellHtml(entry)}</span></div>`).join("") : `<div class="empty">No corrections yet. Add terms that your voice engine commonly gets wrong.</div>`}
     </div></section>
     <section class="card"><div class="card-title"><div><h2>Recognition vocabulary</h2><p>These terms can be supplied to supported speech engines as recognition hints; they are not post-processing replacements.</p></div><button data-action="new-custom-word">Add vocabulary</button></div>${settingToggle("vocabularyBoostingEnabled", "Use recognition vocabulary hints", "When enabled, Voxide supplies the terms above to supported local and system speech engines.")}<div class="dictionary-table"><div class="table-row heading"><span>Term</span><span>Aliases</span><span>Boost</span></div>${customWords}</div><div class="setting-row"><span><strong>Boost strength</strong><small>Global multiplier for how hard Parakeet biases toward vocabulary terms. Default 1.5.</small></span><input data-vocabulary-boost type="number" min="0.1" max="5" step="0.1" value="${database.settings.vocabularyBoost}"></div><div class="setting-row"><span><strong>Minimum term length</strong><small>Ignore vocabulary terms shorter than this many characters (Parakeet). Default 1 keeps every term.</small></span><input data-vocabulary-min-length type="number" min="1" max="20" step="1" value="${database.settings.vocabularyMinTermLength}"></div></section>`);
 }
@@ -1221,6 +1312,13 @@ async function refreshStats(): Promise<void> {
 
 async function refreshModelStatus(): Promise<void> {
   modelStatus = await invoke<VoiceModelStatus>("voice_model_status");
+  try {
+    pronunciationRuntimeInstalled = (
+      await invoke<PronunciationRuntimeStatus>("pronunciation_runtime_status")
+    ).installed;
+  } catch {
+    pronunciationRuntimeInstalled = false;
+  }
 }
 
 async function refreshVoiceEngineAvailability(): Promise<void> {
@@ -2152,7 +2250,26 @@ function bindCommonEvents(): void {
   document.querySelectorAll<HTMLElement>("[data-delete-dictionary]").forEach((element) => element.addEventListener("click", () => {
     const id = element.dataset.deleteDictionary;
     database.dictionary = database.dictionary.filter((entry) => entry.id !== id);
+    database.pronunciationProfiles = (database.pronunciationProfiles ?? []).filter((profile) => profile.dictionaryEntryId !== id);
     void invoke<DictionaryEntry[]>("save_dictionary", { dictionary: database.dictionary }).then(render);
+  }));
+  document.querySelectorAll<HTMLElement>("[data-enroll]").forEach((element) => element.addEventListener("click", () => {
+    void handleEnroll(element.dataset.enroll ?? "", element.dataset.enrollLabel ?? "");
+  }));
+  document.querySelectorAll<HTMLElement>("[data-clear-pronunciation]").forEach((element) => element.addEventListener("click", () => {
+    const id = element.dataset.clearPronunciation ?? "";
+    void invoke("delete_pronunciation_profile", { dictionaryEntryId: id }).then(() => {
+      database.pronunciationProfiles = (database.pronunciationProfiles ?? []).filter((profile) => profile.dictionaryEntryId !== id);
+      render();
+    });
+  }));
+  document.querySelectorAll<HTMLElement>("[data-install-pronunciation]").forEach((element) => element.addEventListener("click", () => {
+    element.setAttribute("disabled", "true");
+    element.textContent = "Installing…";
+    void invoke<PronunciationRuntimeStatus>("install_pronunciation_runtime")
+      .then((status) => { pronunciationRuntimeInstalled = status.installed; })
+      .catch((error) => showNotice(String(error)))
+      .finally(render);
   }));
   document.querySelectorAll<HTMLElement>("[data-delete-custom-word]").forEach((element) => element.addEventListener("click", () => {
     const index = Number(element.dataset.deleteCustomWord);
