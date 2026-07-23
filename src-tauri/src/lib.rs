@@ -41,6 +41,7 @@ mod parakeet;
 mod permissions;
 #[cfg(target_os = "linux")]
 mod portal_hotkeys;
+mod pronunciation;
 mod provider;
 mod session;
 mod speech;
@@ -63,6 +64,11 @@ const NEMOTRON_SERVER_SOURCE: &str = include_str!("../scripts/nemotron_cuda_serv
 const NEMOTRON_RUNTIME_VERSION: &str = "1";
 const NEMOTRON_RUNTIME_HEALTH_FILE: &str = "runtime-health.json";
 const NEMOTRON_RUNTIME_MARKER_FILE: &str = ".voxide-nemotron-runtime-v1";
+const PRONUNCIATION_RUNTIME_ID: &str = "pronunciation-runtime";
+const PRONUNCIATION_SERVER_SOURCE: &str = include_str!("../scripts/pronunciation_server.py");
+const PRONUNCIATION_RUNTIME_VERSION: &str = "1";
+const PRONUNCIATION_RUNTIME_HEALTH_FILE: &str = "runtime-health.json";
+const PRONUNCIATION_RUNTIME_MARKER_FILE: &str = ".voxide-pronunciation-runtime-v1";
 const COMPONENT_RECEIPT_FILE: &str = ".voxide-component-receipt.json";
 const COMPONENT_RECEIPT_SCHEMA: u32 = 1;
 const COMPONENT_STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -6760,6 +6766,224 @@ async fn run_nemotron_runtime_command(
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PronunciationRuntimeStatus {
+    installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+}
+
+fn pronunciation_runtime_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(pronunciation::runtime_directory(&state.data_directory()?))
+}
+
+fn pronunciation_runtime_version(runtime_directory: &Path) -> Option<String> {
+    let metadata = fs::read(runtime_directory.join(PRONUNCIATION_RUNTIME_HEALTH_FILE)).ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata).ok()?;
+    let onnxruntime = diagnostic_version_value(metadata.get("onnxruntime")?)?;
+    Some(format!("onnxruntime {onnxruntime}"))
+}
+
+fn pronunciation_status(state: &AppState) -> Result<PronunciationRuntimeStatus, String> {
+    let runtime = pronunciation_runtime_path(state)?;
+    let installed = pronunciation::runtime_is_installed(&runtime);
+    Ok(PronunciationRuntimeStatus {
+        installed,
+        version: installed
+            .then(|| pronunciation_runtime_version(&runtime))
+            .flatten(),
+    })
+}
+
+/// Materialize the embedded pronunciation sidecar beside its Python env, so an
+/// installed app runs the exact server it was built with (mirrors
+/// `ensure_nemotron_server_script`).
+fn ensure_pronunciation_server_script(runtime_directory: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(runtime_directory).map_err(|error| {
+        format!("Could not create the pronunciation runtime directory: {error}")
+    })?;
+    let script = runtime_directory.join("pronunciation_server.py");
+    let should_write = fs::read_to_string(&script)
+        .map(|current| current != PRONUNCIATION_SERVER_SOURCE)
+        .unwrap_or(true);
+    if should_write {
+        fs::write(&script, PRONUNCIATION_SERVER_SOURCE)
+            .map_err(|error| format!("Could not install the pronunciation service: {error}"))?;
+    }
+    Ok(script)
+}
+
+#[tauri::command]
+async fn install_pronunciation_runtime(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PronunciationRuntimeStatus, String> {
+    if !pronunciation::is_compiled() {
+        return Err("Pronunciation enrollment is included in Voxide's CUDA build for Linux/NVIDIA. Install a CUDA build first.".into());
+    }
+    let runtime = pronunciation_runtime_path(&state)?;
+    let runtime_parent = runtime
+        .parent()
+        .ok_or("Could not determine the pronunciation runtime directory")?;
+    fs::create_dir_all(runtime_parent).map_err(|error| {
+        format!("Could not create the pronunciation runtime directory: {error}")
+    })?;
+    let staging = runtime_parent.join(format!(
+        ".pronunciation-runtime-install-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("Could not stage the pronunciation runtime: {error}"))?;
+    let _ = app.emit(
+        "model-download-progress",
+        ModelDownloadProgress {
+            id: PRONUNCIATION_RUNTIME_ID.into(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+        },
+    );
+    if let Err(error) = install_pronunciation_runtime_staging(&staging).await {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+    let staged_component = staging.clone();
+    let destination = runtime.clone();
+    let activation = tauri::async_runtime::spawn_blocking(move || {
+        replace_component_directory(&staged_component, &destination)
+    })
+    .await
+    .map_err(|error| format!("Pronunciation runtime activation task failed: {error}"))?;
+    if let Err(error) = activation {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+    ensure_pronunciation_server_script(&runtime)?;
+    if !pronunciation::runtime_is_installed(&runtime) {
+        return Err("The pronunciation runtime did not finish installing".into());
+    }
+    pronunciation_status(&state)
+}
+
+/// A lightweight CPU runtime: onnxruntime + numpy + scipy (no torch/NeMo). It
+/// runs the already-installed Parakeet `encoder.int8.onnx`, so no model
+/// download is needed here.
+async fn install_pronunciation_runtime_staging(staging: &Path) -> Result<(), String> {
+    fs::create_dir(staging.join("tmp")).map_err(|error| {
+        format!("Could not prepare the pronunciation runtime work directory: {error}")
+    })?;
+    let python = find_nemotron_python().await?;
+    let venv = staging.join("venv");
+    run_nemotron_runtime_command(
+        &python,
+        vec!["-m".into(), "venv".into(), venv.as_os_str().to_owned()],
+        staging,
+        "create the Python environment",
+    )
+    .await?;
+    let venv_python = pronunciation::python_path(staging);
+    run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--disable-pip-version-check".into(),
+            "--no-input".into(),
+            "--upgrade".into(),
+            "pip".into(),
+        ],
+        staging,
+        "prepare pip",
+    )
+    .await?;
+    run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--disable-pip-version-check".into(),
+            "--no-input".into(),
+            "--upgrade".into(),
+            "numpy".into(),
+            "scipy".into(),
+            "onnxruntime".into(),
+        ],
+        staging,
+        "install pronunciation dependencies",
+    )
+    .await?;
+    let health = run_nemotron_runtime_command(
+        &venv_python,
+        vec![
+            "-c".into(),
+            "import json, sys, numpy, scipy, onnxruntime; assert sys.version_info >= (3, 9), 'Python 3.9 or newer is required'; print(json.dumps({'python': sys.version.split()[0], 'numpy': numpy.__version__, 'scipy': scipy.__version__, 'onnxruntime': onnxruntime.__version__, 'providers': onnxruntime.get_available_providers()}, sort_keys=True))".into(),
+        ],
+        staging,
+        "run the pronunciation health check",
+    )
+    .await?;
+    let health: serde_json::Value = serde_json::from_slice(&health.stdout)
+        .map_err(|_| "The pronunciation health check returned invalid metadata".to_string())?;
+    if health["onnxruntime"].as_str().is_none() {
+        return Err("The pronunciation health check did not report an onnxruntime version".into());
+    }
+    fs::write(
+        staging.join(PRONUNCIATION_RUNTIME_HEALTH_FILE),
+        serde_json::to_vec_pretty(&health)
+            .map_err(|error| format!("Could not encode pronunciation runtime metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Could not save pronunciation runtime metadata: {error}"))?;
+    fs::write(
+        staging.join(PRONUNCIATION_RUNTIME_MARKER_FILE),
+        format!("Voxide pronunciation runtime v{PRONUNCIATION_RUNTIME_VERSION}\n"),
+    )
+    .map_err(|error| format!("Could not finalize the pronunciation runtime marker: {error}"))?;
+    write_component_receipt(
+        staging,
+        &ComponentReceipt {
+            schema: COMPONENT_RECEIPT_SCHEMA,
+            id: PRONUNCIATION_RUNTIME_ID.into(),
+            version: PRONUNCIATION_RUNTIME_VERSION.into(),
+            source: "PyPI".into(),
+            files: component_file_hashes(
+                staging,
+                [
+                    PRONUNCIATION_RUNTIME_HEALTH_FILE,
+                    PRONUNCIATION_RUNTIME_MARKER_FILE,
+                ],
+            )?,
+        },
+    )
+}
+
+#[tauri::command]
+async fn remove_pronunciation_runtime(
+    state: State<'_, AppState>,
+) -> Result<PronunciationRuntimeStatus, String> {
+    let runtime = pronunciation_runtime_path(&state)?;
+    if !runtime.exists() {
+        return Err("Pronunciation support is not installed.".into());
+    }
+    if !runtime.is_dir() {
+        return Err("The pronunciation runtime path is not a directory.".into());
+    }
+    let runtime_to_remove = runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || fs::remove_dir_all(&runtime_to_remove))
+        .await
+        .map_err(|error| format!("Pronunciation runtime removal task failed: {error}"))?
+        .map_err(|error| format!("Could not remove pronunciation support: {error}"))?;
+    pronunciation_status(&state)
+}
+
+#[tauri::command]
+fn pronunciation_runtime_status(
+    state: State<'_, AppState>,
+) -> Result<PronunciationRuntimeStatus, String> {
+    pronunciation_status(&state)
+}
+
 const NEMOTRON_MODEL_FILES: [&str; 6] = [
     "config.json",
     "generation_config.json",
@@ -10008,6 +10232,9 @@ pub fn run() {
             download_parakeet_model,
             install_nemotron_cuda_runtime,
             remove_nemotron_cuda_runtime,
+            install_pronunciation_runtime,
+            remove_pronunciation_runtime,
+            pronunciation_runtime_status,
             open_voice_engine_storage,
             download_nemotron_model,
             start_native_dictation,
