@@ -8033,12 +8033,61 @@ fn spawn_live_apple_speech_preview(
 /// separate final manager. Keep the same full-audio contract here: preview
 /// snapshots never decide the final segmentation or contribute text. When the
 /// user enables vocabulary boosting, use it only for this final pass.
+/// Reports which boosted vocabulary terms actually appear in a final transcript
+/// (mirrors FluidVoice's `detectBoostedTerms`). Both sides are normalized to
+/// lowercase, non-alphanumerics collapsed to single spaces, and space-padded,
+/// so matching is on whole words/phrases only — "cat" never matches inside
+/// "category". A hit means the term is PRESENT, not that boosting caused it
+/// (the model may have produced it anyway): a coarse confirmation/tuning
+/// signal, not proof of causation.
+fn detected_vocabulary_terms(text: &str, vocabulary: &[String], limit: usize) -> Vec<String> {
+    fn normalize(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push(' ');
+        for ch in value.chars() {
+            if ch.is_alphanumeric() {
+                out.extend(ch.to_lowercase());
+            } else if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        }
+        if !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out
+    }
+    let haystack = normalize(text);
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    for term in vocabulary {
+        let needle = normalize(term);
+        if needle.trim().is_empty() || !seen.insert(needle.clone()) {
+            continue;
+        }
+        if haystack.contains(&needle) {
+            hits.push(term.trim().to_owned());
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+    hits
+}
+
 fn transcribe_parakeet_final(
     samples: &[f32],
     model_path: &Path,
     vocabulary: &[String],
 ) -> Result<String, String> {
-    parakeet::transcribe_samples_with_vocabulary(samples, model_path, vocabulary)
+    let text = parakeet::transcribe_samples_with_vocabulary(samples, model_path, vocabulary)?;
+    // Log which boosted terms landed so it is visible whether biasing helps.
+    if !vocabulary.is_empty() {
+        let hits = detected_vocabulary_terms(&text, vocabulary, 8);
+        if !hits.is_empty() {
+            debug_log::append(&format!("BOOST_HIT: {}", hits.join(", ")));
+        }
+    }
+    Ok(text)
 }
 
 /// Flushes the active Nemotron stream with the capture tail that the 80 ms
@@ -10173,6 +10222,30 @@ mod tests {
         // "Voxide" once (deduped), the new replacement "GitHub", and neither
         // "gib hub" nor "kew bernetties".
         assert_eq!(vocabulary, vec!["Voxide", "GitHub"]);
+    }
+
+    #[test]
+    fn detected_vocabulary_terms_matches_whole_words_case_insensitively() {
+        let vocabulary = [
+            "Voxide".to_string(),
+            "New York".to_string(),
+            "Kubernetes".to_string(),
+            "cat".to_string(),
+        ];
+        let text = "I deployed voxide to new york, not on-prem; category aside.";
+        let hits = detected_vocabulary_terms(text, &vocabulary, 8);
+        // "voxide" (case-insensitive) and "new york" (phrase) hit; "Kubernetes"
+        // is absent; "cat" must NOT match inside "category" (whole-word only).
+        assert_eq!(hits, vec!["Voxide", "New York"]);
+
+        // The limit caps the number of reported hits.
+        assert_eq!(
+            detected_vocabulary_terms(text, &vocabulary, 1),
+            vec!["Voxide"]
+        );
+        // Empty vocabulary / no matches yield nothing.
+        assert!(detected_vocabulary_terms(text, &[], 8).is_empty());
+        assert!(detected_vocabulary_terms("nothing here", &vocabulary, 8).is_empty());
     }
 
     #[test]
