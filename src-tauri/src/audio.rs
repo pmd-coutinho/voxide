@@ -660,6 +660,10 @@ fn append_samples<T>(
     T: Sample,
     f32: FromSample<T>,
 {
+    // One sequence number per callback block, assigned whether or not the block
+    // is accepted. A block dropped whole under backpressure therefore leaves a
+    // hole in the sequence that the consumer detects, instead of a silent
+    // partial drop that would smear time across the missing samples.
     let packet_sequence = counters
         .next_packet_sequence
         .fetch_add(1, Ordering::Relaxed);
@@ -667,28 +671,65 @@ fn append_samples<T>(
     counters
         .input_samples
         .fetch_add(data.len() as u64, Ordering::Relaxed);
-    let mut overflowed = false;
-    for sample in data.iter().copied().map(f32::from_sample) {
-        match producer.push(RawSample {
-            value: sample,
-            packet_sequence,
-            capture_delay_ns,
-        }) {
-            Ok(()) => {
-                counters.accepted_samples.fetch_add(1, Ordering::Relaxed);
-                let queued = counters.queued_samples.fetch_add(1, Ordering::Relaxed) + 1;
-                counters
-                    .ring_high_water_samples
-                    .fetch_max(queued, Ordering::Relaxed);
-            }
-            Err(_) => {
-                counters.dropped_samples.fetch_add(1, Ordering::Relaxed);
-                overflowed = true;
-            }
+    if data.is_empty() {
+        return;
+    }
+    // All-or-nothing: reserve the whole block's worth of slots or drop the
+    // entire block. A partial write would carry this block's sequence number
+    // with fewer samples than the source, hiding the loss from the consumer's
+    // discontinuity check and compressing time across the missing samples.
+    match producer.write_chunk_uninit(data.len()) {
+        Ok(chunk) => {
+            let written = chunk.fill_from_iter(data.iter().copied().map(|value| RawSample {
+                value: f32::from_sample(value),
+                packet_sequence,
+                capture_delay_ns,
+            }));
+            counters
+                .accepted_samples
+                .fetch_add(written as u64, Ordering::Relaxed);
+            let queued = counters
+                .queued_samples
+                .fetch_add(written, Ordering::Relaxed)
+                + written;
+            counters
+                .ring_high_water_samples
+                .fetch_max(queued, Ordering::Relaxed);
+        }
+        Err(_) => {
+            counters
+                .dropped_samples
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            counters.overflow_blocks.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if overflowed {
-        counters.overflow_blocks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Resamples one drained batch into the canonical 16 kHz mono timeline,
+/// updating the level meter and canonical-sample counter. The resampler state
+/// persists across calls so batching never introduces packet-boundary clicks.
+fn flush_capture_packet(
+    packet: &[f32],
+    resampler: &mut StatefulMonoResampler,
+    canonical: &mut Vec<f32>,
+    canonical_samples: &Mutex<Vec<f32>>,
+    counters: &CaptureCounters,
+    level_tracker: &mut LevelTracker,
+    on_level: Option<&LevelCallback>,
+) {
+    canonical.clear();
+    resampler.push_interleaved(packet, canonical);
+    if canonical.is_empty() {
+        return;
+    }
+    if let Some(on_level) = on_level {
+        on_level(level_tracker.observe(canonical));
+    }
+    if let Ok(mut timeline) = canonical_samples.lock() {
+        timeline.extend_from_slice(canonical);
+        counters
+            .canonical_samples
+            .fetch_add(canonical.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -714,35 +755,50 @@ fn spawn_capture_worker(
                 while packet.len() < packet.capacity() {
                     match consumer.pop() {
                         Ok(sample) => {
-                            if let Some(previous) = previous_packet_sequence {
-                                if sample.packet_sequence > previous + 1 {
-                                    counters.discontinuities.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
+                            let is_gap = matches!(
+                                previous_packet_sequence,
+                                Some(previous) if sample.packet_sequence > previous + 1
+                            );
                             previous_packet_sequence = Some(sample.packet_sequence);
                             counters
                                 .latest_capture_delay_ns
                                 .store(sample.capture_delay_ns, Ordering::Relaxed);
-                            packet.push(sample.value);
                             counters.queued_samples.fetch_sub(1, Ordering::Relaxed);
+                            if is_gap {
+                                // A block was dropped under backpressure. Flush
+                                // the audio captured up to the hole, then reset
+                                // the resampler so the samples after it re-seed
+                                // the interpolator instead of bridging the gap.
+                                counters.discontinuities.fetch_add(1, Ordering::Relaxed);
+                                if !packet.is_empty() {
+                                    flush_capture_packet(
+                                        &packet,
+                                        &mut resampler,
+                                        &mut canonical,
+                                        &canonical_samples,
+                                        &counters,
+                                        &mut level_tracker,
+                                        on_level.as_ref(),
+                                    );
+                                    packet.clear();
+                                }
+                                resampler.reset();
+                            }
+                            packet.push(sample.value);
                         }
                         Err(_) => break,
                     }
                 }
                 if !packet.is_empty() {
-                    canonical.clear();
-                    resampler.push_interleaved(&packet, &mut canonical);
-                    if !canonical.is_empty() {
-                        if let Some(on_level) = on_level.as_ref() {
-                            on_level(level_tracker.observe(&canonical));
-                        }
-                        if let Ok(mut timeline) = canonical_samples.lock() {
-                            timeline.extend_from_slice(&canonical);
-                            counters
-                                .canonical_samples
-                                .fetch_add(canonical.len() as u64, Ordering::Relaxed);
-                        }
-                    }
+                    flush_capture_packet(
+                        &packet,
+                        &mut resampler,
+                        &mut canonical,
+                        &canonical_samples,
+                        &counters,
+                        &mut level_tracker,
+                        on_level.as_ref(),
+                    );
                     continue;
                 }
                 if stop.load(Ordering::Acquire) {
@@ -817,6 +873,19 @@ impl StatefulMonoResampler {
         }
         self.previous = Some(current);
         self.source_index += 1;
+    }
+
+    /// Drops all resampling state back to a fresh start while keeping the
+    /// channel/ratio configuration. Called at a capture discontinuity (a block
+    /// dropped under backpressure) so the next sample re-seeds the interpolator
+    /// (`previous == None`) instead of interpolating across the missing audio.
+    /// Only the live-capture path resets; the contiguous file-decode path never
+    /// does.
+    fn reset(&mut self) {
+        self.pending_frame.clear();
+        self.previous = None;
+        self.source_index = 0;
+        self.next_output_position = 0.0;
     }
 
     /// Completes a finite source by holding its final sample for any output
@@ -1098,12 +1167,15 @@ mod tests {
     fn full_raw_ring_is_counted_instead_of_silently_dropped() {
         let (mut producer, _consumer) = rtrb::RingBuffer::<RawSample>::new(2);
         let counters = CaptureCounters::default();
+        // The 3-sample block does not fit the 2-slot ring, so it is dropped
+        // whole and fully counted — never partially written under this block's
+        // sequence (which would smear time across the missing samples).
         append_samples(&[0.1_f32, 0.2, 0.3], &mut producer, &counters, 42);
         assert_eq!(counters.health().callback_blocks, 1);
-        assert_eq!(counters.health().accepted_samples, 2);
-        assert_eq!(counters.health().dropped_samples, 1);
+        assert_eq!(counters.health().accepted_samples, 0);
+        assert_eq!(counters.health().dropped_samples, 3);
         assert_eq!(counters.health().overflow_blocks, 1);
-        assert_eq!(counters.health().ring_high_water_samples, 2);
+        assert_eq!(counters.health().ring_high_water_samples, 0);
         assert_eq!(counters.health().latest_capture_delay_ns, 0);
     }
 
@@ -1122,5 +1194,54 @@ mod tests {
         assert_eq!(first.capture_delay_ns, 12);
         assert_eq!(third.capture_delay_ns, 34);
         assert_eq!(third.value, -0.25);
+    }
+
+    #[test]
+    fn overflowing_block_is_dropped_whole_and_leaves_a_sequence_gap() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<RawSample>::new(6);
+        let counters = CaptureCounters::default();
+        let block = [0.1_f32, 0.2, 0.3, 0.4];
+        // Block 0 (seq 0) fits; block 1 (seq 1) needs four slots but only two
+        // remain, so it is dropped whole rather than partially written.
+        append_samples(&block, &mut producer, &counters, 0);
+        append_samples(&block, &mut producer, &counters, 0);
+        assert_eq!(counters.accepted_samples.load(Ordering::Relaxed), 4);
+        assert_eq!(counters.dropped_samples.load(Ordering::Relaxed), 4);
+        assert_eq!(counters.overflow_blocks.load(Ordering::Relaxed), 1);
+        let mut sequences = Vec::new();
+        while let Ok(sample) = consumer.pop() {
+            sequences.push(sample.packet_sequence);
+        }
+        // Only block 0's samples reached the ring — no partial block-1 samples.
+        assert_eq!(sequences, vec![0, 0, 0, 0]);
+        // A later block is seq 2, so the consumer sees a 0 -> 2 jump: the
+        // dropped block leaves a detectable hole, not a silent same-seq smear.
+        append_samples(&block, &mut producer, &counters, 0);
+        assert_eq!(
+            consumer.pop().expect("third block sample").packet_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn resampler_reset_matches_a_fresh_resampler() {
+        let input = [0.25_f32, 0.5, 0.75, 1.0, 0.5, 0.0];
+        let mut fresh = StatefulMonoResampler::new(44_100, 1);
+        let mut fresh_out = Vec::new();
+        fresh.push_interleaved(&input, &mut fresh_out);
+
+        let mut reused = StatefulMonoResampler::new(44_100, 1);
+        let mut scratch = Vec::new();
+        reused.push_interleaved(&[0.9_f32, 0.8, 0.7], &mut scratch);
+        scratch.clear();
+        reused.reset();
+        let mut reused_out = Vec::new();
+        reused.push_interleaved(&input, &mut reused_out);
+
+        // After reset the resampler behaves exactly like a fresh one — phase,
+        // previous sample, source cursor, and pending frame are all cleared —
+        // so no interpolation bridges the discontinuity.
+        assert!(!fresh_out.is_empty());
+        assert_eq!(fresh_out, reused_out);
     }
 }
