@@ -92,6 +92,8 @@ struct AppDatabase {
     app_prompt_bindings: Vec<AppPromptBinding>,
     ai_providers: Vec<provider::AiProviderProfile>,
     custom_words: Vec<CustomWordEntry>,
+    #[serde(default)]
+    pronunciation_profiles: Vec<PronunciationProfile>,
     command_chats: Vec<CommandChat>,
     active_command_chat_id: Option<String>,
 }
@@ -162,6 +164,7 @@ impl Default for AppDatabase {
             app_prompt_bindings: Vec::new(),
             ai_providers: provider::AiProviderProfile::built_in(),
             custom_words: Vec::new(),
+            pronunciation_profiles: Vec::new(),
             command_chats: vec![CommandChat::new()],
             active_command_chat_id: None,
         }
@@ -604,6 +607,8 @@ struct Settings {
     save_transcription_history: bool,
     automatic_dictionary_learning_enabled: bool,
     vocabulary_boosting_enabled: bool,
+    #[serde(default)]
+    pronunciation_matching_enabled: bool,
     // Global multiplier and minimum term length for Parakeet vocabulary
     // boosting. The default boost (1.5) matches the previous hard-coded
     // hotwords score, and the default length (1) keeps every term, so existing
@@ -713,6 +718,7 @@ impl Default for Settings {
             save_transcription_history: true,
             automatic_dictionary_learning_enabled: true,
             vocabulary_boosting_enabled: false,
+            pronunciation_matching_enabled: false,
             vocabulary_boost: default_vocabulary_boost(),
             vocabulary_min_term_length: default_vocabulary_min_term_length(),
             user_typing_wpm: 40,
@@ -1070,6 +1076,35 @@ struct CustomWordEntry {
     #[serde(default)]
     aliases: Vec<String>,
 }
+
+/// Acoustic pronunciation enrollments for one correction-dictionary entry,
+/// scoped to a specific acoustic model. Each enrollment is a pooled encoder
+/// embedding of the user speaking the word; the matcher averages them into a
+/// prototype. Keyed by (dictionary entry, model) exactly like FluidVoice, so a
+/// profile trained on one model is never used with another.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PronunciationProfile {
+    dictionary_entry_id: String,
+    label: String,
+    model_key: String,
+    hidden_size: usize,
+    /// Newest-last; capped at MAX_PRONUNCIATION_ENROLLMENTS like FluidVoice.
+    enrollments: Vec<PronunciationEnrollment>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PronunciationEnrollment {
+    values: Vec<f32>,
+    frames: u32,
+}
+
+const MAX_PRONUNCIATION_ENROLLMENTS: usize = 10;
+const MIN_PRONUNCIATION_ENROLLMENTS: usize = 3;
+/// The acoustic model a profile is trained against (Parakeet TDT).
+const PRONUNCIATION_MODEL_KEY: &str = "parakeet-tdt-0.6b-v2";
 
 // Voxide's Parakeet biasing runs through sherpa-onnx's context graph, whose
 // boost scale (~1.5) differs from FluidVoice's CTC weight scale (~5–13). These
@@ -1854,6 +1889,12 @@ struct NativeCaptureState {
     preview_generation: Arc<AtomicU64>,
     parakeet_live: Mutex<ParakeetLiveState>,
     nemotron_live: Arc<tokio::sync::Mutex<NemotronLiveState>>,
+    // Dedicated capture for pronunciation enrollment (separate from the
+    // dictation `capture` so the two workflows never collide).
+    enroll_capture: Mutex<Option<audio::AudioCapture>>,
+    // Warm pronunciation sidecar, spawned lazily on first enroll/match and
+    // reused; opt-in and torn down when pronunciation support is removed.
+    pronunciation_server: Arc<tokio::sync::Mutex<Option<pronunciation::Server>>>,
 }
 
 impl Default for NativeCaptureState {
@@ -1869,6 +1910,8 @@ impl Default for NativeCaptureState {
             preview_generation: Arc::new(AtomicU64::new(0)),
             parakeet_live: Mutex::new(ParakeetLiveState::default()),
             nemotron_live: Arc::new(tokio::sync::Mutex::new(NemotronLiveState::default())),
+            enroll_capture: Mutex::new(None),
+            pronunciation_server: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -6961,7 +7004,12 @@ async fn install_pronunciation_runtime_staging(staging: &Path) -> Result<(), Str
 #[tauri::command]
 async fn remove_pronunciation_runtime(
     state: State<'_, AppState>,
+    capture_state: State<'_, NativeCaptureState>,
 ) -> Result<PronunciationRuntimeStatus, String> {
+    // Stop the warm sidecar first so it never points at a deleted runtime.
+    if let Some(mut server) = capture_state.pronunciation_server.lock().await.take() {
+        server.terminate();
+    }
     let runtime = pronunciation_runtime_path(&state)?;
     if !runtime.exists() {
         return Err("Pronunciation support is not installed.".into());
@@ -6982,6 +7030,142 @@ fn pronunciation_runtime_status(
     state: State<'_, AppState>,
 ) -> Result<PronunciationRuntimeStatus, String> {
     pronunciation_status(&state)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentStatus {
+    enrollment_count: usize,
+    ready: bool,
+}
+
+/// Get (or lazily launch) the warm pronunciation sidecar. The caller holds the
+/// async lock across the returned reference so requests stay serialized.
+async fn ensure_pronunciation_server<'a>(
+    guard: &'a mut Option<pronunciation::Server>,
+    state: &AppState,
+) -> Result<&'a mut pronunciation::Server, String> {
+    if guard.is_none() {
+        let runtime = pronunciation_runtime_path(state)?;
+        if !pronunciation::runtime_is_installed(&runtime) {
+            return Err("Pronunciation support is not installed. Install it from the Custom Dictionary screen first.".into());
+        }
+        let script = ensure_pronunciation_server_script(&runtime)?;
+        let python = pronunciation::python_path(&runtime);
+        let model = parakeet_model_path(state)?;
+        *guard = Some(pronunciation::Server::launch(&python, &script, &model).await?);
+    }
+    guard
+        .as_mut()
+        .ok_or_else(|| "Pronunciation service is unavailable".to_string())
+}
+
+#[tauri::command]
+fn start_enroll_capture(
+    state: State<'_, AppState>,
+    capture_state: State<'_, NativeCaptureState>,
+) -> Result<(), String> {
+    let mut slot = capture_state
+        .enroll_capture
+        .lock()
+        .map_err(|_| "Enrollment capture lock was poisoned".to_string())?;
+    if slot.is_some() {
+        return Err("An enrollment recording is already in progress".into());
+    }
+    let device = state
+        .database
+        .lock()
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?
+        .settings
+        .selected_input_device
+        .clone();
+    let prepared = audio::AudioCapture::prepare(device.as_deref())?;
+    *slot = Some(audio::AudioCapture::start_prepared(&prepared, None)?);
+    Ok(())
+}
+
+#[tauri::command]
+async fn finish_enroll_capture(
+    state: State<'_, AppState>,
+    capture_state: State<'_, NativeCaptureState>,
+    dictionary_entry_id: String,
+    label: String,
+) -> Result<EnrollmentStatus, String> {
+    let capture = capture_state
+        .enroll_capture
+        .lock()
+        .map_err(|_| "Enrollment capture lock was poisoned".to_string())?
+        .take()
+        .ok_or("No enrollment recording is in progress")?;
+    let (captured, _health) = capture.finish_with_health()?;
+    let mut samples = audio::mono_resample_for_whisper(captured)?;
+    audio::pad_short_transcription_samples(&mut samples);
+    if !audio::has_minimum_transcription_samples(&samples) {
+        return Err(
+            "The recording was too short. Hold the button and say the word clearly.".into(),
+        );
+    }
+
+    let enrollment = {
+        let mut guard = capture_state.pronunciation_server.lock().await;
+        let server = ensure_pronunciation_server(&mut guard, &state).await?;
+        server.enroll(&samples).await?
+    };
+
+    let status = state.update(|database| {
+        let existing = database.pronunciation_profiles.iter_mut().find(|profile| {
+            profile.dictionary_entry_id == dictionary_entry_id
+                && profile.model_key == PRONUNCIATION_MODEL_KEY
+        });
+        let count = if let Some(profile) = existing {
+            profile.label = label.clone();
+            // A model reinstall could change the embedding size; start fresh.
+            if profile.hidden_size != enrollment.hidden_size {
+                profile.hidden_size = enrollment.hidden_size;
+                profile.enrollments.clear();
+            }
+            profile.enrollments.push(PronunciationEnrollment {
+                values: enrollment.embedding.clone(),
+                frames: enrollment.frames,
+            });
+            let overflow = profile
+                .enrollments
+                .len()
+                .saturating_sub(MAX_PRONUNCIATION_ENROLLMENTS);
+            profile.enrollments.drain(0..overflow);
+            profile.enrollments.len()
+        } else {
+            database.pronunciation_profiles.push(PronunciationProfile {
+                dictionary_entry_id: dictionary_entry_id.clone(),
+                label: label.clone(),
+                model_key: PRONUNCIATION_MODEL_KEY.into(),
+                hidden_size: enrollment.hidden_size,
+                enrollments: vec![PronunciationEnrollment {
+                    values: enrollment.embedding.clone(),
+                    frames: enrollment.frames,
+                }],
+                created_at: Utc::now(),
+            });
+            1
+        };
+        EnrollmentStatus {
+            enrollment_count: count,
+            ready: count >= MIN_PRONUNCIATION_ENROLLMENTS,
+        }
+    })?;
+    Ok(status)
+}
+
+#[tauri::command]
+fn delete_pronunciation_profile(
+    state: State<'_, AppState>,
+    dictionary_entry_id: String,
+) -> Result<(), String> {
+    state.update(|database| {
+        database
+            .pronunciation_profiles
+            .retain(|profile| profile.dictionary_entry_id != dictionary_entry_id);
+    })
 }
 
 const NEMOTRON_MODEL_FILES: [&str; 6] = [
@@ -10235,6 +10419,9 @@ pub fn run() {
             install_pronunciation_runtime,
             remove_pronunciation_runtime,
             pronunciation_runtime_status,
+            start_enroll_capture,
+            finish_enroll_capture,
+            delete_pronunciation_profile,
             open_voice_engine_storage,
             download_nemotron_model,
             start_native_dictation,
