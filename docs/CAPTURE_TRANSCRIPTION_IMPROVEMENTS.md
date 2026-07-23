@@ -229,6 +229,10 @@ Separately shippable but touch the same path; best done together.
 
 ### 9. `${transcript}` placeholder / single-user-turn fold
 - **Category:** formatting · **Impact:** low-medium · **Effort:** small · **Verdict:** CONFIRMED
+- **Status:** ✅ Implemented. `fold_dictation_prompt` substitutes the
+  transcript for `${transcript}` and sends a single user turn (empty system)
+  when present, else keeps the classic split; `openai_messages` now omits a
+  blank system message. Opt-in, backward-compatible.
 - **Gap:** every provider builder hard-codes `[system, user]`
   (`provider.rs:1745-1800`, `1881-1904`).
 - **FluidVoice:** supports a `${transcript}` placeholder and folds
@@ -247,6 +251,12 @@ Separately shippable but touch the same path; best done together.
 
 ### 10. Reset resampler on packet discontinuity + drop audio in whole blocks
 - **Category:** capture · **Impact:** medium · **Effort:** medium · **Verdict:** CONFIRMED
+- **Status:** ✅ Implemented. `append_samples` now writes each block all-or-
+  nothing via `write_chunk_uninit`/`fill_from_iter` (whole-block drop leaves a
+  detectable sequence hole); `StatefulMonoResampler::reset()` added; the worker
+  flushes the pre-gap batch and resets at a discontinuity so no interpolation
+  bridges the hole. Adversarially reviewed (CORRECT, 92) incl. frame-alignment
+  and no-gap-regression.
 - **Gap:** on ring overflow, `append_samples` (`audio.rs:526-565`) drops *tail
   samples* while keeping one `packet_sequence` per block, so the consumer's gap
   check (`audio.rs:589`) never fires and `StatefulMonoResampler` interpolates
@@ -263,6 +273,9 @@ Separately shippable but touch the same path; best done together.
 
 ### 11. Capture-clock divergence watchdog (warn-only)
 - **Category:** capture · **Impact:** low-medium · **Effort:** small (~10 lines) · **Verdict:** PARTIAL
+- **Status:** ✅ Implemented. `capture_clock_diverges` (loose asymmetric band
+  `!(0.5..=1.5)` above a 500 ms floor) logs a warning at finalize; warn-only,
+  never returns `Err`. Reviewed CORRECT (95).
 - **Gap:** wall vs canonical duration is computed and **logged** at finalize
   (`lib.rs:8017-8033`) but never acted on. A stalled/mis-clocked source yields a
   silently short/garbled transcript.
@@ -276,6 +289,10 @@ Separately shippable but touch the same path; best done together.
 
 ### 12. Persist the preferred mic by stable node `name`
 - **Category:** capture · **Impact:** medium · **Effort:** small · **Verdict:** PARTIAL (half 1 only)
+- **Status:** ⏸️ Deferred. Changes the persisted `selected_input_device` format
+  and touches the frontend picker (`main.ts`) plus a one-time migration —
+  crosses into frontend/persistence work. Real but latent (duplicate identical
+  USB mics); revisit with a frontend pass.
 - **Gap:** `input_device_names()` (`audio.rs:363`) persists the *description*,
   then `route_to_requested_source` (`audio.rs:477`) matches it back to
   `source.name` — two identical USB mics share a description, so the `find`
@@ -293,6 +310,11 @@ Separately shippable but touch the same path; best done together.
 
 ### 13. CPU fallback when Parakeet CUDA load fails
 - **Category:** engines · **Impact:** low-medium · **Effort:** small-medium · **Verdict:** PARTIAL
+- **Status:** ✅ Implemented. On a failed CUDA `create()`, retry once with
+  `provider="cpu"` and a real `num_threads` (`speech::cpu_decode_threads`, now
+  `pub(crate)`) for both greedy and boosted configs; scoped to offline Parakeet.
+  Reviewed CORRECT (93). (Preview rate-limiting in degraded mode not done — #2's
+  windowing already bounds it.)
 - **Gap:** `parakeet.rs:215` hardcodes `provider="cuda"` and hard-errors on
   `create()` failure; sherpa has no built-in CPU fallback (unlike whisper.cpp,
   which already degrades — `speech.rs:388`).
@@ -306,6 +328,11 @@ Separately shippable but touch the same path; best done together.
 
 ### 14. Unicode-aware filler trimming
 - **Category:** formatting · **Impact:** low · **Effort:** small · **Verdict:** PARTIAL (part 1 only)
+- **Status:** ✅ Implemented. `remove_filler_words` trims `!is_alphanumeric()
+  && !is_whitespace() && !is_control()` (`char::is_punctuation` is not in std),
+  a true superset of the old ASCII trim that also handles Unicode punctuation
+  while preserving newlines. Review caught (and fixed) an initial version that
+  dropped attached newlines.
 - **Gap:** `remove_filler_words` (`formatting.rs:441`) trims
   `is_ascii_punctuation()`, so a filler wrapped in smart quotes/em-dash/ellipsis
   survives filtering.
@@ -320,6 +347,11 @@ Separately shippable but touch the same path; best done together.
 
 ### 15. Context-gated smart punctuation (dot + symbol only)
 - **Category:** formatting · **Impact:** medium · **Effort:** medium · **Verdict:** PARTIAL
+- **Status:** ⏸️ Deferred. FluidVoice's version is unshipped dead code, so this
+  is a *new* heuristic needing fresh design + a validated test corpus (TLD/host
+  tables, symbol-operand rules) and likely a new opt-in setting — not a
+  port-of-proven-behavior. Highest design risk of the tier; revisit
+  deliberately.
 - **Gap:** the port's `apply_spoken_punctuation` (`formatting.rs:507`) has no
   dot-context (TLD/host tables → `api.json`) or symbol-operand heuristics.
 - **Caution:** FluidVoice's version is **dead code** — the flag-setting
@@ -352,13 +384,18 @@ Separately shippable but touch the same path; best done together.
 
 ---
 
-## Suggested sequencing
+## Progress
 
-1. **Items 2, 1, 3** — biggest felt improvement (snappier onset, no runaway
-   preview, survives mic blips).
-2. **Tier 2 (4–7)** — the main accuracy dial.
-3. **Item 8** — a genuine privacy fix worth doing early.
-4. Tier 4 as capacity allows.
+- **Tier 1 — capture latency/robustness:** #1 ✅ #2 ✅ #3 ⏳ (mid-recording
+  recovery, still open)
+- **Tier 2 — vocabulary biasing:** #4 ✅ #7 ✅ · #5 ⏸️ #6 ⏸️ (need Settings/UI)
+- **Tier 3 — AI post-processing:** #8 ✅ #9 ✅ (complete)
+- **Tier 4 — robustness & formatting:** #10 ✅ #11 ✅ #13 ✅ #14 ✅ · #12 ⏸️
+  (frontend/persistence) #15 ⏸️ (needs fresh design)
+
+Still open and worth doing: **#3** (recover from mid-recording device loss
+instead of aborting — Tier 1, `CONFIRMED`), then **#12** and **#5/#6** when a
+frontend pass is in scope.
 
 _Generated from a verified cross-repo comparison (5 CONFIRMED, 12 PARTIAL, 2
 REJECTED findings) against FluidVoice `~/dev/FluidVoice`._
