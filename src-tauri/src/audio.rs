@@ -215,6 +215,28 @@ impl AudioCapture {
         prepared: &PreparedInput,
         on_level: Option<LevelCallback>,
     ) -> Result<Self, String> {
+        Self::start_prepared_appending(prepared, on_level, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Clones the shared 16 kHz mono timeline this capture appends to, so a
+    /// mid-recording rebuild can continue the same recording (see
+    /// `start_prepared_appending`).
+    pub fn canonical_handle(&self) -> Arc<Mutex<Vec<f32>>> {
+        Arc::clone(&self.canonical_samples)
+    }
+
+    /// Opens the microphone appending into an EXISTING canonical timeline
+    /// instead of a fresh one. Used to rebuild capture mid-recording after a
+    /// device error without losing the audio captured so far: the caller drops
+    /// the failed capture (flushing its tail into the timeline) and hands its
+    /// `canonical_handle` here so the new stream continues the same recording.
+    /// The rebuilt capture gets fresh health counters, so a stale error count
+    /// does not immediately re-trip the recovery path.
+    pub fn start_prepared_appending(
+        prepared: &PreparedInput,
+        on_level: Option<LevelCallback>,
+        canonical_samples: Arc<Mutex<Vec<f32>>>,
+    ) -> Result<Self, String> {
         // Re-assert routing right before opening: another `prepare` may have
         // run since this target was resolved, and the pipewire/pulse ALSA
         // plugins read these env vars when the stream is opened below. Held
@@ -232,7 +254,6 @@ impl AudioCapture {
             .saturating_mul(RAW_RING_BUFFER_SECONDS)
             .max(RAW_RING_MINIMUM_SAMPLES);
         let (mut producer, consumer) = rtrb::RingBuffer::<RawSample>::new(ring_capacity);
-        let canonical_samples = Arc::new(Mutex::new(Vec::new()));
         let counters = Arc::new(CaptureCounters::default());
         let stop_worker = Arc::new(AtomicBool::new(false));
         let worker = spawn_capture_worker(

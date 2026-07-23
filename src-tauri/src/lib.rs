@@ -1892,58 +1892,161 @@ fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
             if stream_errors == 0 {
                 continue;
             }
-            if !invalidate_preview_generation(&capture_state, session_id) {
-                return;
-            }
-
-            let capture = capture_state
-                .capture
-                .lock()
-                .ok()
-                .and_then(|mut capture| capture.take());
-            if capture.is_none() {
-                return;
-            }
-            let _ = capture_state
-                .capture_started_at
-                .lock()
-                .map(|mut started_at| started_at.take());
-            let _ = capture_state
-                .session
-                .lock()
-                .map(|mut coordinator| coordinator.cancel(session_id));
-            reset_dictation_context(&capture_state);
-            drop(capture);
-            let nemotron_live = Arc::clone(&capture_state.nemotron_live);
-            tauri::async_runtime::spawn(async move {
-                let mut live = nemotron_live.lock().await;
-                if live.generation == session_id && live.session_started {
-                    if let Some(server) = live.server.as_mut() {
-                        if server.abort().await.is_err() {
-                            server.terminate();
-                        }
-                    }
-                }
-                if live.generation == session_id {
-                    live.fed_samples = 0;
-                    live.session_started = false;
-                    live.generation = 0;
-                    live.start_error = None;
-                }
-            });
+            // A mid-recording stream error: device unplugged, default source
+            // moved, or a Bluetooth/USB blip. Try to rebuild capture onto the
+            // same timeline before giving up, so a transient glitch does not
+            // lose the whole dictation.
             debug_log::append(&format!(
-                "Capture failed (session: {session_id}, stream_errors: {stream_errors})"
+                "Capture stream error (session: {session_id}, stream_errors: {stream_errors}); attempting recovery"
             ));
-            emit_overlay(
-                &app,
-                "error",
-                "Microphone connection lost. Reconnect or reselect the input device.",
-            );
-            let _ = app.emit("dictation-capture-failed", CaptureFailure { session_id });
-            update_tray_status(&app, TrayVisualState::Ready);
+            emit_overlay(&app, "recording", "Reconnecting microphone…");
+            if recover_capture(&app, session_id).await {
+                debug_log::append(&format!("Capture recovered (session: {session_id})"));
+                continue;
+            }
+            abort_failed_capture(&app, session_id, stream_errors);
             return;
         }
     });
+}
+
+/// Rebuilds capture in-session after a stream error, preserving the audio
+/// captured so far. Returns true when the recording is live again. The failed
+/// capture is dropped first (freeing the device and flushing its tail into the
+/// shared timeline); a fresh stream is then opened appending to that SAME
+/// timeline, with a short backoff because the device may need a moment to
+/// settle (Bluetooth reconnect, PipeWire default move). The session, its
+/// preview generation, and the Nemotron streaming cursor are all left intact,
+/// so only the audio during the outage is lost. During the rebuild window the
+/// capture is briefly absent; the preview loops tolerate that by skipping a
+/// tick rather than exiting.
+async fn recover_capture(app: &AppHandle, session_id: u64) -> bool {
+    let canonical = {
+        let capture_state = app.state::<NativeCaptureState>();
+        let old = match capture_state.capture.lock() {
+            Ok(mut capture) => capture.take(),
+            Err(_) => return false,
+        };
+        let Some(old) = old else {
+            return false;
+        };
+        let canonical = old.canonical_handle();
+        // Drop outside the capture lock: this stops and joins the failed
+        // worker, flushing its tail into `canonical`, before the new stream
+        // starts appending — so no two workers write the timeline at once.
+        drop(old);
+        canonical
+    };
+    let selected_device = app
+        .state::<AppState>()
+        .database
+        .lock()
+        .ok()
+        .and_then(|database| database.settings.selected_input_device.clone());
+    let level = dictation_level_callback(app.clone());
+    let rebuilt = tauri::async_runtime::spawn_blocking(move || {
+        let backoffs = [
+            Duration::from_millis(250),
+            Duration::from_millis(750),
+            Duration::from_millis(1_500),
+            Duration::from_millis(2_500),
+        ];
+        let mut attempt = 0usize;
+        loop {
+            let result =
+                audio::AudioCapture::prepare(selected_device.as_deref()).and_then(|prepared| {
+                    audio::AudioCapture::start_prepared_appending(
+                        &prepared,
+                        Some(Arc::clone(&level)),
+                        Arc::clone(&canonical),
+                    )
+                });
+            match result {
+                Ok(capture) => return Ok(capture),
+                Err(error) if attempt >= backoffs.len() => return Err(error),
+                Err(_) => {
+                    std::thread::sleep(backoffs[attempt]);
+                    attempt += 1;
+                }
+            }
+        }
+    })
+    .await;
+    let capture = match rebuilt {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => {
+            debug_log::append(&format!(
+                "Capture recovery could not reopen the microphone: {error}"
+            ));
+            return false;
+        }
+        Err(error) => {
+            debug_log::append(&format!("Capture recovery task failed: {error}"));
+            return false;
+        }
+    };
+    let capture_state = app.state::<NativeCaptureState>();
+    // If the dictation ended or was superseded during the rebuild, discard the
+    // freshly opened stream rather than resurrecting a dead session.
+    if capture_state.preview_generation.load(Ordering::SeqCst) != session_id {
+        return false;
+    }
+    match capture_state.capture.lock() {
+        Ok(mut guard) => *guard = Some(capture),
+        Err(_) => return false,
+    }
+    true
+}
+
+/// Terminal handling when a capture stream error cannot be recovered: end the
+/// session, tear down any live engine, and tell the UI the recording was lost.
+fn abort_failed_capture(app: &AppHandle, session_id: u64, stream_errors: u64) {
+    let capture_state = app.state::<NativeCaptureState>();
+    if !invalidate_preview_generation(&capture_state, session_id) {
+        // The session already moved on (e.g. the user stopped it); nothing to
+        // abort.
+        return;
+    }
+    let _ = capture_state
+        .capture
+        .lock()
+        .map(|mut capture| capture.take());
+    let _ = capture_state
+        .capture_started_at
+        .lock()
+        .map(|mut started_at| started_at.take());
+    let _ = capture_state
+        .session
+        .lock()
+        .map(|mut coordinator| coordinator.cancel(session_id));
+    reset_dictation_context(&capture_state);
+    let nemotron_live = Arc::clone(&capture_state.nemotron_live);
+    tauri::async_runtime::spawn(async move {
+        let mut live = nemotron_live.lock().await;
+        if live.generation == session_id && live.session_started {
+            if let Some(server) = live.server.as_mut() {
+                if server.abort().await.is_err() {
+                    server.terminate();
+                }
+            }
+        }
+        if live.generation == session_id {
+            live.fed_samples = 0;
+            live.session_started = false;
+            live.generation = 0;
+            live.start_error = None;
+        }
+    });
+    debug_log::append(&format!(
+        "Capture failed unrecoverably (session: {session_id}, stream_errors: {stream_errors})"
+    ));
+    emit_overlay(
+        &app,
+        "error",
+        "Microphone connection lost. Reconnect or reselect the input device.",
+    );
+    let _ = app.emit("dictation-capture-failed", CaptureFailure { session_id });
+    update_tray_status(app, TrayVisualState::Ready);
 }
 
 /// Ensures finalization cannot leave the coordinator stuck when any later
@@ -7289,6 +7392,22 @@ fn spawn_capture_prewarm(handle: AppHandle) {
     });
 }
 
+/// Builds the throttled audio-level callback that feeds the recording overlay
+/// meter. Shared by the initial capture and the mid-recording rebuild so both
+/// emit `dictation-audio-level` at the same ~30 Hz cadence.
+fn dictation_level_callback(app: AppHandle) -> audio::LevelCallback {
+    let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+    Arc::new(move |level| {
+        let Ok(mut last_emit) = last_emit.lock() else {
+            return;
+        };
+        if last_emit.elapsed() >= Duration::from_millis(33) {
+            *last_emit = Instant::now();
+            let _ = app.emit("dictation-audio-level", level);
+        }
+    })
+}
+
 /// Opens the microphone for dictation, preferring the prewarmed target that
 /// was resolved off the hotkey path. On a cache hit the press only builds and
 /// plays the stream; a miss — or a stale entry after a mic-preference change —
@@ -7363,8 +7482,6 @@ fn start_native_dictation(
         prompt_profile_id: prompt_profile_id.clone(),
         preceding_text,
     };
-    let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
-    let app_for_levels = app.clone();
     let (settings, custom_words, cloud_profile, dictionary) = {
         let database = state
             .database
@@ -7430,19 +7547,10 @@ fn start_native_dictation(
         rollback_native_dictation_start(&capture_state, preview_generation);
         return Err(error);
     }
-    let level_callback: audio::LevelCallback = Arc::new(move |level| {
-        let Ok(mut last_emit) = last_emit.lock() else {
-            return;
-        };
-        if last_emit.elapsed() >= Duration::from_millis(33) {
-            *last_emit = Instant::now();
-            let _ = app_for_levels.emit("dictation-audio-level", level);
-        }
-    });
     let started = match start_dictation_capture(
         &capture_state,
         settings.selected_input_device.as_deref(),
-        level_callback,
+        dictation_level_callback(app.clone()),
     ) {
         Ok(capture) => capture,
         Err(error) => {
@@ -7638,7 +7746,11 @@ fn spawn_live_whisper_preview(
                     .and_then(|capture| capture.snapshot_recent(Duration::from_secs(8)).ok())
             });
             let Some(captured) = captured else {
-                return;
+                // Capture is briefly absent while a mid-recording device error
+                // is recovered (see recover_capture); skip this tick and
+                // re-check the session generation next iteration rather than
+                // exiting, so the live preview resumes once capture is rebuilt.
+                continue;
             };
             if captured.duration_ms < 1_000 {
                 continue;
@@ -7774,7 +7886,11 @@ fn spawn_live_parakeet_preview(
                     .and_then(|capture| capture.snapshot_recent(PARAKEET_PREVIEW_WINDOW).ok())
             });
             let Some(captured) = captured else {
-                return;
+                // Capture is briefly absent while a mid-recording device error
+                // is recovered (see recover_capture); skip this tick and
+                // re-check the session generation next iteration rather than
+                // exiting, so the live preview resumes once capture is rebuilt.
+                continue;
             };
             let samples = match audio::mono_resample_for_whisper(captured) {
                 Ok(samples) => samples,
@@ -7873,7 +7989,11 @@ fn spawn_live_nemotron_stream(
                     .and_then(|capture| capture.snapshot_all().ok())
             });
             let Some(captured) = captured else {
-                return;
+                // Capture is briefly absent while a mid-recording device error
+                // is recovered (see recover_capture); skip this tick and
+                // re-check the session generation next iteration rather than
+                // exiting, so the live preview resumes once capture is rebuilt.
+                continue;
             };
             let samples = match audio::mono_resample_for_whisper(captured) {
                 Ok(samples) => samples,
@@ -8056,7 +8176,11 @@ fn spawn_live_cloud_preview(
                     .and_then(|capture| capture.snapshot_recent(Duration::from_secs(20)).ok())
             });
             let Some(captured) = captured else {
-                return;
+                // Capture is briefly absent while a mid-recording device error
+                // is recovered (see recover_capture); skip this tick and
+                // re-check the session generation next iteration rather than
+                // exiting, so the live preview resumes once capture is rebuilt.
+                continue;
             };
             if captured.duration_ms < 1_000 {
                 continue;
@@ -8118,7 +8242,11 @@ fn spawn_live_apple_speech_preview(
                     .and_then(|capture| capture.snapshot_recent(Duration::from_secs(20)).ok())
             });
             let Some(captured) = captured else {
-                return;
+                // Capture is briefly absent while a mid-recording device error
+                // is recovered (see recover_capture); skip this tick and
+                // re-check the session generation next iteration rather than
+                // exiting, so the live preview resumes once capture is rebuilt.
+                continue;
             };
             if captured.duration_ms < 1_000 {
                 continue;
