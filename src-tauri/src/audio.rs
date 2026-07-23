@@ -255,6 +255,17 @@ impl AudioCapture {
             .max(RAW_RING_MINIMUM_SAMPLES);
         let (mut producer, consumer) = rtrb::RingBuffer::<RawSample>::new(ring_capacity);
         let counters = Arc::new(CaptureCounters::default());
+        // When rebuilding onto an existing timeline (mid-recording recovery),
+        // seed the produced-sample counter from what is already captured, so
+        // canonical_duration_ms() — and therefore the reported dictation
+        // duration, analytics, and the clock-divergence check — spans the WHOLE
+        // recording, not just the audio captured since the rebuild. A fresh
+        // capture starts from an empty timeline, so this seeds 0.
+        if let Ok(existing) = canonical_samples.lock() {
+            counters
+                .canonical_samples
+                .store(existing.len() as u64, Ordering::Relaxed);
+        }
         let stop_worker = Arc::new(AtomicBool::new(false));
         let worker = spawn_capture_worker(
             consumer,

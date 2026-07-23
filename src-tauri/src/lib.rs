@@ -1750,6 +1750,10 @@ struct NativeCaptureState {
     // Device + config + routing resolved off the record hotkey path so a press
     // only opens hardware. Populated at startup and refreshed on a cold miss.
     prepared_input: Mutex<Option<PreparedCapture>>,
+    // True while a mid-recording capture rebuild is in flight (see
+    // recover_capture): the capture is briefly absent, so stop_native_dictation
+    // waits for it to reappear instead of failing with "not recording".
+    recovering: AtomicBool,
     session: Arc<Mutex<session::Coordinator>>,
     context: Mutex<DictationContext>,
     continuous_context: Mutex<ContinuousDictationContext>,
@@ -1764,6 +1768,7 @@ impl Default for NativeCaptureState {
             capture: Mutex::new(None),
             capture_started_at: Mutex::new(None),
             prepared_input: Mutex::new(None),
+            recovering: AtomicBool::new(false),
             session: Arc::new(Mutex::new(session::Coordinator::default())),
             context: Mutex::new(DictationContext::default()),
             continuous_context: Mutex::new(ContinuousDictationContext::default()),
@@ -1900,7 +1905,12 @@ fn spawn_capture_error_monitor(app: AppHandle, session_id: u64) {
                 "Capture stream error (session: {session_id}, stream_errors: {stream_errors}); attempting recovery"
             ));
             emit_overlay(&app, "recording", "Reconnecting microphone…");
-            if recover_capture(&app, session_id).await {
+            // Flag recovery so a concurrent stop waits for the rebuilt capture
+            // rather than failing; cleared however recovery ends.
+            capture_state.recovering.store(true, Ordering::SeqCst);
+            let recovered = recover_capture(&app, session_id).await;
+            capture_state.recovering.store(false, Ordering::SeqCst);
+            if recovered {
                 debug_log::append(&format!("Capture recovered (session: {session_id})"));
                 continue;
             }
@@ -8435,6 +8445,29 @@ async fn stop_native_dictation(
     prompt_test_prompt: Option<String>,
     engine_test_mode: Option<bool>,
 ) -> Result<NativeTranscriptionResult, String> {
+    // If a mid-recording device error is being recovered, the capture is
+    // briefly absent while the stream is rebuilt. Wait — before claiming the
+    // session, so recovery can still reinstall it under the current generation
+    // — for a bounded window, so pressing stop during recovery finalizes the
+    // buffered audio instead of failing with "Dictation is not recording". Only
+    // waits when a recovery is actually in flight, so a genuine not-recording
+    // stop still errors immediately.
+    {
+        let mut waited = Duration::ZERO;
+        let poll = Duration::from_millis(50);
+        let limit = Duration::from_millis(1_500);
+        while waited < limit
+            && capture_state.recovering.load(Ordering::SeqCst)
+            && capture_state
+                .capture
+                .lock()
+                .map(|capture| capture.is_none())
+                .unwrap_or(false)
+        {
+            tokio::time::sleep(poll).await;
+            waited += poll;
+        }
+    }
     let recording_generation = capture_state
         .preview_generation
         .fetch_add(1, Ordering::SeqCst);
