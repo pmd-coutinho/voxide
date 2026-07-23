@@ -1752,16 +1752,7 @@ fn openai_chat_request<'a>(
 ) -> OpenAiRequest<'a> {
     OpenAiRequest {
         model: &profile.model,
-        messages: vec![
-            OpenAiMessage {
-                role: "system",
-                content: system_prompt,
-            },
-            OpenAiMessage {
-                role: "user",
-                content: input,
-            },
-        ],
+        messages: openai_messages(system_prompt, input),
         temperature: (!is_temperature_unsupported(&profile.model)).then_some(temperature),
         max_completion_tokens: is_reasoning_model(&profile.model)
             .then_some(max_tokens)
@@ -1769,6 +1760,25 @@ fn openai_chat_request<'a>(
         stream,
         request_parameters: &profile.request_parameters,
     }
+}
+
+/// The system+user pair for a chat/responses request, omitting the system
+/// message entirely when the prompt is empty. A blank system turn is at best
+/// wasted and at worst rejected by some OpenAI-compatible proxies, and the
+/// dictation `${transcript}` fold deliberately produces an empty system prompt.
+fn openai_messages<'a>(system_prompt: &'a str, input: &'a str) -> Vec<OpenAiMessage<'a>> {
+    let mut messages = Vec::with_capacity(2);
+    if !system_prompt.trim().is_empty() {
+        messages.push(OpenAiMessage {
+            role: "system",
+            content: system_prompt,
+        });
+    }
+    messages.push(OpenAiMessage {
+        role: "user",
+        content: input,
+    });
+    messages
 }
 
 fn openai_responses_request<'a>(
@@ -1781,16 +1791,7 @@ fn openai_responses_request<'a>(
 ) -> OpenAiResponsesRequest<'a> {
     OpenAiResponsesRequest {
         model: &profile.model,
-        input: vec![
-            OpenAiMessage {
-                role: "system",
-                content: system_prompt,
-            },
-            OpenAiMessage {
-                role: "user",
-                content: input,
-            },
-        ],
+        input: openai_messages(system_prompt, input),
         store: false,
         temperature: (!is_temperature_unsupported(&profile.model)).then_some(temperature),
         max_output_tokens: max_tokens,

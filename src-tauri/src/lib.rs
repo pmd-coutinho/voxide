@@ -5026,6 +5026,28 @@ fn effective_dictation_system_prompt(
         .unwrap_or_else(|| profile.prompt.clone())
 }
 
+/// Placeholder a dictation prompt can embed to control exactly where the
+/// transcript is inserted, folding the instruction and transcript into one user
+/// turn instead of the default system+user split.
+const TRANSCRIPT_PLACEHOLDER: &str = "${transcript}";
+
+/// Builds the (system, user) pair for AI enhancement. If the prompt contains
+/// `${transcript}`, every occurrence is replaced with the transcript and the
+/// result becomes a single user turn with an empty system prompt — giving
+/// power users precise placement and better instruction-following on
+/// local/instruct models. Without the placeholder the classic system+user
+/// layout is preserved, so existing prompts behave exactly as before.
+fn fold_dictation_prompt(system_prompt: &str, transcript: &str) -> (String, String) {
+    if system_prompt.contains(TRANSCRIPT_PLACEHOLDER) {
+        (
+            String::new(),
+            system_prompt.replace(TRANSCRIPT_PLACEHOLDER, transcript),
+        )
+    } else {
+        (system_prompt.to_owned(), transcript.to_owned())
+    }
+}
+
 async fn post_process_dictation_outcome(
     state: &AppState,
     raw_text: String,
@@ -5069,6 +5091,10 @@ async fn post_process_dictation_outcome(
     {
         (dictionary_corrected, None, false, None)
     } else {
+        // ${transcript} placeholder: when the prompt embeds it, fold
+        // instruction + transcript into a single user turn (empty system);
+        // otherwise keep the classic system+user split so prompts are unchanged.
+        let (ai_system, ai_input) = fold_dictation_prompt(&system_prompt, &dictionary_corrected);
         let enhanced = match provider_api_key(&provider.id) {
             Ok(api_key) => match ensure_provider_verified(&settings, &provider, api_key.as_deref())
             {
@@ -5079,8 +5105,8 @@ async fn post_process_dictation_outcome(
                     let streaming = provider::process_streaming_with_options(
                         &provider,
                         api_key.as_deref(),
-                        &system_prompt,
-                        &dictionary_corrected,
+                        &ai_system,
+                        &ai_input,
                         Duration::from_secs(120),
                         0.2,
                         None,
@@ -5096,8 +5122,8 @@ async fn post_process_dictation_outcome(
                             provider::process_with_options_timeout(
                                 &provider,
                                 api_key.as_deref(),
-                                &system_prompt,
-                                &dictionary_corrected,
+                                &ai_system,
+                                &ai_input,
                                 Duration::from_secs(120),
                                 0.2,
                                 None,
@@ -10401,6 +10427,23 @@ mod tests {
             .verified_provider_fingerprints
             .insert(ollama.id.clone(), local_fingerprint);
         assert!(ensure_provider_verified(&settings, &ollama, None).is_ok());
+    }
+
+    #[test]
+    fn fold_dictation_prompt_uses_the_placeholder_or_keeps_the_split() {
+        // No placeholder: the classic system + user split is preserved.
+        let (system, input) = fold_dictation_prompt("Clean up the text.", "hello world");
+        assert_eq!(system, "Clean up the text.");
+        assert_eq!(input, "hello world");
+
+        // Placeholder present: single user turn, empty system, every occurrence
+        // replaced with the transcript.
+        let (system, input) = fold_dictation_prompt(
+            "Rewrite ${transcript} formally. Original: ${transcript}",
+            "hi there",
+        );
+        assert!(system.is_empty());
+        assert_eq!(input, "Rewrite hi there formally. Original: hi there");
     }
 
     #[test]
