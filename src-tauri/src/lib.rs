@@ -621,6 +621,12 @@ struct Settings {
     selected_rewrite_ai_provider: Option<String>,
     selected_command_ai_provider: Option<String>,
     model_reasoning_configs: HashMap<String, ModelReasoningConfig>,
+    // SHA-256 fingerprint of the (base URL | API key) that last passed a
+    // provider connection test, keyed by provider id. AI enhancement only fires
+    // when the live fingerprint still matches, so a rotated key or edited base
+    // URL is caught before the transcript is transmitted to that endpoint.
+    #[serde(default)]
+    verified_provider_fingerprints: HashMap<String, String>,
     command_mode_confirm_before_execute: bool,
     overlay_position: OverlayPosition,
     overlay_bottom_offset: f64,
@@ -714,6 +720,7 @@ impl Default for Settings {
             selected_rewrite_ai_provider: None,
             selected_command_ai_provider: None,
             model_reasoning_configs: HashMap::new(),
+            verified_provider_fingerprints: HashMap::new(),
             command_mode_confirm_before_execute: true,
             overlay_position: OverlayPosition::Bottom,
             overlay_bottom_offset: 50.0,
@@ -3560,6 +3567,62 @@ fn provider_api_key(provider_id: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// SHA-256 fingerprint of an AI provider's reachable identity — its trimmed
+/// base URL joined with its trimmed API key. Recorded when a connection test
+/// succeeds and re-checked before AI enhancement fires, so a rotated key or an
+/// edited base URL invalidates the match automatically. Returns `None` when the
+/// base URL is empty (there is nothing to verify).
+fn provider_fingerprint(base_url: &str, api_key: Option<&str>) -> Option<String> {
+    let base = base_url.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let key = api_key.unwrap_or_default().trim();
+    Some(format!(
+        "{:x}",
+        Sha256::digest(format!("{base}|{key}").as_bytes())
+    ))
+}
+
+/// Guards AI post-processing. Returns `Err(reason)` — surfaced to the user
+/// instead of a silent downgrade to deterministic text — unless the provider is
+/// fully configured AND its live (base URL | key) fingerprint matches the one
+/// stored when its connection was last verified. This keeps a dictation
+/// transcript from ever being transmitted to an unverified or drifted endpoint,
+/// and turns config drift (rotated key, edited URL, removed model) into a clear
+/// message rather than a request that quietly leaks the transcript or hangs.
+fn ensure_provider_verified(
+    settings: &Settings,
+    provider: &provider::AiProviderProfile,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    if provider.id.trim().is_empty() || provider.model.trim().is_empty() {
+        return Err(
+            "AI enhancement is on but no provider or model is configured. Choose one in Settings."
+                .into(),
+        );
+    }
+    if !provider::is_local_endpoint(&provider.base_url)
+        && api_key.unwrap_or_default().trim().is_empty()
+    {
+        return Err(
+            "AI enhancement is on but this provider has no API key. Add one in Settings.".into(),
+        );
+    }
+    let Some(current) = provider_fingerprint(&provider.base_url, api_key) else {
+        return Err(
+            "AI enhancement is on but the provider base URL is empty. Fix it in Settings.".into(),
+        );
+    };
+    match settings.verified_provider_fingerprints.get(&provider.id) {
+        Some(stored) if *stored == current => Ok(()),
+        _ => Err(
+            "AI provider is not verified. In Settings, use \"Fetch models\" (or run it once via rewrite/playground) to verify the connection, then enhancement will run."
+                .into(),
+        ),
+    }
+}
+
 fn cloud_transcription_profile(
     settings: &Settings,
     database: &AppDatabase,
@@ -3781,7 +3844,24 @@ async fn fetch_ai_provider_models(
             .map_err(|_| "Voxide data lock was poisoned".to_string())?;
         selected_provider(&database, Some(&provider_id))?
     };
-    provider::fetch_models(&profile, provider_api_key(&profile.id)?.as_deref()).await
+    let api_key = provider_api_key(&profile.id)?;
+    let models = provider::fetch_models(&profile, api_key.as_deref()).await?;
+    // A successful model fetch proves this provider is reachable with the
+    // current base URL + key, so record its fingerprint. AI enhancement checks
+    // it before sending a transcript; a later key/URL change stops matching and
+    // re-gates enhancement until the connection is tested again.
+    if let Some(fingerprint) = provider_fingerprint(&profile.base_url, api_key.as_deref()) {
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+        database
+            .settings
+            .verified_provider_fingerprints
+            .insert(profile.id.clone(), fingerprint);
+        state.persist(&database)?;
+    }
+    Ok(models)
 }
 
 #[tauri::command]
@@ -3832,6 +3912,22 @@ async fn enhance_text(
             ],
         ),
     );
+    // A successful run confirms this provider is reachable with the current
+    // base URL + key over the CHAT endpoint (not /models), so it verifies
+    // providers that lack a models endpoint too. Record the fingerprint so
+    // automatic dictation post-processing can trust this provider. Best-effort:
+    // never fail an enhancement the user already received over a storage hiccup.
+    if result.is_ok() {
+        if let Some(fingerprint) = provider_fingerprint(&profile.base_url, api_key.as_deref()) {
+            if let Ok(mut database) = state.database.lock() {
+                database
+                    .settings
+                    .verified_provider_fingerprints
+                    .insert(profile.id.clone(), fingerprint);
+                let _ = state.persist(&database);
+            }
+        }
+    }
     result
 }
 
@@ -4974,25 +5070,30 @@ async fn post_process_dictation_outcome(
         (dictionary_corrected, None, false, None)
     } else {
         let enhanced = match provider_api_key(&provider.id) {
-            Ok(api_key) => {
-                let streaming = provider::process_streaming_with_options(
-                    &provider,
-                    api_key.as_deref(),
-                    &system_prompt,
-                    &dictionary_corrected,
-                    Duration::from_secs(120),
-                    0.2,
-                    None,
-                    &mut *on_delta,
-                )
-                .await;
-                match streaming {
-                    Ok(text) => Ok(text),
-                    Err(streaming_error) => {
-                        // Voxide shows live refinement when the provider
-                        // supports SSE, then retries the same request as a
-                        // complete reply for providers/proxies that do not.
-                        provider::process_with_options_timeout(
+            Ok(api_key) => match ensure_provider_verified(&settings, &provider, api_key.as_deref())
+            {
+                // Never transmit the transcript to an unverified/drifted
+                // endpoint; fall back to deterministic text with the reason.
+                Err(reason) => Err(reason),
+                Ok(()) => {
+                    let streaming = provider::process_streaming_with_options(
+                        &provider,
+                        api_key.as_deref(),
+                        &system_prompt,
+                        &dictionary_corrected,
+                        Duration::from_secs(120),
+                        0.2,
+                        None,
+                        &mut *on_delta,
+                    )
+                    .await;
+                    match streaming {
+                        Ok(text) => Ok(text),
+                        Err(streaming_error) => {
+                            // Voxide shows live refinement when the provider
+                            // supports SSE, then retries the same request as a
+                            // complete reply for providers/proxies that do not.
+                            provider::process_with_options_timeout(
                                 &provider,
                                 api_key.as_deref(),
                                 &system_prompt,
@@ -5007,9 +5108,10 @@ async fn post_process_dictation_outcome(
                                     "Streaming refinement failed ({streaming_error}); complete-reply retry failed: {fallback_error}"
                                 )
                             })
+                        }
                     }
                 }
-            }
+            },
             Err(error) => Err(error),
         };
         match enhanced {
@@ -10246,6 +10348,59 @@ mod tests {
         // Empty vocabulary / no matches yield nothing.
         assert!(detected_vocabulary_terms(text, &[], 8).is_empty());
         assert!(detected_vocabulary_terms("nothing here", &vocabulary, 8).is_empty());
+    }
+
+    #[test]
+    fn ai_provider_verification_gates_on_a_matching_fingerprint() {
+        let providers = provider::AiProviderProfile::built_in();
+        let openai = providers
+            .iter()
+            .find(|profile| profile.id == "openai")
+            .expect("built-in openai profile")
+            .clone();
+        let mut ollama = providers
+            .iter()
+            .find(|profile| profile.id == "ollama")
+            .expect("built-in ollama profile")
+            .clone();
+
+        // The fingerprint is stable and sensitive to both key and base URL.
+        let fingerprint = provider_fingerprint(&openai.base_url, Some("k1")).unwrap();
+        assert_eq!(
+            fingerprint,
+            provider_fingerprint(&openai.base_url, Some("k1")).unwrap()
+        );
+        assert_ne!(
+            fingerprint,
+            provider_fingerprint(&openai.base_url, Some("k2")).unwrap()
+        );
+        assert_ne!(
+            fingerprint,
+            provider_fingerprint("https://proxy.example/v1", Some("k1")).unwrap()
+        );
+        assert!(provider_fingerprint("   ", Some("k1")).is_none());
+
+        let mut settings = Settings::default();
+        // Remote provider with no key, or with a key but no stored fingerprint,
+        // is gated; only a matching stored fingerprint unlocks it.
+        assert!(ensure_provider_verified(&settings, &openai, None).is_err());
+        assert!(ensure_provider_verified(&settings, &openai, Some("k1")).is_err());
+        settings
+            .verified_provider_fingerprints
+            .insert(openai.id.clone(), fingerprint);
+        assert!(ensure_provider_verified(&settings, &openai, Some("k1")).is_ok());
+        // A rotated key no longer matches the stored fingerprint.
+        assert!(ensure_provider_verified(&settings, &openai, Some("k2")).is_err());
+
+        // A localhost provider needs no key, but still needs a model and a
+        // matching fingerprint. Its built-in model is empty, so it is gated.
+        assert!(ensure_provider_verified(&settings, &ollama, None).is_err());
+        ollama.model = "llama3".into();
+        let local_fingerprint = provider_fingerprint(&ollama.base_url, None).unwrap();
+        settings
+            .verified_provider_fingerprints
+            .insert(ollama.id.clone(), local_fingerprint);
+        assert!(ensure_provider_verified(&settings, &ollama, None).is_ok());
     }
 
     #[test]
