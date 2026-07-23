@@ -304,33 +304,65 @@ mod implementation {
     }
 
     /// Uses Sherpa's TDT context graph for FluidVoice-style final vocabulary
-    /// boosting. Preview intentionally calls `transcribe` instead, because
-    /// FluidVoice applies vocabulary rescoring only to the final manager.
-    /// `hotwords` is the pre-built `phrase :score/…` string (already sanitized,
-    /// length-filtered, and per-term scored by the caller).
-    pub fn transcribe_with_hotwords(
+    /// boosting, and also returns per-word acoustic time spans so a
+    /// pronunciation match can be mapped back onto the transcript. Preview
+    /// intentionally calls `transcribe` instead, because FluidVoice applies
+    /// vocabulary rescoring only to the final manager. `hotwords` is the
+    /// pre-built `phrase :score/…` string (already sanitized, length-filtered,
+    /// and per-term scored by the caller). A boosted decode that fails falls
+    /// back to the unboosted one so a custom term never fails a dictation.
+    pub fn transcribe_with_hotwords_timed(
         samples: &[f32],
         model_directory: &Path,
         hotwords: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<super::TimedWord>), String> {
         if samples.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), Vec::new()));
         }
-        let Some(hotwords) = hotwords.filter(|hotwords| !hotwords.trim().is_empty()) else {
-            return transcribe(samples, model_directory);
-        };
-        match decode(samples, model_directory, Some(hotwords)) {
-            Ok(result) => Ok(result.text.trim().to_owned()),
-            Err(error) => {
-                // FluidVoice similarly falls back to its ordinary final
-                // manager if the boosted manager cannot transcribe. A custom
-                // term must never make a completed dictation fail outright.
+        let result = match hotwords.filter(|hotwords| !hotwords.trim().is_empty()) {
+            Some(hotwords) => decode(samples, model_directory, Some(hotwords)).or_else(|error| {
                 debug_log::append(&format!(
                     "Parakeet vocabulary boosting failed; retrying the unboosted final decode: {error}"
                 ));
-                transcribe(samples, model_directory)
+                decode(samples, model_directory, None)
+            })?,
+            None => decode(samples, model_directory, None)?,
+        };
+        let words = group_timed_words(&result);
+        Ok((result.text.trim().to_owned(), words))
+    }
+
+    /// Group sherpa's BPE tokens into words. SentencePiece marks the first
+    /// token of a word with a leading U+2581 ("▁"). Returns empty if the
+    /// decoder gave no per-token timestamps (then acoustic mapping is skipped).
+    fn group_timed_words(result: &OfflineRecognizerResult) -> Vec<super::TimedWord> {
+        let timestamps = match result.timestamps.as_deref() {
+            Some(timestamps) if timestamps.len() == result.tokens.len() => timestamps,
+            _ => return Vec::new(),
+        };
+        let durations = result.durations.as_deref();
+        let mut words: Vec<super::TimedWord> = Vec::new();
+        for (index, token) in result.tokens.iter().enumerate() {
+            let start = timestamps[index];
+            let end = durations
+                .and_then(|durations| durations.get(index))
+                .map(|duration| start + duration)
+                .or_else(|| timestamps.get(index + 1).copied())
+                .unwrap_or(start + 0.24);
+            let piece = token.strip_prefix('\u{2581}');
+            if piece.is_some() || words.is_empty() {
+                words.push(super::TimedWord {
+                    text: piece.unwrap_or(token).to_owned(),
+                    start,
+                    end,
+                });
+            } else if let Some(last) = words.last_mut() {
+                last.text.push_str(token);
+                last.end = end;
             }
         }
+        words.retain(|word| !word.text.trim().is_empty());
+        words
     }
 
     fn decode(
@@ -353,11 +385,20 @@ mod implementation {
     }
 }
 
+/// A decoded word with its acoustic time span (seconds). Used to map an
+/// acoustic pronunciation match back onto the words of the transcript.
+#[derive(Debug, Clone)]
+pub struct TimedWord {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
 #[cfg(feature = "parakeet")]
 pub use implementation::{
     preload, preload_with_hotwords, transcribe as transcribe_samples,
     transcribe_preview as transcribe_preview_samples,
-    transcribe_with_hotwords as transcribe_samples_with_hotwords,
+    transcribe_with_hotwords_timed as transcribe_samples_with_hotwords_timed,
 };
 
 #[cfg(not(feature = "parakeet"))]
@@ -381,11 +422,11 @@ pub fn transcribe_preview_samples(_: &[f32], _: &Path) -> Result<String, String>
 }
 
 #[cfg(not(feature = "parakeet"))]
-pub fn transcribe_samples_with_hotwords(
+pub fn transcribe_samples_with_hotwords_timed(
     _: &[f32],
     _: &Path,
     _: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<TimedWord>), String> {
     Err("Parakeet is included only in the CUDA build".into())
 }
 
@@ -475,9 +516,14 @@ mod tests {
         let hotwords = "country :1.50";
         preload_with_hotwords(&directory, Some(hotwords))
             .expect("preload CUDA vocabulary-boosted final model");
-        let text = transcribe_samples_with_hotwords(&samples, &directory, Some(hotwords))
-            .expect("decode reference WAV with CUDA vocabulary boosting");
-        println!("Parakeet vocabulary transcript: {text}");
+        let (text, words) =
+            transcribe_samples_with_hotwords_timed(&samples, &directory, Some(hotwords))
+                .expect("decode reference WAV with CUDA vocabulary boosting");
+        println!(
+            "Parakeet vocabulary transcript: {text} ({} words)",
+            words.len()
+        );
         assert!(text.to_ascii_lowercase().contains("country"));
+        assert!(!words.is_empty());
     }
 }

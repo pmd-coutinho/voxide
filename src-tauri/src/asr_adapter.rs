@@ -204,11 +204,36 @@ impl VoiceEngine {
             }
             Self::Parakeet => {
                 let model = parakeet_model_path(state)?;
-                let text = tauri::async_runtime::spawn_blocking(move || {
+                // Decide acoustic pronunciation matching before samples move
+                // into the blocking decode; keep a copy only when it applies.
+                let prototypes = pronunciation_prototypes(state, settings)?;
+                let match_samples = (!prototypes.is_empty()
+                    && (samples.len() as f32 / audio::WHISPER_SAMPLE_RATE as f32)
+                        <= PRONUNCIATION_MAX_UTTERANCE_SECONDS)
+                    .then(|| samples.clone());
+                let (mut text, words) = tauri::async_runtime::spawn_blocking(move || {
                     transcribe_parakeet_final(&samples, &model, &custom_words)
                 })
                 .await
                 .map_err(|error| format!("Parakeet voice engine task failed: {error}"))??;
+                if let Some(match_samples) = match_samples.filter(|_| !words.is_empty()) {
+                    match apply_pronunciation_matching(
+                        capture_state,
+                        state,
+                        &match_samples,
+                        &words,
+                        &prototypes,
+                    )
+                    .await
+                    {
+                        Ok(Some(corrected)) => text = corrected,
+                        Ok(None) => {}
+                        // A pronunciation failure must never fail a dictation.
+                        Err(error) => {
+                            debug_log::append(&format!("Pronunciation matching skipped: {error}"))
+                        }
+                    }
+                }
                 Ok(EngineFinalTranscript {
                     text,
                     whisper_timings: None,

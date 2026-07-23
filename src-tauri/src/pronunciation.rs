@@ -9,10 +9,6 @@
 //! 16 kHz float PCM is written to the child's stdin. The sidecar is opt-in and
 //! spawned only while pronunciation matching is in use.
 
-// TODO(phase 2/3): remove once enrollment + finalize matching call the Server
-// API below; landed in Phase 1 as a verified, self-tested transport layer.
-#![allow(dead_code)]
-
 use std::{
     path::{Path, PathBuf},
     process::Stdio,

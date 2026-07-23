@@ -1105,6 +1105,13 @@ const MAX_PRONUNCIATION_ENROLLMENTS: usize = 10;
 const MIN_PRONUNCIATION_ENROLLMENTS: usize = 3;
 /// The acoustic model a profile is trained against (Parakeet TDT).
 const PRONUNCIATION_MODEL_KEY: &str = "parakeet-tdt-0.6b-v2";
+/// Skip acoustic matching for long dictations (mirrors FluidVoice's 15 s gate):
+/// the sliding-window search + second encoder pass are only worth it for short
+/// utterances where a hard name is likely.
+const PRONUNCIATION_MAX_UTTERANCE_SECONDS: f32 = 15.0;
+/// Minimum cosine similarity for an acoustic match to rewrite a word span.
+/// Tuned conservatively from the spike; refine against real speech.
+const PRONUNCIATION_ACCEPTANCE_THRESHOLD: f32 = 0.5;
 
 // Voxide's Parakeet biasing runs through sherpa-onnx's context graph, whose
 // boost scale (~1.5) differs from FluidVoice's CTC weight scale (~5–13). These
@@ -7168,6 +7175,134 @@ fn delete_pronunciation_profile(
     })
 }
 
+/// Average a profile's enrollments into one prototype embedding for matching.
+fn average_prototype(profile: &PronunciationProfile) -> Option<pronunciation::Prototype> {
+    let count = profile.enrollments.len();
+    if count == 0 || profile.hidden_size == 0 {
+        return None;
+    }
+    let mut mean = vec![0.0f32; profile.hidden_size];
+    let mut frame_total: u64 = 0;
+    for enrollment in &profile.enrollments {
+        if enrollment.values.len() != profile.hidden_size {
+            return None;
+        }
+        for (accumulator, value) in mean.iter_mut().zip(&enrollment.values) {
+            *accumulator += value;
+        }
+        frame_total += enrollment.frames as u64;
+    }
+    for value in mean.iter_mut() {
+        *value /= count as f32;
+    }
+    Some(pronunciation::Prototype {
+        label: profile.label.clone(),
+        values: mean,
+        frames: (frame_total / count as u64) as u32,
+    })
+}
+
+/// Prototypes for the active Parakeet model, or empty when matching is off /
+/// no profile has enough enrollments.
+fn pronunciation_prototypes(
+    state: &AppState,
+    settings: &Settings,
+) -> Result<Vec<pronunciation::Prototype>, String> {
+    if !settings.pronunciation_matching_enabled || !pronunciation::is_compiled() {
+        return Ok(Vec::new());
+    }
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?;
+    Ok(database
+        .pronunciation_profiles
+        .iter()
+        .filter(|profile| {
+            profile.model_key == PRONUNCIATION_MODEL_KEY
+                && profile.enrollments.len() >= MIN_PRONUNCIATION_ENROLLMENTS
+        })
+        .filter_map(average_prototype)
+        .collect())
+}
+
+/// Rewrite the words an accepted acoustic match covers with the match's label.
+/// Matches are claimed highest-score-first and never overlap; a word belongs to
+/// a match when its time midpoint falls inside the matched span. Returns `None`
+/// (leave the transcript untouched) when nothing clears the threshold.
+fn apply_pronunciation_matches(
+    words: &[parakeet::TimedWord],
+    matches: &[pronunciation::PronunciationMatch],
+    threshold: f32,
+) -> Option<String> {
+    let mut accepted: Vec<&pronunciation::PronunciationMatch> =
+        matches.iter().filter(|m| m.score >= threshold).collect();
+    accepted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Per word: None = keep; Some(usize::MAX) = absorbed into a label; Some(i) =
+    // emit labels[i].
+    let mut claim: Vec<Option<usize>> = vec![None; words.len()];
+    let mut labels: Vec<String> = Vec::new();
+    for candidate in accepted {
+        let covered: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| {
+                let midpoint = (word.start + word.end) / 2.0;
+                candidate.start_time <= midpoint && midpoint <= candidate.end_time
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if covered.is_empty() || covered.iter().any(|&index| claim[index].is_some()) {
+            continue;
+        }
+        let label_index = labels.len();
+        labels.push(candidate.label.clone());
+        for (position, &index) in covered.iter().enumerate() {
+            claim[index] = Some(if position == 0 {
+                label_index
+            } else {
+                usize::MAX
+            });
+        }
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    let mut output: Vec<String> = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        match claim[index] {
+            None => output.push(word.text.clone()),
+            Some(marker) if marker == usize::MAX => {}
+            Some(label_index) => output.push(labels[label_index].clone()),
+        }
+    }
+    Some(output.join(" "))
+}
+
+/// Run the warm sidecar's acoustic match and apply any accepted substitutions.
+async fn apply_pronunciation_matching(
+    capture_state: &NativeCaptureState,
+    state: &AppState,
+    samples: &[f32],
+    words: &[parakeet::TimedWord],
+    prototypes: &[pronunciation::Prototype],
+) -> Result<Option<String>, String> {
+    let matches = {
+        let mut guard = capture_state.pronunciation_server.lock().await;
+        let server = ensure_pronunciation_server(&mut guard, state).await?;
+        server.match_prototypes(samples, prototypes).await?
+    };
+    Ok(apply_pronunciation_matches(
+        words,
+        &matches,
+        PRONUNCIATION_ACCEPTANCE_THRESHOLD,
+    ))
+}
+
 const NEMOTRON_MODEL_FILES: [&str; 6] = [
     "config.json",
     "generation_config.json",
@@ -8840,8 +8975,8 @@ fn transcribe_parakeet_final(
     samples: &[f32],
     model_path: &Path,
     vocabulary: &RecognitionVocabulary,
-) -> Result<String, String> {
-    let text = parakeet::transcribe_samples_with_hotwords(
+) -> Result<(String, Vec<parakeet::TimedWord>), String> {
+    let (text, words) = parakeet::transcribe_samples_with_hotwords_timed(
         samples,
         model_path,
         vocabulary.parakeet_hotwords.as_deref(),
@@ -8853,7 +8988,7 @@ fn transcribe_parakeet_final(
             debug_log::append(&format!("BOOST_HIT: {}", hits.join(", ")));
         }
     }
-    Ok(text)
+    Ok((text, words))
 }
 
 /// Flushes the active Nemotron stream with the capture tail that the 80 ms
@@ -11113,6 +11248,96 @@ mod tests {
         // Empty vocabulary / no matches yield nothing.
         assert!(detected_vocabulary_terms(text, &[], 8).is_empty());
         assert!(detected_vocabulary_terms("nothing here", &vocabulary, 8).is_empty());
+    }
+
+    fn timed(text: &str, start: f32, end: f32) -> parakeet::TimedWord {
+        parakeet::TimedWord {
+            text: text.into(),
+            start,
+            end,
+        }
+    }
+
+    fn matched(label: &str, start: f32, end: f32, score: f32) -> pronunciation::PronunciationMatch {
+        pronunciation::PronunciationMatch {
+            label: label.into(),
+            start_time: start,
+            end_time: end,
+            score,
+        }
+    }
+
+    #[test]
+    fn pronunciation_match_rewrites_the_covered_word_span_with_the_label() {
+        let words = [
+            timed("deploy", 0.0, 0.4),
+            timed("on", 0.4, 0.6),
+            timed("cuber", 0.6, 1.0),
+            timed("netes", 1.0, 1.4),
+            timed("today", 1.4, 1.8),
+        ];
+        // A match spanning "cuber netes" (midpoints 0.8 and 1.2 inside 0.7..1.3).
+        let matches = [matched("Kubernetes", 0.7, 1.3, 0.72)];
+        assert_eq!(
+            apply_pronunciation_matches(&words, &matches, 0.5).as_deref(),
+            Some("deploy on Kubernetes today")
+        );
+    }
+
+    #[test]
+    fn pronunciation_match_below_threshold_or_absent_leaves_text_untouched() {
+        let words = [timed("cuber", 0.6, 1.0), timed("netes", 1.0, 1.4)];
+        // Below the acceptance threshold -> no rewrite (None keeps the original).
+        assert!(
+            apply_pronunciation_matches(&words, &[matched("Kubernetes", 0.7, 1.3, 0.31)], 0.5)
+                .is_none()
+        );
+        // No matches at all -> None.
+        assert!(apply_pronunciation_matches(&words, &[], 0.5).is_none());
+    }
+
+    #[test]
+    fn pronunciation_matches_claim_highest_score_first_without_overlap() {
+        let words = [timed("alpha", 0.0, 0.5), timed("beta", 0.5, 1.0)];
+        // Two candidates cover the same words; only the higher score wins, and
+        // the lower one cannot re-claim an already-claimed word.
+        let matches = [
+            matched("Lower", 0.0, 1.0, 0.60),
+            matched("Higher", 0.0, 1.0, 0.90),
+        ];
+        assert_eq!(
+            apply_pronunciation_matches(&words, &matches, 0.5).as_deref(),
+            Some("Higher")
+        );
+    }
+
+    #[test]
+    fn average_prototype_means_enrollments_and_averages_frames() {
+        let profile = PronunciationProfile {
+            dictionary_entry_id: "d1".into(),
+            label: "Kubernetes".into(),
+            model_key: PRONUNCIATION_MODEL_KEY.into(),
+            hidden_size: 2,
+            enrollments: vec![
+                PronunciationEnrollment {
+                    values: vec![0.0, 2.0],
+                    frames: 8,
+                },
+                PronunciationEnrollment {
+                    values: vec![2.0, 4.0],
+                    frames: 12,
+                },
+            ],
+            created_at: Utc::now(),
+        };
+        let prototype = average_prototype(&profile).expect("prototype");
+        assert_eq!(prototype.label, "Kubernetes");
+        assert_eq!(prototype.values, vec![1.0, 3.0]);
+        assert_eq!(prototype.frames, 10);
+        // A dimensionality mismatch is rejected rather than producing garbage.
+        let mut broken = profile;
+        broken.enrollments[1].values = vec![1.0];
+        assert!(average_prototype(&broken).is_none());
     }
 
     #[test]
