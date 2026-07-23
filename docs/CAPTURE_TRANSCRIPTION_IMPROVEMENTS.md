@@ -123,6 +123,10 @@ Separately shippable but touch the same path; best done together.
 
 ### 4. Cross-link the correction dictionary into the boost vocab
 - **Category:** engines · **Impact:** medium · **Effort:** small · **Verdict:** PARTIAL
+- **Status:** ✅ Implemented. `recognition_vocabulary` now also feeds each
+  `DictionaryEntry.replacement` (target only, never `spoken`) into the boost
+  vocab, deduped, gated on `vocabulary_boosting_enabled`, sharing the 200-term
+  cap. Flows to both whisper `initial_prompt` and the sherpa hotword graph.
 - **Gap:** `recognition_vocabulary` (`lib.rs:1051`) reads only `custom_words`;
   `DictionaryEntry{spoken,replacement}` (`lib.rs:980`) is used only for post-hoc
   replacement, so correction targets are never acoustically boosted.
@@ -136,6 +140,11 @@ Separately shippable but touch the same path; best done together.
 
 ### 5. Honor per-term weights via sherpa `phrase :score`
 - **Category:** engines · **Impact:** medium · **Effort:** medium · **Verdict:** PARTIAL
+- **Status:** ⏸️ Deferred. Needs a weighted vocab threaded through the shared
+  engine path, new Settings, a weight scale-mapping, and (to help most users) a
+  Settings UI control — the add-word UI doesn't set weights, so backend-only
+  helps only local-API/import users, and the accuracy payoff is unproven.
+  Revisit if boosting proves too weak/strong in practice.
 - **Gap:** `CustomWordEntry.weight` is persisted (`lib.rs:1046`) but discarded —
   `recognition_vocabulary` returns `Vec<String>` and decode uses a single
   global `hotwords_score=1.5` (`parakeet.rs:224`).
@@ -151,6 +160,10 @@ Separately shippable but touch the same path; best done together.
 
 ### 6. Min-term-length filter + configurable global boost
 - **Category:** engines · **Impact:** medium · **Effort:** small · **Verdict:** PARTIAL
+- **Status:** ⏸️ Deferred (with #5). A min-length filter can't be hardcoded
+  safely — it would drop legitimate short terms (the languages "C"/"R", "Qt",
+  "Go") — so it needs a configurable knob, i.e. new Settings/UI. Bundled with
+  #5's tuning work.
 - **Gap:** `vocabulary_hotwords` (`parakeet.rs:317`) has no length guard.
   FluidVoice defaults `minTermLength=3` (`ParakeetVocabularyStore.swift:83`).
 - **Do:** add a Unicode-aware `word.chars().count() >= min_term_length` filter
@@ -161,6 +174,10 @@ Separately shippable but touch the same path; best done together.
 
 ### 7. Surface which boosted terms actually landed
 - **Category:** engines · **Impact:** low-medium · **Effort:** small (~30 lines) · **Verdict:** CONFIRMED
+- **Status:** ✅ Implemented (log). `detected_vocabulary_terms` does whole-word,
+  case-insensitive matching of the active vocab against the final Parakeet
+  transcript and logs `BOOST_HIT: …`. The Tauri event / UI status badge is
+  deferred (needs UI); logging delivers the diagnostic value now.
 - **Gap:** no post-decode inspection of which boosted terms appear in the
   output. Standalone — does **not** depend on weights.
 - **FluidVoice:** `detectBoostedTerms` (`FluidAudioProvider.swift:518`) →
