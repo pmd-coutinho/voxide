@@ -598,6 +598,14 @@ struct Settings {
     save_transcription_history: bool,
     automatic_dictionary_learning_enabled: bool,
     vocabulary_boosting_enabled: bool,
+    // Global multiplier and minimum term length for Parakeet vocabulary
+    // boosting. The default boost (1.5) matches the previous hard-coded
+    // hotwords score, and the default length (1) keeps every term, so existing
+    // setups are unchanged until a user tunes them.
+    #[serde(default = "default_vocabulary_boost")]
+    vocabulary_boost: f32,
+    #[serde(default = "default_vocabulary_min_term_length")]
+    vocabulary_min_term_length: u32,
     user_typing_wpm: u16,
     weekends_dont_break_streak: bool,
     audio_history_enabled: bool,
@@ -699,6 +707,8 @@ impl Default for Settings {
             save_transcription_history: true,
             automatic_dictionary_learning_enabled: true,
             vocabulary_boosting_enabled: false,
+            vocabulary_boost: default_vocabulary_boost(),
+            vocabulary_min_term_length: default_vocabulary_min_term_length(),
             user_typing_wpm: 40,
             weekends_dont_break_streak: true,
             audio_history_enabled: false,
@@ -1055,37 +1065,115 @@ struct CustomWordEntry {
     aliases: Vec<String>,
 }
 
+// Voxide's Parakeet biasing runs through sherpa-onnx's context graph, whose
+// boost scale (~1.5) differs from FluidVoice's CTC weight scale (~5–13). These
+// map a FluidVoice-style term weight onto a sherpa hotword score.
+const FLUIDVOICE_DEFAULT_WEIGHT: f32 = 10.0; // FluidVoice's balanced/default term
+const FLUIDVOICE_DICTIONARY_WEIGHT: f32 = 8.0; // FluidVoice's correction-dictionary target
+const MAX_RECOGNITION_TERMS: usize = 200;
+
+fn default_vocabulary_boost() -> f32 {
+    1.5
+}
+
+fn default_vocabulary_min_term_length() -> u32 {
+    1
+}
+
+/// A recognition vocabulary resolved for the active engines. `phrases` are the
+/// plain terms — used for the Whisper `initial_prompt` and boosted-term
+/// detection — ordered so the highest-weight terms survive the cap.
+/// `parakeet_hotwords` is the sherpa context-graph string (`phrase :score/…`)
+/// with each term's score mapped from its weight and the global boost, and
+/// short terms filtered out; `None` when there is nothing to boost.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RecognitionVocabulary {
+    pub phrases: Vec<String>,
+    pub parakeet_hotwords: Option<String>,
+}
+
 fn recognition_vocabulary(
     words: &[CustomWordEntry],
     dictionary: &[DictionaryEntry],
-) -> Vec<String> {
-    let mut seen = HashSet::new();
-    words
+    boost: f32,
+    min_term_length: u32,
+) -> RecognitionVocabulary {
+    // A term's text and aliases inherit its weight; correction-dictionary
+    // replacement targets are boosted at FluidVoice's dictionary weight (only
+    // the replacement, never the misheard spoken form). A missing weight
+    // defaults to FluidVoice's balanced weight, so unweighted terms behave
+    // exactly as before (score == the default global boost).
+    let weighted = words
         .iter()
-        .flat_map(|word| std::iter::once(&word.text).chain(word.aliases.iter()))
-        // Boost each correction dictionary's REPLACEMENT target too, so the
-        // recognizer is nudged toward producing the exact form the correction
-        // expects (e.g. "Voxide") rather than only fixing it after the fact.
-        // Only the replacement is boosted, never the misheard `spoken` form —
-        // biasing the transducer toward the wrong tokens would defeat the goal.
-        .chain(dictionary.iter().map(|entry| &entry.replacement))
-        .map(|word| word.trim())
-        .filter(|word| !word.is_empty())
-        .filter(|word| seen.insert(word.to_lowercase()))
-        .take(200)
-        .map(str::to_owned)
-        .collect()
+        .flat_map(|word| {
+            let weight = word.weight;
+            std::iter::once(&word.text)
+                .chain(word.aliases.iter())
+                .map(move |phrase| (phrase.as_str(), weight))
+        })
+        .chain(dictionary.iter().map(|entry| {
+            (
+                entry.replacement.as_str(),
+                Some(FLUIDVOICE_DICTIONARY_WEIGHT),
+            )
+        }));
+    let mut seen = HashSet::new();
+    let mut terms = weighted
+        .map(|(phrase, weight)| (phrase.trim(), weight))
+        .filter(|(phrase, _)| !phrase.is_empty())
+        .filter(|(phrase, _)| seen.insert(phrase.to_lowercase()))
+        .map(|(phrase, weight)| {
+            (
+                phrase.to_owned(),
+                weight.unwrap_or(FLUIDVOICE_DEFAULT_WEIGHT),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Keep the highest-weight terms when capping; the sort is stable, so equal
+    // weights preserve insertion order.
+    terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    terms.truncate(MAX_RECOGNITION_TERMS);
+
+    let phrases = terms.iter().map(|(phrase, _)| phrase.clone()).collect();
+    let hotword_entries = terms
+        .iter()
+        // Drop short terms (a configurable guard against over-biasing) and any
+        // phrase that would corrupt sherpa's "/"-separated ":score" grammar.
+        .filter(|(phrase, _)| phrase.chars().count() as u32 >= min_term_length.max(1))
+        .filter(|(phrase, _)| !phrase.contains(['\0', '/', '\n', '\r']))
+        .filter(|(phrase, _)| {
+            !phrase
+                .split_whitespace()
+                .any(|token| token.starts_with(':'))
+        })
+        .map(|(phrase, weight)| {
+            let score = (boost * (weight / FLUIDVOICE_DEFAULT_WEIGHT)).clamp(0.1, 5.0);
+            format!("{phrase} :{score:.2}")
+        })
+        .collect::<Vec<_>>();
+    let parakeet_hotwords = (!hotword_entries.is_empty()).then(|| hotword_entries.join("/"));
+
+    RecognitionVocabulary {
+        phrases,
+        parakeet_hotwords,
+    }
 }
 
 fn active_recognition_vocabulary(
     settings: &Settings,
     words: &[CustomWordEntry],
     dictionary: &[DictionaryEntry],
-) -> Vec<String> {
-    settings
-        .vocabulary_boosting_enabled
-        .then(|| recognition_vocabulary(words, dictionary))
-        .unwrap_or_default()
+) -> RecognitionVocabulary {
+    if settings.vocabulary_boosting_enabled {
+        recognition_vocabulary(
+            words,
+            dictionary,
+            settings.vocabulary_boost,
+            settings.vocabulary_min_term_length,
+        )
+    } else {
+        RecognitionVocabulary::default()
+    }
 }
 
 fn normalize_custom_words(words: Vec<CustomWordEntry>) -> Vec<CustomWordEntry> {
@@ -8343,12 +8431,16 @@ fn detected_vocabulary_terms(text: &str, vocabulary: &[String], limit: usize) ->
 fn transcribe_parakeet_final(
     samples: &[f32],
     model_path: &Path,
-    vocabulary: &[String],
+    vocabulary: &RecognitionVocabulary,
 ) -> Result<String, String> {
-    let text = parakeet::transcribe_samples_with_vocabulary(samples, model_path, vocabulary)?;
+    let text = parakeet::transcribe_samples_with_hotwords(
+        samples,
+        model_path,
+        vocabulary.parakeet_hotwords.as_deref(),
+    )?;
     // Log which boosted terms landed so it is visible whether biasing helps.
-    if !vocabulary.is_empty() {
-        let hits = detected_vocabulary_terms(&text, vocabulary, 8);
+    if !vocabulary.phrases.is_empty() {
+        let hits = detected_vocabulary_terms(&text, &vocabulary.phrases, 8);
         if !hits.is_empty() {
             debug_log::append(&format!("BOOST_HIT: {}", hits.join(", ")));
         }
@@ -10495,15 +10587,17 @@ mod tests {
                 aliases: vec!["Acme".into()],
             },
         ];
-        let vocabulary = recognition_vocabulary(&words, &[]);
-        assert_eq!(vocabulary, vec!["Voxide", "vox side", "Acme"]);
+        let vocabulary = recognition_vocabulary(&words, &[], 1.5, 1);
+        assert_eq!(vocabulary.phrases, vec!["Voxide", "vox side", "Acme"]);
 
         let mut settings = Settings::default();
-        assert!(active_recognition_vocabulary(&settings, &words, &[]).is_empty());
+        assert!(active_recognition_vocabulary(&settings, &words, &[])
+            .phrases
+            .is_empty());
         settings.vocabulary_boosting_enabled = true;
         assert_eq!(
-            active_recognition_vocabulary(&settings, &words, &[]),
-            vocabulary
+            active_recognition_vocabulary(&settings, &words, &[]).phrases,
+            vocabulary.phrases
         );
     }
 
@@ -10530,10 +10624,57 @@ mod tests {
             weight: None,
             aliases: vec![],
         }];
-        let vocabulary = recognition_vocabulary(&words, &dictionary);
+        let vocabulary = recognition_vocabulary(&words, &dictionary, 1.5, 1);
         // "Voxide" once (deduped), the new replacement "GitHub", and neither
         // "gib hub" nor "kew bernetties".
-        assert_eq!(vocabulary, vec!["Voxide", "GitHub"]);
+        assert_eq!(vocabulary.phrases, vec!["Voxide", "GitHub"]);
+        // The dictionary target is boosted at FluidVoice's dictionary weight
+        // (8 -> 1.20); the unweighted custom word stays at the default (1.50).
+        assert_eq!(
+            vocabulary.parakeet_hotwords.unwrap(),
+            "Voxide :1.50/GitHub :1.20"
+        );
+    }
+
+    #[test]
+    fn recognition_vocabulary_scores_weights_and_filters_short_terms() {
+        let words = [
+            CustomWordEntry {
+                text: "AcmeCorp".into(),
+                weight: Some(13.0), // strong
+                aliases: vec![],
+            },
+            CustomWordEntry {
+                text: "casual".into(),
+                weight: Some(5.0), // mild
+                aliases: vec![],
+            },
+            CustomWordEntry {
+                text: "Qt".into(),
+                weight: None, // default (balanced) weight
+                aliases: vec![],
+            },
+        ];
+        // Phrases are weight-descending so the cap keeps the important terms.
+        let v = recognition_vocabulary(&words, &[], 1.5, 3);
+        assert_eq!(v.phrases, vec!["AcmeCorp", "Qt", "casual"]);
+        // min length 3 filters "Qt" out of the hotwords (but not the phrases);
+        // strong boosts hardest, mild least.
+        assert_eq!(v.parakeet_hotwords.unwrap(), "AcmeCorp :1.95/casual :0.75");
+        // With no length filter, the 2-char default-weight term is kept at 1.50.
+        assert_eq!(
+            recognition_vocabulary(&words, &[], 1.5, 1)
+                .parakeet_hotwords
+                .unwrap(),
+            "AcmeCorp :1.95/Qt :1.50/casual :0.75"
+        );
+        // The global boost scales every score.
+        assert_eq!(
+            recognition_vocabulary(&words, &[], 3.0, 1)
+                .parakeet_hotwords
+                .unwrap(),
+            "AcmeCorp :3.90/Qt :3.00/casual :1.50"
+        );
     }
 
     #[test]

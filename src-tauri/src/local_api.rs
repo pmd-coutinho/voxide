@@ -711,7 +711,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                             &model_path,
                             vad_model.as_deref(),
                             &language,
-                            &custom_words,
+                            &custom_words.phrases,
                             whisper_beam_size,
                             None,
                         )
@@ -749,7 +749,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                             &model_path,
                             vad_model.as_deref(),
                             &language,
-                            &custom_words,
+                            &custom_words.phrases,
                             speech::TranscriptionOptions::final_decode(whisper_beam_size),
                         )
                         .map(|result| (result.text, sample_count))
@@ -890,7 +890,7 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
             Some(path) => {
                 let path = std::path::PathBuf::from(path);
                 match tauri::async_runtime::spawn_blocking(move || {
-                    transcribe_apple_media_file(&path, &language, &custom_words, None).map(
+                    transcribe_apple_media_file(&path, &language, &custom_words.phrases, None).map(
                         |(text, duration_ms)| {
                             let sample_count = duration_ms
                                 .saturating_mul(16)
@@ -921,8 +921,12 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                     Err(message) => return error(StatusCode::BAD_REQUEST, message),
                 };
                 match tauri::async_runtime::spawn_blocking(move || {
-                    crate::apple_speech::transcribe_samples(&samples, &language, &custom_words)
-                        .map(|text| (text, sample_count))
+                    crate::apple_speech::transcribe_samples(
+                        &samples,
+                        &language,
+                        &custom_words.phrases,
+                    )
+                    .map(|text| (text, sample_count))
                 })
                 .await
                 {

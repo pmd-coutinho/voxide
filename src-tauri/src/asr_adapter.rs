@@ -95,7 +95,7 @@ impl VoiceEngine {
         session_id: u64,
         state: &AppState,
         settings: &Settings,
-        custom_words: Vec<String>,
+        custom_words: RecognitionVocabulary,
         cloud_profile: Option<provider::AiProviderProfile>,
         dictionary: Vec<DictionaryEntry>,
     ) -> Result<(), String> {
@@ -109,7 +109,7 @@ impl VoiceEngine {
                     model,
                     vad_model_path(state),
                     settings.language.clone(),
-                    custom_words,
+                    custom_words.phrases,
                     settings.transcription_preview_char_limit,
                 );
             }
@@ -160,7 +160,7 @@ impl VoiceEngine {
                     app,
                     session_id,
                     settings.apple_speech_locale.clone(),
-                    custom_words,
+                    custom_words.phrases,
                     settings.transcription_preview_char_limit,
                 );
             }
@@ -176,7 +176,7 @@ impl VoiceEngine {
         settings: &Settings,
         recording_generation: u64,
         samples: Vec<f32>,
-        custom_words: Vec<String>,
+        custom_words: RecognitionVocabulary,
     ) -> Result<EngineFinalTranscript, String> {
         self.prepare_live_capture(settings, state)?;
         match self {
@@ -191,7 +191,7 @@ impl VoiceEngine {
                         &model,
                         vad_model.as_deref(),
                         &language,
-                        &custom_words,
+                        &custom_words.phrases,
                         speech::TranscriptionOptions::final_decode(beam_size),
                     )
                 })
@@ -260,7 +260,7 @@ impl VoiceEngine {
             Self::AppleSpeech => {
                 let language = settings.apple_speech_locale.clone();
                 let text = tauri::async_runtime::spawn_blocking(move || {
-                    apple_speech::transcribe_samples(&samples, &language, &custom_words)
+                    apple_speech::transcribe_samples(&samples, &language, &custom_words.phrases)
                 })
                 .await
                 .map_err(|error| format!("Apple Speech task failed: {error}"))??;
@@ -280,7 +280,7 @@ impl VoiceEngine {
         state: &AppState,
         settings: &Settings,
         path: PathBuf,
-        custom_words: Vec<String>,
+        custom_words: RecognitionVocabulary,
         progress: speech::ProgressCallback,
     ) -> Result<(String, u64), String> {
         match self {
@@ -298,7 +298,7 @@ impl VoiceEngine {
                         &model,
                         vad_model.as_deref(),
                         &language,
-                        &custom_words,
+                        &custom_words.phrases,
                         beam_size,
                         Some(progress),
                     )
@@ -355,7 +355,12 @@ impl VoiceEngine {
             Self::AppleSpeech => {
                 let language = settings.apple_speech_locale.clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    transcribe_apple_media_file(&path, &language, &custom_words, Some(progress))
+                    transcribe_apple_media_file(
+                        &path,
+                        &language,
+                        &custom_words.phrases,
+                        Some(progress),
+                    )
                 })
                 .await
                 .map_err(|error| format!("Apple Speech task failed: {error}"))?
@@ -370,7 +375,7 @@ impl VoiceEngine {
         self,
         state: &AppState,
         settings: &Settings,
-        vocabulary: Vec<String>,
+        vocabulary: RecognitionVocabulary,
     ) {
         match self {
             Self::Whisper => {
@@ -410,10 +415,10 @@ impl VoiceEngine {
                             "Parakeet preview preload failed: {error}"
                         )),
                     }
-                    if vocabulary.is_empty() {
+                    let Some(hotwords) = vocabulary.parakeet_hotwords else {
                         return;
-                    }
-                    match parakeet::preload_with_vocabulary(&model, &vocabulary) {
+                    };
+                    match parakeet::preload_with_hotwords(&model, Some(&hotwords)) {
                         Ok(()) => {
                             debug_log::append("Parakeet CUDA vocabulary final model preloaded")
                         }

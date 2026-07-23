@@ -59,6 +59,8 @@ interface Settings {
   saveTranscriptionHistory: boolean;
   automaticDictionaryLearningEnabled: boolean;
   vocabularyBoostingEnabled: boolean;
+  vocabularyBoost: number;
+  vocabularyMinTermLength: number;
   userTypingWpm: number;
   weekendsDontBreakStreak: boolean;
   audioHistoryEnabled: boolean;
@@ -954,7 +956,7 @@ function renderEnhancement(): void {
 
 function renderDictionary(): void {
   const customWords = database.customWords.length
-    ? database.customWords.map((word, index) => `<div class="table-row"><span>${escapeHtml(word.text)}</span><span>${escapeHtml(word.aliases.join(", ") || "Recognition hint")}</span><button data-delete-custom-word="${index}">Remove</button></div>`).join("")
+    ? database.customWords.map((word, index) => `<div class="table-row"><span>${escapeHtml(word.text)}</span><span>${escapeHtml(word.aliases.join(", ") || "Recognition hint")}</span><span class="vocab-actions"><select data-word-strength="${index}" title="Boost strength">${boostPresetOptions(word.weight)}</select><button data-delete-custom-word="${index}">Remove</button></span></div>`).join("")
     : `<div class="empty">No recognition vocabulary yet. Add names and terms that Whisper should favor.</div>`;
   const learningSuggestions = dictionaryLearningSuggestions.map((suggestion) => `<article class="profile"><div><strong>“${escapeHtml(suggestion.heardText)}” → “${escapeHtml(suggestion.correctedText)}”</strong><small>${suggestion.occurrences} observed correction${suggestion.occurrences === 1 ? "" : "s"}</small></div><p>Accepting adds this as a local replacement. Nothing is changed until you accept.</p><div class="entry-actions"><button class="primary" data-accept-dictionary-learning="${escapeHtml(suggestion.heardText)}" data-learning-replacement="${escapeHtml(suggestion.correctedText)}">Add correction</button><button data-dismiss-dictionary-learning="${escapeHtml(suggestion.heardText)}" data-learning-replacement="${escapeHtml(suggestion.correctedText)}">Not now</button></div></article>`).join("");
   renderShell(`
@@ -963,7 +965,7 @@ function renderDictionary(): void {
     <section class="card"><div class="dictionary-table"><div class="table-row heading"><span>Spoken phrase</span><span>Replace with</span><span></span></div>
       ${database.dictionary.length ? database.dictionary.map((entry) => `<div class="table-row"><span>${escapeHtml(entry.spoken)}</span><span>${escapeHtml(entry.replacement)}</span><button data-delete-dictionary="${entry.id}">Remove</button></div>`).join("") : `<div class="empty">No corrections yet. Add terms that your voice engine commonly gets wrong.</div>`}
     </div></section>
-    <section class="card"><div class="card-title"><div><h2>Recognition vocabulary</h2><p>These terms can be supplied to supported speech engines as recognition hints; they are not post-processing replacements.</p></div><button data-action="new-custom-word">Add vocabulary</button></div>${settingToggle("vocabularyBoostingEnabled", "Use recognition vocabulary hints", "When enabled, Voxide supplies the terms above to supported local and system speech engines.")}<div class="dictionary-table"><div class="table-row heading"><span>Term</span><span>Aliases</span><span></span></div>${customWords}</div></section>`);
+    <section class="card"><div class="card-title"><div><h2>Recognition vocabulary</h2><p>These terms can be supplied to supported speech engines as recognition hints; they are not post-processing replacements.</p></div><button data-action="new-custom-word">Add vocabulary</button></div>${settingToggle("vocabularyBoostingEnabled", "Use recognition vocabulary hints", "When enabled, Voxide supplies the terms above to supported local and system speech engines.")}<div class="dictionary-table"><div class="table-row heading"><span>Term</span><span>Aliases</span><span>Boost</span></div>${customWords}</div><div class="setting-row"><span><strong>Boost strength</strong><small>Global multiplier for how hard Parakeet biases toward vocabulary terms. Default 1.5.</small></span><input data-vocabulary-boost type="number" min="0.1" max="5" step="0.1" value="${database.settings.vocabularyBoost}"></div><div class="setting-row"><span><strong>Minimum term length</strong><small>Ignore vocabulary terms shorter than this many characters (Parakeet). Default 1 keeps every term.</small></span><input data-vocabulary-min-length type="number" min="1" max="20" step="1" value="${database.settings.vocabularyMinTermLength}"></div></section>`);
 }
 
 function renderModePage(mode: "command" | "rewrite"): void {
@@ -1635,12 +1637,37 @@ async function addDictionaryEntry(): Promise<void> {
   render();
 }
 
+// Mirrors FluidVoice's Mild/Balanced/Strong boost presets. The weight maps to
+// a sherpa hotword score on the backend (scaled by the global boost setting).
+const BOOST_PRESETS: ReadonlyArray<{ label: string; weight: number }> = [
+  { label: "Mild", weight: 5 },
+  { label: "Balanced", weight: 10 },
+  { label: "Strong", weight: 13 },
+];
+
+function nearestBoostWeight(weight: number | undefined): number {
+  const target = weight ?? 10;
+  return BOOST_PRESETS.reduce((best, preset) =>
+    Math.abs(preset.weight - target) < Math.abs(best.weight - target) ? preset : best,
+  ).weight;
+}
+
+function boostPresetOptions(weight: number | undefined): string {
+  const current = nearestBoostWeight(weight);
+  return BOOST_PRESETS.map(
+    (preset) => `<option value="${preset.weight}" ${preset.weight === current ? "selected" : ""}>${preset.label}</option>`,
+  ).join("");
+}
+
 async function addCustomWord(): Promise<void> {
   const text = window.prompt("Recognition vocabulary term");
   if (!text?.trim()) return;
   const aliases = window.prompt("Optional aliases, separated by commas", "") ?? "";
+  const strength = (window.prompt("Boost strength — mild, balanced, or strong", "balanced") ?? "balanced").trim().toLowerCase();
+  const weight = BOOST_PRESETS.find((preset) => preset.label.toLowerCase() === strength)?.weight;
   database.customWords.push({
     text: text.trim(),
+    weight,
     aliases: aliases.split(",").map((alias) => alias.trim()).filter(Boolean),
   });
   database.customWords = await invoke<CustomWord[]>("save_custom_words", { words: database.customWords });
@@ -2135,6 +2162,27 @@ function bindCommonEvents(): void {
       database.customWords = words;
       render();
     });
+  }));
+  document.querySelectorAll<HTMLSelectElement>("[data-word-strength]").forEach((element) => element.addEventListener("change", () => {
+    const index = Number(element.dataset.wordStrength);
+    const word = database.customWords[index];
+    if (!word) return;
+    word.weight = Number(element.value);
+    void invoke<CustomWord[]>("save_custom_words", { words: database.customWords }).then((words) => {
+      database.customWords = words;
+    });
+  }));
+  document.querySelectorAll<HTMLInputElement>("[data-vocabulary-boost]").forEach((element) => element.addEventListener("change", () => {
+    const value = Number(element.value);
+    if (!Number.isFinite(value)) return;
+    database.settings.vocabularyBoost = Math.min(5, Math.max(0.1, value));
+    void saveSettings();
+  }));
+  document.querySelectorAll<HTMLInputElement>("[data-vocabulary-min-length]").forEach((element) => element.addEventListener("change", () => {
+    const value = Math.round(Number(element.value));
+    if (!Number.isFinite(value)) return;
+    database.settings.vocabularyMinTermLength = Math.max(1, value);
+    void saveSettings();
   }));
   document.querySelectorAll<HTMLElement>("[data-delete-app-prompt-binding]").forEach((element) => element.addEventListener("click", () => {
     void deleteAppPromptBinding(element.dataset.deleteAppPromptBinding ?? "");

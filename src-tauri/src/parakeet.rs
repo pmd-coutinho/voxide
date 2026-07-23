@@ -264,13 +264,14 @@ mod implementation {
     }
 
     /// Preloads FluidVoice's equivalent of its optional final-only boosted
-    /// manager. If no usable terms are configured, the normal preview/final
-    /// recognizer is the only one needed.
-    pub fn preload_with_vocabulary(
+    /// manager. If no hotwords are configured, the normal preview/final
+    /// recognizer is the only one needed. `hotwords` is the pre-built sherpa
+    /// context-graph string (`phrase :score/…`) resolved by the caller.
+    pub fn preload_with_hotwords(
         model_directory: &Path,
-        vocabulary: &[String],
+        hotwords: Option<&str>,
     ) -> Result<(), String> {
-        if vocabulary_hotwords(vocabulary).is_some() {
+        if hotwords.is_some_and(|hotwords| !hotwords.trim().is_empty()) {
             recognizer(model_directory, true).map(|_| ())
         } else {
             preload(model_directory)
@@ -305,18 +306,20 @@ mod implementation {
     /// Uses Sherpa's TDT context graph for FluidVoice-style final vocabulary
     /// boosting. Preview intentionally calls `transcribe` instead, because
     /// FluidVoice applies vocabulary rescoring only to the final manager.
-    pub fn transcribe_with_vocabulary(
+    /// `hotwords` is the pre-built `phrase :score/…` string (already sanitized,
+    /// length-filtered, and per-term scored by the caller).
+    pub fn transcribe_with_hotwords(
         samples: &[f32],
         model_directory: &Path,
-        vocabulary: &[String],
+        hotwords: Option<&str>,
     ) -> Result<String, String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
-        let Some(hotwords) = vocabulary_hotwords(vocabulary) else {
+        let Some(hotwords) = hotwords.filter(|hotwords| !hotwords.trim().is_empty()) else {
             return transcribe(samples, model_directory);
         };
-        match decode(samples, model_directory, Some(&hotwords)) {
+        match decode(samples, model_directory, Some(hotwords)) {
             Ok(result) => Ok(result.text.trim().to_owned()),
             Err(error) => {
                 // FluidVoice similarly falls back to its ordinary final
@@ -328,20 +331,6 @@ mod implementation {
                 transcribe(samples, model_directory)
             }
         }
-    }
-
-    fn vocabulary_hotwords(vocabulary: &[String]) -> Option<String> {
-        let hotwords = vocabulary
-            .iter()
-            .map(|word| word.trim())
-            // Sherpa uses `/` as its per-stream phrase separator and its Rust
-            // binding passes the string through CString. Ignore malformed
-            // user terms rather than letting one term abort dictation.
-            .filter(|word| !word.is_empty() && !word.contains(['\0', '/', '\n', '\r']))
-            .take(200)
-            .collect::<Vec<_>>()
-            .join("/");
-        (!hotwords.is_empty()).then_some(hotwords)
     }
 
     fn decode(
@@ -366,9 +355,9 @@ mod implementation {
 
 #[cfg(feature = "parakeet")]
 pub use implementation::{
-    preload, preload_with_vocabulary, transcribe as transcribe_samples,
+    preload, preload_with_hotwords, transcribe as transcribe_samples,
     transcribe_preview as transcribe_preview_samples,
-    transcribe_with_vocabulary as transcribe_samples_with_vocabulary,
+    transcribe_with_hotwords as transcribe_samples_with_hotwords,
 };
 
 #[cfg(not(feature = "parakeet"))]
@@ -377,7 +366,7 @@ pub fn preload(_: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(feature = "parakeet"))]
-pub fn preload_with_vocabulary(_: &Path, _: &[String]) -> Result<(), String> {
+pub fn preload_with_hotwords(_: &Path, _: Option<&str>) -> Result<(), String> {
     Err("Parakeet is included only in the CUDA build".into())
 }
 
@@ -392,10 +381,10 @@ pub fn transcribe_preview_samples(_: &[f32], _: &Path) -> Result<String, String>
 }
 
 #[cfg(not(feature = "parakeet"))]
-pub fn transcribe_samples_with_vocabulary(
+pub fn transcribe_samples_with_hotwords(
     _: &[f32],
     _: &Path,
-    _: &[String],
+    _: Option<&str>,
 ) -> Result<String, String> {
     Err("Parakeet is included only in the CUDA build".into())
 }
@@ -483,10 +472,10 @@ mod tests {
         let captured = media::decode_audio_segment(&wav, 0.0, duration_ms as f64 / 1_000.0)
             .expect("decode reference WAV");
         let samples = audio::mono_resample_for_whisper(captured).expect("resample reference WAV");
-        let vocabulary = ["country".to_owned()];
-        preload_with_vocabulary(&directory, &vocabulary)
+        let hotwords = "country :1.50";
+        preload_with_hotwords(&directory, Some(hotwords))
             .expect("preload CUDA vocabulary-boosted final model");
-        let text = transcribe_samples_with_vocabulary(&samples, &directory, &vocabulary)
+        let text = transcribe_samples_with_hotwords(&samples, &directory, Some(hotwords))
             .expect("decode reference WAV with CUDA vocabulary boosting");
         println!("Parakeet vocabulary transcript: {text}");
         assert!(text.to_ascii_lowercase().contains("country"));
