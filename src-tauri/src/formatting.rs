@@ -437,8 +437,15 @@ pub(crate) fn remove_filler_words(text: &str, filler_words: &[String]) -> String
     text.split(' ')
         .filter(|word| !word.is_empty())
         .filter(|word| {
+            // Trim any non-alphanumeric edge characters, not just ASCII
+            // punctuation, so a filler wrapped in Unicode punctuation (smart
+            // quotes, an em dash, an ellipsis) is still recognized and removed.
+            // This is Unicode-aware (`char::is_punctuation` is not in std) and a
+            // strict superset of the previous ASCII-punctuation trim, so ASCII
+            // behavior is unchanged; the emitted token is never altered, only
+            // the value compared against the filler list.
             let normalized = word
-                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .trim_matches(|character: char| !character.is_alphanumeric())
                 .to_lowercase();
             !fillers.iter().any(|filler| filler == &normalized)
         })
@@ -1225,6 +1232,26 @@ mod tests {
         assert_eq!(
             apply_before_ai("Um hello er world", &settings),
             "hello world"
+        );
+    }
+
+    #[test]
+    fn removes_fillers_wrapped_in_unicode_punctuation() {
+        let fillers = vec!["um".to_string(), "uh".to_string()];
+        // Smart quotes, an em dash, and an ellipsis around a filler are trimmed
+        // for matching (ASCII-only trimming would leave these fillers in place).
+        assert_eq!(
+            remove_filler_words(
+                "\u{201C}um\u{201D} hello \u{2014}uh\u{2014} world um\u{2026}",
+                &fillers
+            ),
+            "hello world"
+        );
+        // A non-filler word wrapped in punctuation is preserved verbatim —
+        // trimming affects only the comparison, never the emitted token.
+        assert_eq!(
+            remove_filler_words("\u{201C}hello\u{201D}", &fillers),
+            "\u{201C}hello\u{201D}"
         );
     }
 
