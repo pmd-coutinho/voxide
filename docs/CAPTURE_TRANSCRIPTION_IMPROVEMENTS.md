@@ -97,6 +97,17 @@ respect them:
 
 ### 3. Recover from mid-recording device loss instead of hard-aborting
 - **Category:** capture · **Impact:** medium-high · **Effort:** medium · **Verdict:** CONFIRMED
+- **Status:** ✅ Implemented (Layer 1, reactive). On a stream error the monitor
+  drops the failed capture (flushing its tail into the shared 16 kHz timeline)
+  and rebuilds a stream that appends to that same timeline with a
+  250/750/1500/2500 ms backoff, keeping the session, preview generation, and
+  Nemotron cursor; falls back to the terminal abort only if every rebuild
+  attempt fails. `AudioCapture::start_prepared_appending` + `canonical_handle`;
+  the five preview loops skip a tick on the transient absent capture instead of
+  exiting. Adversarial review found and fixed two defects: the rebuilt capture's
+  duration counter is seeded from the shared timeline (was under-reporting), and
+  stop during the rebuild window now waits for recovery (was losing the buffer).
+  Layer 2 (proactive `pactl subscribe`) deferred.
 - **Gap:** `spawn_capture_error_monitor` (`lib.rs:1842`) cancels the whole
   session and shows "Microphone connection lost" on *any* `stream_errors > 0`
   (`audio.rs:215-218` only bumps a counter). A USB/Bluetooth blip mid-dictation
@@ -289,10 +300,12 @@ Separately shippable but touch the same path; best done together.
 
 ### 12. Persist the preferred mic by stable node `name`
 - **Category:** capture · **Impact:** medium · **Effort:** small · **Verdict:** PARTIAL (half 1 only)
-- **Status:** ⏸️ Deferred. Changes the persisted `selected_input_device` format
-  and touches the frontend picker (`main.ts`) plus a one-time migration —
-  crosses into frontend/persistence work. Real but latent (duplicate identical
-  USB mics); revisit with a frontend pass.
+- **Status:** ✅ Implemented. `input_devices()` returns `{name, description}`;
+  `decide_routing` matches the stable `name` first (description fallback so
+  older settings still route and migrate on re-save); the picker's option value
+  is the name, label the description. Fixes the identical-description mic
+  binding bug. Reviewed CORRECT (88). Half 2 (hardware-change re-assertion
+  backoff) remains dropped — Linux routing is recomputed per capture.
 - **Gap:** `input_device_names()` (`audio.rs:363`) persists the *description*,
   then `route_to_requested_source` (`audio.rs:477`) matches it back to
   `source.name` — two identical USB mics share a description, so the `find`
@@ -347,11 +360,18 @@ Separately shippable but touch the same path; best done together.
 
 ### 15. Context-gated smart punctuation (dot + symbol only)
 - **Category:** formatting · **Impact:** medium · **Effort:** medium · **Verdict:** PARTIAL
-- **Status:** ⏸️ Deferred. FluidVoice's version is unshipped dead code, so this
-  is a *new* heuristic needing fresh design + a validated test corpus (TLD/host
-  tables, symbol-operand rules) and likely a new opt-in setting — not a
-  port-of-proven-behavior. Highest design risk of the tier; revisit
-  deliberately.
+- **Status:** ⏸️ Deferred — **nothing to port.** Confirmed against the Swift
+  source: FluidVoice's SHIPPED path (`apply` → `makeRules(from:)`,
+  `SpokenPunctuationFormatting.swift:120/162`) builds rules from the user's
+  dictionary with every `requires*` context flag OFF, so it does plain
+  prefix-gated conversion — identical in spirit to Voxide's current
+  `apply_spoken_punctuation`. The context-gating machinery (`requiresDotContext`
+  etc. + `hasDotContext`/`hasSymbolContext` + TLD/host word tables) lives only
+  in the no-arg `makeRules()` at `:208`, which has **zero callers** (dead code),
+  and even it still requires the spoken prefix — the flags only *narrow*
+  conversion, they don't enable prefix-free. So Voxide is already at parity with
+  what FluidVoice ships. The valuable version (prefix-free "api dot json" →
+  "api.json") is a NEW opt-in feature with false-positive risk, not a port.
 - **Gap:** the port's `apply_spoken_punctuation` (`formatting.rs:507`) has no
   dot-context (TLD/host tables → `api.json`) or symbol-operand heuristics.
 - **Caution:** FluidVoice's version is **dead code** — the flag-setting
@@ -386,16 +406,15 @@ Separately shippable but touch the same path; best done together.
 
 ## Progress
 
-- **Tier 1 — capture latency/robustness:** #1 ✅ #2 ✅ #3 ⏳ (mid-recording
-  recovery, still open)
+- **Tier 1 — capture latency/robustness:** #1 ✅ #2 ✅ #3 ✅ (complete)
 - **Tier 2 — vocabulary biasing:** #4 ✅ #7 ✅ · #5 ⏸️ #6 ⏸️ (need Settings/UI)
 - **Tier 3 — AI post-processing:** #8 ✅ #9 ✅ (complete)
-- **Tier 4 — robustness & formatting:** #10 ✅ #11 ✅ #13 ✅ #14 ✅ · #12 ⏸️
-  (frontend/persistence) #15 ⏸️ (needs fresh design)
+- **Tier 4 — robustness & formatting:** #10 ✅ #11 ✅ #12 ✅ #13 ✅ #14 ✅ ·
+  #15 ⏸️ (nothing to port — would be a new opt-in feature)
 
-Still open and worth doing: **#3** (recover from mid-recording device loss
-instead of aborting — Tier 1, `CONFIRMED`), then **#12** and **#5/#6** when a
-frontend pass is in scope.
+Implemented: 11 of 15 (#1–#4, #7–#14). Deferred as product/design decisions:
+**#5/#6** (per-term & global vocab boost — need Settings/UI), **#15** (prefix-
+free smart punctuation — a new opt-in feature, not a port).
 
 _Generated from a verified cross-repo comparison (5 CONFIRMED, 12 PARTIAL, 2
 REJECTED findings) against FluidVoice `~/dev/FluidVoice`._
