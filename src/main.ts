@@ -495,7 +495,11 @@ let modelStatus: VoiceModelStatus | undefined;
 let voiceEngineAvailability: VoiceEngineAvailability = { engines: [] };
 let modelDownloadProgress: ModelDownloadProgress | undefined;
 let verifyingVoiceEngineInstallation = false;
-let audioDevices: string[] = [];
+interface AudioInputDevice {
+  name: string;
+  description: string;
+}
+let audioDevices: AudioInputDevice[] = [];
 let providers: AiProviderView[] = [];
 let editingProviderId: string | undefined;
 let apiStatus: LocalApiStatus | undefined;
@@ -778,10 +782,16 @@ function renderVoiceEngine(): void {
       : `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
     : "";
   const canDeleteDownloadedModel = (isWhisper && !database.settings.localModelPath || isParakeet || isNemotron) && modelStatus?.installed;
+  // The stored value is a stable device `name`; older builds stored the
+  // `description`, so treat either as a match (the option value is the name, so
+  // re-saving migrates it forward).
+  const deviceMatchesSelection = (device: AudioInputDevice): boolean =>
+    database.settings.selectedInputDevice === device.name ||
+    database.settings.selectedInputDevice === device.description;
   const selectedInputDeviceUnavailable = Boolean(
-    database.settings.selectedInputDevice && !audioDevices.includes(database.settings.selectedInputDevice),
+    database.settings.selectedInputDevice && !audioDevices.some(deviceMatchesSelection),
   );
-  const deviceOptions = [`<option value="" ${!database.settings.selectedInputDevice || selectedInputDeviceUnavailable ? "selected" : ""}>System default${selectedInputDeviceUnavailable ? " (preferred device unavailable)" : ""}</option>`, ...audioDevices.map((device) => `<option value="${escapeHtml(device)}" ${database.settings.selectedInputDevice === device ? "selected" : ""}>${escapeHtml(device)}</option>`)].join("");
+  const deviceOptions = [`<option value="" ${!database.settings.selectedInputDevice || selectedInputDeviceUnavailable ? "selected" : ""}>System default${selectedInputDeviceUnavailable ? " (preferred device unavailable)" : ""}</option>`, ...audioDevices.map((device) => `<option value="${escapeHtml(device.name)}" ${deviceMatchesSelection(device) ? "selected" : ""}>${escapeHtml(device.description)}</option>`)].join("");
   const microphoneInput = `<label>Microphone input<select id="input-device">${deviceOptions}</select><small>${audioDevices.length ? "Choose the microphone used for every local dictation engine." : "No individual devices are available right now; Voxide will use the system default microphone."}</small></label>`;
   const engineConfiguration = isWhisper
     ? `<label>Selected Whisper model<select id="selected-model"><option value="tiny" ${database.settings.selectedModel === "tiny" ? "selected" : ""}>Tiny — multilingual, fastest</option><option value="base" ${database.settings.selectedModel === "base" ? "selected" : ""}>Base — multilingual, default</option><option value="small" ${database.settings.selectedModel === "small" ? "selected" : ""}>Small — multilingual, higher accuracy</option><option value="medium" ${database.settings.selectedModel === "medium" ? "selected" : ""}>Medium — multilingual</option><option value="large-v3-turbo" ${database.settings.selectedModel === "large-v3-turbo" ? "selected" : ""}>Large v3 Turbo — multilingual</option><option value="large-v3-turbo-q5_0" ${database.settings.selectedModel === "large-v3-turbo-q5_0" ? "selected" : ""}>Large v3 Turbo Q5 — smaller local fallback</option><option value="large-v3-turbo-q8_0" ${database.settings.selectedModel === "large-v3-turbo-q8_0" ? "selected" : ""}>Large v3 Turbo Q8 — smaller local fallback</option><option value="large-v3" ${database.settings.selectedModel === "large-v3" ? "selected" : ""}>Large v3 — multilingual</option><optgroup label="Legacy English-only Whisper models"><option value="tiny.en" ${database.settings.selectedModel === "tiny.en" ? "selected" : ""}>Tiny English</option><option value="base.en" ${database.settings.selectedModel === "base.en" ? "selected" : ""}>Base English</option><option value="small.en" ${database.settings.selectedModel === "small.en" ? "selected" : ""}>Small English</option><option value="medium.en" ${database.settings.selectedModel === "medium.en" ? "selected" : ""}>Medium English</option></optgroup></select></label>
@@ -1216,13 +1226,13 @@ async function refreshVoiceEngineAvailability(): Promise<void> {
 }
 
 async function refreshAudioDevices(): Promise<void> {
-  audioDevices = await invoke<string[]>("audio_input_devices");
+  audioDevices = await invoke<AudioInputDevice[]>("audio_input_devices");
 }
 
 async function refreshAudioDevicesWhenChanged(): Promise<void> {
   try {
-    const updated = await invoke<string[]>("audio_input_devices");
-    if (updated.length === audioDevices.length && updated.every((device, index) => device === audioDevices[index])) return;
+    const updated = await invoke<AudioInputDevice[]>("audio_input_devices");
+    if (updated.length === audioDevices.length && updated.every((device, index) => device.name === audioDevices[index]?.name && device.description === audioDevices[index]?.description)) return;
     audioDevices = updated;
     if (currentView === "voice") render();
   } catch {

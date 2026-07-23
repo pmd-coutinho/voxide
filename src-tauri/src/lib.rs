@@ -6947,8 +6947,8 @@ async fn download_nemotron_model(
 }
 
 #[tauri::command]
-fn audio_input_devices() -> Result<Vec<String>, String> {
-    audio::input_device_names()
+fn audio_input_devices() -> Result<Vec<audio::AudioInputDevice>, String> {
+    audio::input_devices()
 }
 
 #[tauri::command]

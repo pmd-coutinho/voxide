@@ -423,31 +423,53 @@ impl Drop for AudioCapture {
     }
 }
 
-pub fn input_device_names() -> Result<Vec<String>, String> {
+/// A selectable microphone. `name` is the stable, unique routing key (a
+/// PipeWire/PulseAudio source name such as `alsa_input.usb-…` or
+/// `bluez_input.AA:BB:…`, or the raw ALSA device label when no sound server is
+/// present); `description` is the human-readable label. The persisted
+/// `selected_input_device` stores the `name` so two mics sharing a description
+/// (e.g. two identical USB mics) stay distinguishable and route correctly.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInputDevice {
+    pub name: String,
+    pub description: String,
+}
+
+pub fn input_devices() -> Result<Vec<AudioInputDevice>, String> {
     // On PipeWire/PulseAudio desktops the ALSA backend only exposes raw PCM
     // plugin names ("default", "sysdefault:CARD=…"), not the devices users
     // recognize. Prefer the sound server's source list when it is available.
     #[cfg(target_os = "linux")]
     if let Some(sources) = pulse::sources() {
         if !sources.is_empty() {
-            let mut names = sources
+            let mut devices = sources
                 .into_iter()
-                .map(|source| source.description)
+                .map(|source| AudioInputDevice {
+                    name: source.name,
+                    description: source.description,
+                })
                 .collect::<Vec<_>>();
-            names.sort();
-            names.dedup();
-            return Ok(names);
+            devices.sort_by(|a, b| a.description.cmp(&b.description).then(a.name.cmp(&b.name)));
+            devices.dedup_by(|a, b| a.name == b.name);
+            return Ok(devices);
         }
     }
+    // Without a sound server (or off Linux) the cpal label is the only handle,
+    // so it serves as both the routing key and the display label.
     let host = cpal::default_host();
-    let mut names = host
+    let mut devices = host
         .input_devices()
         .map_err(|error| format!("Could not enumerate microphone devices: {error}"))?
         .filter_map(|device| device_label(&device))
+        .map(|label| AudioInputDevice {
+            name: label.clone(),
+            description: label,
+        })
         .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    Ok(names)
+    devices.sort_by(|a, b| a.description.cmp(&b.description).then(a.name.cmp(&b.name)));
+    devices.dedup_by(|a, b| a.name == b.name);
+    Ok(devices)
 }
 
 /// Friendly microphone selection on Linux sound servers (PipeWire or
@@ -579,13 +601,21 @@ mod pulse {
     }
 
     /// The pure source-list decision, split out so it is testable without a
-    /// sound server. Matches the requested device by its human-readable
-    /// description (the value the picker persists).
+    /// sound server. Matches the requested device by its stable `name` (the
+    /// value the picker now persists), falling back to a `description` match so
+    /// a setting saved by an older build — which stored the description — keeps
+    /// selecting the right source until it is re-saved. Matching `name` first
+    /// is what fixes two identical-description mics binding the wrong source.
     fn decide_routing(sources: &[Source], requested: Option<&str>) -> Routing {
         match requested.and_then(|requested| {
             sources
                 .iter()
-                .find(|source| source.description == requested)
+                .find(|source| source.name == requested)
+                .or_else(|| {
+                    sources
+                        .iter()
+                        .find(|source| source.description == requested)
+                })
         }) {
             Some(source) => Routing::Source(source.name.clone()),
             // Unset selection (or a source that is currently unavailable,
@@ -641,10 +671,41 @@ mod pulse {
         #[test]
         fn routing_selects_the_source_matching_the_requested_description() {
             let sources = fixture_sources();
+            // A setting saved by an older build stored the description; it must
+            // still route (description fallback).
             match super::decide_routing(&sources, Some("Digital Microphone")) {
                 super::Routing::Source(name) => {
                     assert_eq!(name, "alsa_input.pci.HiFi__Mic1__source")
                 }
+                super::Routing::Default { .. } => panic!("expected a routed source"),
+            }
+        }
+
+        #[test]
+        fn routing_matches_the_stable_name_and_prefers_it_over_description() {
+            let sources = fixture_sources();
+            // The picker now persists the stable name; match on it directly.
+            match super::decide_routing(&sources, Some("alsa_input.pci.HiFi__Mic1__source")) {
+                super::Routing::Source(name) => {
+                    assert_eq!(name, "alsa_input.pci.HiFi__Mic1__source")
+                }
+                super::Routing::Default { .. } => panic!("expected a routed source"),
+            }
+            // If one source's name collides with another's description, the
+            // name match wins — this is what fixes two identical-description
+            // mics binding the wrong source.
+            let colliding = vec![
+                super::Source {
+                    name: "Digital Microphone".into(),
+                    description: "Some Other Mic".into(),
+                },
+                super::Source {
+                    name: "alsa_input.pci.HiFi__Mic1__source".into(),
+                    description: "Digital Microphone".into(),
+                },
+            ];
+            match super::decide_routing(&colliding, Some("Digital Microphone")) {
+                super::Routing::Source(name) => assert_eq!(name, "Digital Microphone"),
                 super::Routing::Default { .. } => panic!("expected a routed source"),
             }
         }
