@@ -365,7 +365,7 @@ fn physical_cpu_count() -> usize {
         .unwrap_or(1)
 }
 
-fn cpu_decode_threads() -> c_int {
+pub(crate) fn cpu_decode_threads() -> c_int {
     physical_cpu_count().clamp(1, c_int::MAX as usize) as c_int
 }
 

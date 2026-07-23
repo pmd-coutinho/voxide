@@ -227,13 +227,29 @@ mod implementation {
         } else {
             config.decoding_method = Some("greedy_search".into());
         }
-        let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
-            if vocabulary_boosting {
-                "Could not load Parakeet vocabulary boosting with CUDA. Check that the bundled sherpa-onnx runtime supports Parakeet TDT modified-beam decoding.".to_string()
-            } else {
-                "Could not load Parakeet with CUDA. Check that the CUDA 12 and cuDNN 9 runtime libraries are installed beside the Voxide CUDA build.".to_string()
+        let recognizer = match OfflineRecognizer::create(&config) {
+            Some(recognizer) => recognizer,
+            None => {
+                // sherpa-onnx has no built-in CPU fallback (unlike whisper.cpp/
+                // ggml), so when the CUDA provider fails to load — e.g. the
+                // CUDA 12 / cuDNN 9 runtime is missing — retry once on CPU with
+                // a real thread count (CUDA only needed one). Degraded but
+                // functional; missing model files or an unsupported decoding
+                // method still fail below.
+                debug_log::append(
+                    "Parakeet CUDA recognizer failed to load; retrying on CPU (degraded performance)",
+                );
+                config.model_config.provider = Some("cpu".into());
+                config.model_config.num_threads = crate::speech::cpu_decode_threads();
+                OfflineRecognizer::create(&config).ok_or_else(|| {
+                    if vocabulary_boosting {
+                        "Could not load Parakeet vocabulary boosting on CUDA or CPU. Check that the sherpa-onnx runtime supports Parakeet TDT modified-beam decoding and the model files are intact.".to_string()
+                    } else {
+                        "Could not load Parakeet on CUDA or CPU. Check that the model files are intact; CUDA 12 / cuDNN 9 runtime libraries are needed for GPU decoding.".to_string()
+                    }
+                })?
             }
-        })?;
+        };
         let recognizer = Arc::new(recognizer);
         cache.push(CachedRecognizer {
             model_directory: model_directory.to_path_buf(),
