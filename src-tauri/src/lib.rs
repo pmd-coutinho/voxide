@@ -8279,6 +8279,23 @@ fn is_isolated_dictation_test(prompt_test: bool, engine_test: bool) -> bool {
     prompt_test || engine_test
 }
 
+/// Whether a finished capture's canonical (produced-audio) duration diverges
+/// grossly from wall-clock elapsed. With zero dropped samples and zero stream
+/// errors, that is the signature of a broken audio clock the other health
+/// checks miss — a stalled/mis-clocked source, or a resampler-ratio regression.
+/// The band is intentionally loose and asymmetric: the wall clock brackets the
+/// audio (it starts before the first callback and ends after stop latency), so
+/// canonical sits legitimately below wall in healthy captures. Only gross
+/// divergence above a short-clip floor is flagged, and only as a warning —
+/// a false positive must never discard a genuinely captured dictation.
+fn capture_clock_diverges(wall_duration_ms: u64, canonical_duration_ms: u64) -> bool {
+    if wall_duration_ms < 500 {
+        return false;
+    }
+    let ratio = canonical_duration_ms as f64 / wall_duration_ms as f64;
+    !(0.5..=1.5).contains(&ratio)
+}
+
 #[tauri::command]
 async fn stop_native_dictation(
     app: AppHandle,
@@ -8347,6 +8364,12 @@ async fn stop_native_dictation(
         capture_health.latest_capture_delay_ns,
         capture_health.stream_errors,
     ));
+    if capture_clock_diverges(wall_duration_ms, captured.duration_ms) {
+        debug_log::append(&format!(
+            "Capture clock divergence (session: {recording_generation}): canonical={}ms wall={wall_duration_ms}ms — possible resampler/format regression or a stalled audio source",
+            captured.duration_ms
+        ));
+    }
     if capture_health.dropped_samples != 0 {
         return Err(format!(
             "Microphone capture overflowed and lost {} samples. Try closing CPU-intensive applications or selecting another input device, then record again.",
@@ -10427,6 +10450,19 @@ mod tests {
             .verified_provider_fingerprints
             .insert(ollama.id.clone(), local_fingerprint);
         assert!(ensure_provider_verified(&settings, &ollama, None).is_ok());
+    }
+
+    #[test]
+    fn capture_clock_divergence_only_flags_gross_mismatch_above_the_floor() {
+        // Below the 500 ms floor: never flagged (short clips have noisy ratios).
+        assert!(!capture_clock_diverges(400, 50));
+        // Healthy skew — canonical a little below or above wall.
+        assert!(!capture_clock_diverges(2_000, 1_800));
+        assert!(!capture_clock_diverges(2_000, 2_200));
+        // Gross divergence: far too little audio for the elapsed time (~0.35)…
+        assert!(capture_clock_diverges(2_000, 700));
+        // …or far too much (3×), e.g. an inverted resampler ratio.
+        assert!(capture_clock_diverges(2_000, 6_000));
     }
 
     #[test]
