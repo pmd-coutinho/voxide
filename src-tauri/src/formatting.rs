@@ -437,15 +437,22 @@ pub(crate) fn remove_filler_words(text: &str, filler_words: &[String]) -> String
     text.split(' ')
         .filter(|word| !word.is_empty())
         .filter(|word| {
-            // Trim any non-alphanumeric edge characters, not just ASCII
-            // punctuation, so a filler wrapped in Unicode punctuation (smart
-            // quotes, an em dash, an ellipsis) is still recognized and removed.
-            // This is Unicode-aware (`char::is_punctuation` is not in std) and a
-            // strict superset of the previous ASCII-punctuation trim, so ASCII
-            // behavior is unchanged; the emitted token is never altered, only
-            // the value compared against the filler list.
+            // Trim edge punctuation for the comparison so a filler wrapped in
+            // Unicode punctuation (smart quotes, an em dash, an ellipsis) is
+            // still recognized and removed. This is Unicode-aware
+            // (`char::is_punctuation` is not in std). Whitespace and control
+            // chars are deliberately NOT trimmed: this function preserves
+            // newlines for the punctuation renderer that runs next, so a filler
+            // glued to a newline ("um\n") must stay intact rather than be
+            // matched and dropped with its line break. That keeps this a true
+            // superset of the old ASCII-punctuation trim. The emitted token is
+            // never altered — only the value compared against the filler list.
             let normalized = word
-                .trim_matches(|character: char| !character.is_alphanumeric())
+                .trim_matches(|character: char| {
+                    !character.is_alphanumeric()
+                        && !character.is_whitespace()
+                        && !character.is_control()
+                })
                 .to_lowercase();
             !fillers.iter().any(|filler| filler == &normalized)
         })
@@ -1252,6 +1259,13 @@ mod tests {
         assert_eq!(
             remove_filler_words("\u{201C}hello\u{201D}", &fillers),
             "\u{201C}hello\u{201D}"
+        );
+        // A filler glued to a newline keeps the newline: whitespace/control are
+        // not trimmed for matching, so "um\n" is NOT recognized as the filler
+        // "um" and the line break the punctuation renderer relies on survives.
+        assert_eq!(
+            remove_filler_words("done um\n new", &fillers),
+            "done um\n new"
         );
     }
 
