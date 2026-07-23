@@ -1048,11 +1048,20 @@ struct CustomWordEntry {
     aliases: Vec<String>,
 }
 
-fn recognition_vocabulary(words: &[CustomWordEntry]) -> Vec<String> {
+fn recognition_vocabulary(
+    words: &[CustomWordEntry],
+    dictionary: &[DictionaryEntry],
+) -> Vec<String> {
     let mut seen = HashSet::new();
     words
         .iter()
         .flat_map(|word| std::iter::once(&word.text).chain(word.aliases.iter()))
+        // Boost each correction dictionary's REPLACEMENT target too, so the
+        // recognizer is nudged toward producing the exact form the correction
+        // expects (e.g. "Voxide") rather than only fixing it after the fact.
+        // Only the replacement is boosted, never the misheard `spoken` form —
+        // biasing the transducer toward the wrong tokens would defeat the goal.
+        .chain(dictionary.iter().map(|entry| &entry.replacement))
         .map(|word| word.trim())
         .filter(|word| !word.is_empty())
         .filter(|word| seen.insert(word.to_lowercase()))
@@ -1061,10 +1070,14 @@ fn recognition_vocabulary(words: &[CustomWordEntry]) -> Vec<String> {
         .collect()
 }
 
-fn active_recognition_vocabulary(settings: &Settings, words: &[CustomWordEntry]) -> Vec<String> {
+fn active_recognition_vocabulary(
+    settings: &Settings,
+    words: &[CustomWordEntry],
+    dictionary: &[DictionaryEntry],
+) -> Vec<String> {
     settings
         .vocabulary_boosting_enabled
-        .then(|| recognition_vocabulary(words))
+        .then(|| recognition_vocabulary(words, dictionary))
         .unwrap_or_default()
 }
 
@@ -3217,7 +3230,8 @@ async fn transcribe_file(
             .lock()
             .map_err(|_| "Voxide data lock was poisoned".to_string())?;
         let settings = database.settings.clone();
-        let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
+        let custom_words =
+            active_recognition_vocabulary(&settings, &database.custom_words, &database.dictionary);
         (settings, custom_words)
     };
     let progress_app = app.clone();
@@ -7243,7 +7257,8 @@ fn start_native_dictation(
             .requires_provider_profile()
             .then(|| selected_provider(&database, None))
             .transpose()?;
-        let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
+        let custom_words =
+            active_recognition_vocabulary(&settings, &database.custom_words, &database.dictionary);
         (
             settings,
             custom_words,
@@ -8171,7 +8186,8 @@ async fn stop_native_dictation(
             .lock()
             .map_err(|_| "Voxide data lock was poisoned".to_string())?;
         let settings = database.settings.clone();
-        let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
+        let custom_words =
+            active_recognition_vocabulary(&settings, &database.custom_words, &database.dictionary);
         (settings, custom_words)
     };
     let prompt_test_prompt = prompt_test_prompt
@@ -9431,8 +9447,11 @@ pub fn run() {
                 let state = preload_handle.state::<AppState>();
                 let Ok((settings, vocabulary)) = state.database.lock().map(|database| {
                     let settings = database.settings.clone();
-                    let vocabulary =
-                        active_recognition_vocabulary(&settings, &database.custom_words);
+                    let vocabulary = active_recognition_vocabulary(
+                        &settings,
+                        &database.custom_words,
+                        &database.dictionary,
+                    );
                     (settings, vocabulary)
                 }) else {
                     return;
@@ -10115,13 +10134,45 @@ mod tests {
                 aliases: vec!["Acme".into()],
             },
         ];
-        let vocabulary = recognition_vocabulary(&words);
+        let vocabulary = recognition_vocabulary(&words, &[]);
         assert_eq!(vocabulary, vec!["Voxide", "vox side", "Acme"]);
 
         let mut settings = Settings::default();
-        assert!(active_recognition_vocabulary(&settings, &words).is_empty());
+        assert!(active_recognition_vocabulary(&settings, &words, &[]).is_empty());
         settings.vocabulary_boosting_enabled = true;
-        assert_eq!(active_recognition_vocabulary(&settings, &words), vocabulary);
+        assert_eq!(
+            active_recognition_vocabulary(&settings, &words, &[]),
+            vocabulary
+        );
+    }
+
+    #[test]
+    fn recognition_vocabulary_boosts_dictionary_replacement_targets_not_spoken_forms() {
+        let dictionary = [
+            DictionaryEntry {
+                id: "1".into(),
+                spoken: "gib hub".into(),
+                replacement: "GitHub".into(),
+                created_at: Utc::now(),
+            },
+            // A replacement that duplicates an existing term (case-insensitive)
+            // must not be added twice; the misheard `spoken` form is never boosted.
+            DictionaryEntry {
+                id: "2".into(),
+                spoken: "kew bernetties".into(),
+                replacement: "Voxide".into(),
+                created_at: Utc::now(),
+            },
+        ];
+        let words = [CustomWordEntry {
+            text: "Voxide".into(),
+            weight: None,
+            aliases: vec![],
+        }];
+        let vocabulary = recognition_vocabulary(&words, &dictionary);
+        // "Voxide" once (deduped), the new replacement "GitHub", and neither
+        // "gib hub" nor "kew bernetties".
+        assert_eq!(vocabulary, vec!["Voxide", "GitHub"]);
     }
 
     #[test]

@@ -673,7 +673,11 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
     let (settings, custom_words) = match state.database.lock() {
         Ok(database) => {
             let settings = database.settings.clone();
-            let custom_words = active_recognition_vocabulary(&settings, &database.custom_words);
+            let custom_words = active_recognition_vocabulary(
+                &settings,
+                &database.custom_words,
+                &database.dictionary,
+            );
             (settings, custom_words)
         }
         Err(_) => {
