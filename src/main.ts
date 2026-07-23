@@ -1,4 +1,4 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -1136,7 +1136,7 @@ function renderHistory(): void {
     entry.mode,
   ].some((value) => value.toLocaleLowerCase().includes(query)));
   const entries = visibleEntries.map((entry) => {
-    const playback = entry.audioFile ? `<audio class="history-audio" controls preload="metadata" src="${escapeHtml(convertFileSrc(entry.audioFile))}">Saved recording</audio>` : "";
+    const playback = entry.audioFile ? `<audio class="history-audio" controls preload="none" data-audio-entry="${entry.id}">Saved recording</audio>` : "";
     const audioExport = entry.audioFile ? `<button data-export-audio-entry="${entry.id}">Export audio ZIP</button>` : "";
     const source = entry.sourceApplication?.trim() || "Unknown app";
     const rawText = entry.rawText && entry.rawText !== entry.text
@@ -2150,7 +2150,29 @@ async function initializeOverlay(): Promise<void> {
   });
 }
 
+const audioBlobUrls = new Map<string, string>();
+// History recordings are played from blob: URLs (allowed by the CSP) built
+// from a backend command, rather than the asset protocol, which failed to
+// load in the packaged webview. Runs after every render; a no-op off history.
+function loadHistoryAudio(): void {
+  for (const url of audioBlobUrls.values()) URL.revokeObjectURL(url);
+  audioBlobUrls.clear();
+  document.querySelectorAll<HTMLAudioElement>("audio[data-audio-entry]").forEach((element) => {
+    const id = element.dataset.audioEntry;
+    if (!id) return;
+    void invoke<string>("read_dictation_audio", { id })
+      .then((base64) => {
+        const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+        audioBlobUrls.set(id, url);
+        element.src = url;
+      })
+      .catch(() => {});
+  });
+}
+
 function bindCommonEvents(): void {
+  loadHistoryAudio();
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((element) => element.addEventListener("click", () => {
     const nextView = element.dataset.nav ?? "welcome";
     if (promptTestState.active && nextView !== "enhancement") {

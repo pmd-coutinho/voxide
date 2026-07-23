@@ -2977,6 +2977,37 @@ fn save_dictation(
         .ok_or("The saved dictation could not be found".into())
 }
 
+/// Returns a saved dictation recording as base64 WAV bytes. The history UI
+/// plays it from a `blob:` URL rather than the asset protocol, which avoids
+/// asset-scope/URL-scheme issues in the packaged webview. The path is confined
+/// to the audio-history directory so this can never read arbitrary files.
+#[tauri::command]
+fn read_dictation_audio(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let audio_file = state
+        .database
+        .lock()
+        .map_err(|_| "Voxide data lock was poisoned".to_string())?
+        .dictation_history
+        .iter()
+        .find(|entry| entry.id == id)
+        .and_then(|entry| entry.audio_file.clone())
+        .ok_or("This dictation has no saved recording")?;
+    let directory = state
+        .audio_history_directory()?
+        .canonicalize()
+        .map_err(|error| format!("Could not open the audio history directory: {error}"))?;
+    let path = PathBuf::from(&audio_file)
+        .canonicalize()
+        .map_err(|error| format!("Could not open the recording: {error}"))?;
+    if !path.starts_with(&directory) {
+        return Err("Refusing to read audio outside the history directory".into());
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("Could not read the recording: {error}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 #[tauri::command]
 fn copy_completed_dictation(text: String) -> Result<(), String> {
     typing::copy_text_to_clipboard(&text)
@@ -10492,6 +10523,7 @@ pub fn run() {
             import_backup,
             save_dictation,
             copy_completed_dictation,
+            read_dictation_audio,
             copy_text_to_clipboard,
             update_dictation,
             dictionary_learning_suggestions,
