@@ -38,6 +38,7 @@ mod local_api;
 mod media;
 mod nemotron;
 mod parakeet;
+mod parakeet_stream;
 mod permissions;
 #[cfg(target_os = "linux")]
 mod portal_hotkeys;
@@ -584,6 +585,12 @@ struct Settings {
     paste_last_transcription_hotkey: Option<String>,
     hotkey_activation_mode: HotkeyActivationMode,
     enable_streaming_preview: bool,
+    /// Opt-in: drive the Parakeet live preview with the CPU streaming zipformer
+    /// (true low-latency partials + endpointing) instead of re-decoding a
+    /// rolling window through the offline TDT. Requires the streaming preview
+    /// model to be downloaded; the authoritative final stays the CUDA TDT.
+    #[serde(default)]
+    parakeet_streaming_preview: bool,
     enable_ai_streaming: bool,
     show_thinking_tokens: bool,
     transcription_preview_char_limit: usize,
@@ -696,6 +703,7 @@ impl Default for Settings {
             paste_last_transcription_hotkey: None,
             hotkey_activation_mode: HotkeyActivationMode::Toggle,
             enable_streaming_preview: true,
+            parakeet_streaming_preview: false,
             enable_ai_streaming: true,
             show_thinking_tokens: true,
             transcription_preview_char_limit: DEFAULT_TRANSCRIPTION_PREVIEW_CHARACTERS,
@@ -8059,6 +8067,241 @@ async fn download_parakeet_model(
     })
 }
 
+fn parakeet_stream_model_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(parakeet_stream::model_directory(&state.models_directory()?))
+}
+
+pub(crate) fn parakeet_stream_model_is_verified(model_directory: &Path) -> bool {
+    parakeet_stream::model_is_installed(model_directory)
+        && component_receipt_is_recorded(
+            model_directory,
+            parakeet_stream::MODEL_ID,
+            parakeet_stream::MODEL_ARCHIVE_SHA256,
+            parakeet_stream::required_files(),
+        )
+}
+
+fn validate_parakeet_stream_archive(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    downloaded_bytes: u64,
+) -> Result<(), String> {
+    if downloaded_bytes != parakeet_stream::MODEL_ARCHIVE_BYTES {
+        return Err(
+            "The streaming preview download size did not match the pinned release asset".into(),
+        );
+    }
+    if expected_bytes.is_some_and(|expected| expected != parakeet_stream::MODEL_ARCHIVE_BYTES) {
+        return Err(
+            "The streaming preview server reported an unexpected release asset size".into(),
+        );
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not verify the streaming preview download: {error}"))?;
+    if !metadata.is_file() || metadata.len() != downloaded_bytes {
+        return Err(
+            "The streaming preview download was not saved as a complete regular file".into(),
+        );
+    }
+    let mut prefix = [0_u8; 3];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .map_err(|error| format!("Could not inspect the streaming preview download: {error}"))?;
+    if &prefix != b"BZh" {
+        return Err("The streaming preview download is not a bzip2 model archive".into());
+    }
+    if sha256_file(path)? != parakeet_stream::MODEL_ARCHIVE_SHA256 {
+        return Err(
+            "The streaming preview download checksum did not match the pinned release asset".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Extracts the streaming zipformer archive and keeps only the int8 trio plus
+/// tokens (the archive also ships fp32 copies, test wavs, and a bpe model we do
+/// not use), so the installed footprint stays small.
+fn install_parakeet_stream_archive(
+    archive_path: &Path,
+    models_directory: &Path,
+) -> Result<PathBuf, String> {
+    let staging =
+        models_directory.join(format!(".parakeet-stream-install-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging).map_err(|error| {
+        format!("Could not prepare the streaming preview installation: {error}")
+    })?;
+    let install_result = (|| {
+        let file = fs::File::open(archive_path)
+            .map_err(|error| format!("Could not open the streaming preview archive: {error}"))?;
+        let decoder = bzip2::read::BzDecoder::new(file);
+        let mut tarball = tar::Archive::new(decoder);
+        for entry in tarball
+            .entries()
+            .map_err(|error| format!("Could not read the streaming preview archive: {error}"))?
+        {
+            entry
+                .map_err(|error| {
+                    format!("Could not read a streaming preview archive entry: {error}")
+                })?
+                .unpack_in(&staging)
+                .map_err(|error| {
+                    format!("Could not extract the streaming preview archive safely: {error}")
+                })?;
+        }
+        let extracted = staging.join(parakeet_stream::archive_root());
+        if !parakeet_stream::model_is_installed(&extracted) {
+            return Err(parakeet_stream::installation_error(&extracted));
+        }
+        let merged = staging.join("model");
+        fs::create_dir(&merged).map_err(|error| {
+            format!("Could not prepare the streaming preview installation: {error}")
+        })?;
+        for file in parakeet_stream::required_files() {
+            fs::copy(extracted.join(file), merged.join(file)).map_err(|error| {
+                format!("Could not assemble the streaming preview model ({file}): {error}")
+            })?;
+        }
+        write_component_receipt(
+            &merged,
+            &ComponentReceipt {
+                schema: COMPONENT_RECEIPT_SCHEMA,
+                id: parakeet_stream::MODEL_ID.into(),
+                version: parakeet_stream::MODEL_ARCHIVE_SHA256.into(),
+                source: parakeet_stream::MODEL_ARCHIVE_URL.into(),
+                files: component_file_hashes(
+                    &merged,
+                    parakeet_stream::required_files().iter().copied(),
+                )?,
+            },
+        )?;
+        let destination = parakeet_stream::model_directory(models_directory);
+        replace_component_directory(&merged, &destination)?;
+        Ok(destination)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    install_result
+}
+
+#[tauri::command]
+async fn download_parakeet_stream_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    if !parakeet_stream::is_compiled() {
+        return Err(
+            "The streaming preview model is available in Voxide's CUDA build. Install a CUDA build first."
+                .into(),
+        );
+    }
+    let directory = state.models_directory()?;
+    let temporary = directory.join(format!(".{}.tar.bz2.download", parakeet_stream::MODEL_ID));
+    let response = reqwest::get(parakeet_stream::MODEL_ARCHIVE_URL)
+        .await
+        .map_err(|error| format!("Could not download the streaming preview model: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not download the streaming preview model: HTTP {}",
+            response.status()
+        ));
+    }
+    if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+        return Err("Could not download the streaming preview model: the server returned HTML or XML instead of model data.".into());
+    }
+    let reported_bytes = response.content_length();
+    let download_result = async {
+        let mut downloaded_bytes = 0_u64;
+        let mut stream = response.bytes_stream();
+        let mut output = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|error| format!("Could not create the streaming preview download: {error}"))?;
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                format!("The streaming preview download was interrupted: {error}")
+            })?;
+            output.write_all(&chunk).await.map_err(|error| {
+                format!("Could not save the streaming preview download: {error}")
+            })?;
+            downloaded_bytes += chunk.len() as u64;
+            let _ = app.emit(
+                "model-download-progress",
+                ModelDownloadProgress {
+                    id: parakeet_stream::MODEL_ID.into(),
+                    downloaded_bytes,
+                    total_bytes: Some(parakeet_stream::MODEL_ARCHIVE_BYTES),
+                },
+            );
+        }
+        output.flush().await.map_err(|error| {
+            format!("Could not finalize the streaming preview download: {error}")
+        })?;
+        Ok::<u64, String>(downloaded_bytes)
+    }
+    .await;
+    let downloaded_bytes = match download_result {
+        Ok(downloaded_bytes) => downloaded_bytes,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    let validate_path = temporary.clone();
+    let validation = tauri::async_runtime::spawn_blocking(move || {
+        validate_parakeet_stream_archive(&validate_path, reported_bytes, downloaded_bytes)
+    })
+    .await
+    .map_err(|error| format!("Streaming preview validation task failed: {error}"))?;
+    if let Err(error) = validation {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    let install_directory = directory.clone();
+    let install_archive = temporary.clone();
+    let install = tauri::async_runtime::spawn_blocking(move || {
+        install_parakeet_stream_archive(&install_archive, &install_directory)
+    })
+    .await
+    .map_err(|error| format!("Streaming preview installation task failed: {error}"));
+    let _ = tokio::fs::remove_file(&temporary).await;
+    let destination = install??;
+    Ok(VoiceModelStatus {
+        id: parakeet_stream::MODEL_ID.into(),
+        installed: true,
+        path: destination.display().to_string(),
+        runtime_installed: None,
+    })
+}
+
+#[tauri::command]
+fn delete_parakeet_stream_model(state: State<'_, AppState>) -> Result<VoiceModelStatus, String> {
+    let path = parakeet_stream_model_path(&state)?;
+    if !path.exists() {
+        return Err("The streaming preview model is not installed".into());
+    }
+    if !path.is_dir() {
+        return Err("The streaming preview model path is not a directory".into());
+    }
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Could not remove the streaming preview model: {error}"))?;
+    Ok(VoiceModelStatus {
+        id: parakeet_stream::MODEL_ID.into(),
+        installed: false,
+        path: path.display().to_string(),
+        runtime_installed: None,
+    })
+}
+
+#[tauri::command]
+fn parakeet_stream_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, String> {
+    let path = parakeet_stream_model_path(&state)?;
+    Ok(VoiceModelStatus {
+        id: parakeet_stream::MODEL_ID.into(),
+        installed: parakeet_stream::is_compiled() && parakeet_stream_model_is_verified(&path),
+        path: path.display().to_string(),
+        runtime_installed: None,
+    })
+}
+
 /// Resolves the current input device (device handle, negotiated config, and
 /// sound-server routing) off the record hotkey path and caches it so the next
 /// press only opens the stream. Safe to call whenever no capture is active —
@@ -8710,6 +8953,97 @@ fn spawn_live_parakeet_preview(
                 Err(error) => debug_log::append(&format!(
                     "Live Parakeet preview skipped (audio_ms: {audio_ms}): {error}"
                 )),
+            }
+        }
+    });
+}
+
+/// Opt-in true-streaming Parakeet preview: FluidVoice's "Flash" analog. Unlike
+/// the offline TDT preview above (which re-decodes a rolling window each tick),
+/// this drives a CPU streaming zipformer that is fed only the newly captured
+/// audio each poll and endpoints utterances itself. It runs entirely on the CPU
+/// execution provider, so it never touches the CUDA context the offline TDT
+/// final owns — no inference lock, no concurrent-CUDA risk. The `Session` is
+/// task-local (created here, dropped when the session ends); the authoritative
+/// final is still the separate full-capture CUDA TDT decode.
+#[cfg(feature = "parakeet")]
+fn spawn_live_parakeet_stream(
+    app: AppHandle,
+    preview_generation: u64,
+    model_path: PathBuf,
+    preview_char_limit: usize,
+) {
+    tauri::async_runtime::spawn(async move {
+        const POLL_INTERVAL: Duration = Duration::from_millis(120);
+        let start_path = model_path.clone();
+        let mut session = match tauri::async_runtime::spawn_blocking(move || {
+            parakeet_stream::Session::start(&start_path)
+        })
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                return debug_log::append(&format!(
+                    "Live streaming preview could not start: {error}"
+                ));
+            }
+            Err(error) => {
+                return debug_log::append(&format!("Live streaming preview task failed: {error}"));
+            }
+        };
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let captured = capture_state.capture.lock().ok().and_then(|capture| {
+                capture
+                    .as_ref()
+                    // The streaming decoder is stateful, so it needs the whole
+                    // capture-so-far to feed a contiguous delta — not a window.
+                    .and_then(|capture| capture.snapshot_all().ok())
+            });
+            let Some(captured) = captured else {
+                continue;
+            };
+            let samples = match audio::mono_resample_for_whisper(captured) {
+                Ok(samples) => samples,
+                Err(error) => {
+                    debug_log::append(&format!(
+                        "Live streaming preview could not resample audio: {error}"
+                    ));
+                    continue;
+                }
+            };
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
+            let (returned, text) = match tauri::async_runtime::spawn_blocking(move || {
+                let text = session.observe(&samples);
+                (session, text)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    finish_preview(&capture_state, preview_generation);
+                    return debug_log::append(&format!(
+                        "Live streaming preview task failed: {error}"
+                    ));
+                }
+            };
+            session = returned;
+            finish_preview(&capture_state, preview_generation);
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            if !text.trim().is_empty() {
+                emit_overlay(
+                    &app,
+                    "recording",
+                    tail_characters(&text, preview_char_limit),
+                );
             }
         }
     });
@@ -10661,6 +10995,9 @@ pub fn run() {
             open_accessibility_settings,
             download_whisper_model,
             download_parakeet_model,
+            download_parakeet_stream_model,
+            delete_parakeet_stream_model,
+            parakeet_stream_model_status,
             install_nemotron_cuda_runtime,
             remove_nemotron_cuda_runtime,
             install_pronunciation_runtime,

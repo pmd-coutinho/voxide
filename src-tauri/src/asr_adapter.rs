@@ -114,6 +114,26 @@ impl VoiceEngine {
                 );
             }
             Self::Parakeet if settings.enable_streaming_preview => {
+                // Opt-in: drive the preview with the CPU streaming zipformer when
+                // it is enabled and its model is installed; otherwise fall back to
+                // the offline-window preview.
+                #[cfg(feature = "parakeet")]
+                if settings.parakeet_streaming_preview {
+                    match parakeet_stream_model_path(state) {
+                        Ok(stream_model) if parakeet_stream_model_is_verified(&stream_model) => {
+                            spawn_live_parakeet_stream(
+                                app,
+                                session_id,
+                                stream_model,
+                                settings.transcription_preview_char_limit,
+                            );
+                            return Ok(());
+                        }
+                        _ => crate::debug_log::append(
+                            "Streaming preview requested but its model is not installed; using the offline-window preview",
+                        ),
+                    }
+                }
                 let model = parakeet_model_path(state)?;
                 spawn_live_parakeet_preview(
                     app,

@@ -37,6 +37,7 @@ interface Settings {
   pasteLastTranscriptionHotkey?: string;
   hotkeyActivationMode: "toggle" | "hold" | "automatic";
   enableStreamingPreview: boolean;
+  parakeetStreamingPreview: boolean;
   enableAiStreaming: boolean;
   showThinkingTokens: boolean;
   transcriptionPreviewCharLimit: number;
@@ -508,6 +509,7 @@ let currentView = "welcome";
 let recording = false;
 let liveText = "";
 let modelStatus: VoiceModelStatus | undefined;
+let parakeetStreamModelInstalled = false;
 let voiceEngineAvailability: VoiceEngineAvailability = { engines: [] };
 let pronunciationRuntimeInstalled = false;
 // The dictionary entry whose pronunciation is being recorded right now, if any.
@@ -817,7 +819,7 @@ function renderVoiceEngine(): void {
       <label>Whisper decoding<select id="whisper-beam-size"><option value="auto" ${database.settings.whisperBeamSize === "auto" ? "selected" : ""}>Auto — Beam 5 on GPU, greedy on CPU</option><option value="greedy" ${database.settings.whisperBeamSize === "greedy" ? "selected" : ""}>Greedy — fastest</option><option value="beam2" ${database.settings.whisperBeamSize === "beam2" ? "selected" : ""}>Beam 2 — balanced</option><option value="beam5" ${database.settings.whisperBeamSize === "beam5" ? "selected" : ""}>Beam 5 — highest local accuracy</option></select><small>Preview decoding stays greedy so it never delays the final result.</small></label>
       <label>Custom local model path (optional)<input id="local-model-path" value="${escapeHtml(database.settings.localModelPath ?? "")}" placeholder="/path/to/ggml-model.bin"></label>`
     : isParakeet
-      ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v2 is the English higher-recall Parakeet model. Voxide installs both the fp16 export (used on the GPU for better accuracy on quiet input) and the int8 export (CPU fallback). Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 1.6 GB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p>`
+      ? `<section class="setting-subsection"><h3>Parakeet input</h3>${microphoneInput}<small>Parakeet TDT 0.6B v2 is the English higher-recall Parakeet model. Voxide installs both the fp16 export (used on the GPU for better accuracy on quiet input) and the int8 export (CPU fallback). Like FluidVoice, it periodically re-decodes the full growing capture for preview, then runs a separate full-audio decode when dictation stops; it does not use VAD segmentation.</small></section><p class="muted">Runs locally through the CUDA build. Download size is about 1.6 GB; it requires an NVIDIA GPU with CUDA 12 and cuDNN 9 runtime libraries.</p><section class="setting-subsection"><h3>Streaming preview (experimental)</h3>${settingToggle("parakeetStreamingPreview", "Use the streaming preview model", "Drive the live preview with a low-latency CPU streaming model with end-of-utterance detection, instead of re-decoding a rolling window. The authoritative final transcription is unchanged. Needs a separate ~296 MB model.")}${database.settings.parakeetStreamingPreview ? (parakeetStreamModelInstalled ? `<p class="muted">Streaming preview model ready. <button data-action="delete-parakeet-stream-model" ${downloading ? "disabled" : ""}>Remove streaming model</button></p>` : `<button data-action="download-parakeet-stream-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download streaming preview model (~296 MB)"}</button>`) : ""}</section>`
       : isNemotron
         ? `<section class="setting-subsection"><h3>Nemotron input</h3>${microphoneInput}<label>Streaming profile<select id="nemotron-streaming-mode"><option value="fast" ${database.settings.nemotronStreamingMode === "fast" ? "selected" : ""}>Fast — 320 ms chunks</option><option value="balanced" ${database.settings.nemotronStreamingMode === "balanced" ? "selected" : ""}>Balanced — 560 ms chunks (recommended)</option><option value="quality" ${database.settings.nemotronStreamingMode === "quality" ? "selected" : ""}>Quality — 1.12 s chunks</option></select><small>Larger chunks give the model more right-context and generally improve recognition accuracy; all three remain true cache-aware streams.</small></label><small>Nemotron 3.5 ASR Streaming 0.6B feeds new microphone audio through its CUDA encoder cache and emits incremental text. The final transcript flushes that same stream; it does not use VAD segmentation.</small></section><p class="muted">Runs locally on Linux/NVIDIA CUDA. First install the user-local PyTorch CUDA runtime, then download the 2.6 GB model. The runtime and model are separate so the model can be removed from this screen.</p>`
       : isCloud
@@ -1312,6 +1314,13 @@ async function refreshStats(): Promise<void> {
 
 async function refreshModelStatus(): Promise<void> {
   modelStatus = await invoke<VoiceModelStatus>("voice_model_status");
+  try {
+    parakeetStreamModelInstalled = (
+      await invoke<VoiceModelStatus>("parakeet_stream_model_status")
+    ).installed;
+  } catch {
+    parakeetStreamModelInstalled = false;
+  }
   try {
     pronunciationRuntimeInstalled = (
       await invoke<PronunciationRuntimeStatus>("pronunciation_runtime_status")
@@ -2779,6 +2788,34 @@ async function handleAction(element: HTMLElement): Promise<void> {
         render();
       } catch (error) {
         showNotice(`Could not remove Parakeet: ${String(error)}`);
+      }
+      break;
+    }
+    case "download-parakeet-stream-model": {
+      showNotice("Downloading the streaming preview model. This is about 296 MB and may take a few minutes.");
+      modelDownloadProgress = { id: "streaming-zipformer-en-2023-06-26", downloadedBytes: 0 };
+      render();
+      try {
+        await invoke<VoiceModelStatus>("download_parakeet_stream_model");
+        parakeetStreamModelInstalled = true;
+        showNotice("Streaming preview model is installed.");
+      } catch (error) {
+        showNotice(`Could not download the streaming preview model: ${String(error)}`);
+      } finally {
+        modelDownloadProgress = undefined;
+        render();
+      }
+      break;
+    }
+    case "delete-parakeet-stream-model": {
+      if (!window.confirm("Remove the streaming preview model? You can download it again later.")) break;
+      try {
+        await invoke<VoiceModelStatus>("delete_parakeet_stream_model");
+        parakeetStreamModelInstalled = false;
+        showNotice("The streaming preview model was removed.");
+        render();
+      } catch (error) {
+        showNotice(`Could not remove the streaming preview model: ${String(error)}`);
       }
       break;
     }
