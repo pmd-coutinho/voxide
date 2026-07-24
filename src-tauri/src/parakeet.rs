@@ -9,77 +9,22 @@ use std::path::{Path, PathBuf};
 
 use crate::{audio, media};
 
-pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v2";
+pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v2-int8";
+pub const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
+/// GitHub release asset digest verified on 2026-07-22. The release tag is a
+/// mutable URL, so installation must authenticate the downloaded archive.
+pub const MODEL_ARCHIVE_SHA256: &str =
+    "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad";
+pub const MODEL_ARCHIVE_BYTES: u64 = 482_468_385;
+const MODEL_ARCHIVE_ROOT: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
 
-/// One downloadable sherpa-onnx release archive. Parakeet installs two precision
-/// exports into a single model directory: the fp16 export used on CUDA (natively
-/// fast on the ONNX Runtime CUDA EP and more robust on quiet input than int8),
-/// and the int8 export kept for the CPU fallback (fp16 on the ORT CPU EP is
-/// emulated and slow). Each archive is pinned by digest because the release tag
-/// is a mutable URL, so installation must authenticate every downloaded archive.
-pub struct ModelArchive {
-    pub url: &'static str,
-    pub sha256: &'static str,
-    pub bytes: u64,
-    /// Top-level directory inside the tarball.
-    pub root: &'static str,
-    /// Files copied out of `root/` into the shared model directory.
-    pub files: &'static [&'static str],
-}
-
-/// Digests verified on 2026-07-24. A `static` (not `const`) so install/download
-/// can hold `&'static ModelArchive` across `spawn_blocking`.
-pub static MODEL_ARCHIVES: [ModelArchive; 2] = [
-    // int8 first: smaller, and it carries the shared tokens.txt.
-    ModelArchive {
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
-        sha256: "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad",
-        bytes: 482_468_385,
-        root: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
-        files: &[
-            "encoder.int8.onnx",
-            "decoder.int8.onnx",
-            "joiner.int8.onnx",
-            "tokens.txt",
-        ],
-    },
-    ModelArchive {
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16.tar.bz2",
-        sha256: "37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0",
-        bytes: 1_120_982_957,
-        root: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16",
-        files: &["encoder.fp16.onnx", "decoder.fp16.onnx", "joiner.fp16.onnx"],
-    },
-];
-
-/// Combined download across both archives — the pinned total-size check and the
-/// unit for the download progress bar. Kept a literal sum because a `const`
-/// cannot read the `static` archive table.
-pub const MODEL_ARCHIVE_BYTES: u64 = 482_468_385 + 1_120_982_957;
-
-/// Receipt version, bound to both archive digests so re-pinning either export
-/// invalidates an existing install and forces a fresh, authenticated download.
-pub const MODEL_RECEIPT_VERSION: &str = concat!(
-    "int8:157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad;",
-    "fp16:37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0"
-);
-
-/// The CUDA-preferred fp16 encoder/decoder/joiner.
-const FP16_FILES: [&str; 3] = ["encoder.fp16.onnx", "decoder.fp16.onnx", "joiner.fp16.onnx"];
-/// The CPU-fallback int8 encoder/decoder/joiner.
+// The int8 encoder/decoder/joiner, used on both CUDA and CPU. (An fp16 export
+// of this model exists but decodes to empty text on sherpa-onnx 1.13.4's CUDA
+// EP — ORT's CUDA fp16 transducer path yields no tokens and sherpa exposes no
+// fp16 knob — so it is not shipped.)
 const INT8_FILES: [&str; 3] = ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx"];
 const TOKENS_FILE: &str = "tokens.txt";
-
-/// Every file that must be present in an installed model directory.
-const REQUIRED_FILES: [&str; 7] = [
-    FP16_FILES[0],
-    FP16_FILES[1],
-    FP16_FILES[2],
-    INT8_FILES[0],
-    INT8_FILES[1],
-    INT8_FILES[2],
-    TOKENS_FILE,
-];
+const REQUIRED_FILES: [&str; 4] = [INT8_FILES[0], INT8_FILES[1], INT8_FILES[2], TOKENS_FILE];
 
 /// TDT is an offline recognizer, so the newest tokens in a live full-buffer
 /// decode are tentative: the model has not yet seen the following audio that
@@ -188,6 +133,10 @@ pub fn is_compiled() -> bool {
 
 pub fn model_directory(models_directory: &Path) -> PathBuf {
     models_directory.join(MODEL_ID)
+}
+
+pub fn archive_root() -> &'static str {
+    MODEL_ARCHIVE_ROOT
 }
 
 pub fn required_files() -> &'static [&'static str] {
@@ -337,15 +286,14 @@ mod implementation {
             return Ok(Arc::clone(&cached.recognizer));
         }
 
-        // Use the int8 export on both CUDA and CPU. The fp16 export was measured
+        // Use the int8 export on both CUDA and CPU. (An fp16 export was measured
         // to load and run on this sherpa-onnx 1.13.4 CUDA EP but decode to an
-        // empty transcript (ORT's CUDA fp16 transducer path yields no tokens
-        // here, and sherpa exposes no fp16 knob to correct it), whereas int8
-        // decodes correctly and fast. sherpa-onnx has no built-in CPU fallback
-        // (unlike whisper.cpp/ggml), so when the CUDA provider fails to load —
-        // e.g. the CUDA 12 / cuDNN 9 runtime is missing — retry on CPU with a
-        // real thread count. Degraded but functional; intact-but-unsupported
-        // files still fail below. (The fp16 files remain installed but unused.)
+        // empty transcript — ORT's CUDA fp16 transducer path yields no tokens
+        // here and sherpa exposes no fp16 knob — so it is not shipped.) sherpa
+        // has no built-in CPU fallback (unlike whisper.cpp/ggml), so when the
+        // CUDA provider fails to load — e.g. the CUDA 12 / cuDNN 9 runtime is
+        // missing — retry on CPU with a real thread count. Degraded but
+        // functional; intact-but-unsupported files still fail below.
         let recognizer = match OfflineRecognizer::create(&model_config(
             model_directory,
             &INT8_FILES,
