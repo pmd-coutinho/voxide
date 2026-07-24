@@ -492,7 +492,7 @@ mod tests {
                 .lock()
                 .expect("Parakeet live lock");
             live.generation = 4;
-            live.previous_full_text = "stale preview".into();
+            live.last_preview_text = "stale preview".into();
         }
 
         VoiceEngine::Parakeet
@@ -504,7 +504,7 @@ mod tests {
             .lock()
             .expect("Parakeet live lock");
         assert_eq!(live.generation, 9);
-        assert!(live.previous_full_text.is_empty());
+        assert!(live.last_preview_text.is_empty());
     }
 
     #[test]

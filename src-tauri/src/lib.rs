@@ -2241,7 +2241,10 @@ impl Drop for ResetDictationContextWhenDropped<'_> {
 #[derive(Debug, Clone, Default)]
 struct ParakeetLiveState {
     generation: u64,
-    previous_full_text: String,
+    /// The text the live preview last put on the overlay this session. Held so
+    /// the preview→final handoff can keep it on screen through the offline
+    /// decode instead of blanking to a status string.
+    last_preview_text: String,
 }
 
 /// State held across Nemotron's native cache-aware stream. The child process
@@ -8276,8 +8279,9 @@ fn start_native_dictation(
     })
 }
 
-/// Produces a deliberately conservative live transcript. Whisper previews are
-/// independent decodes of a growing, then rolling, audio window. The tail is
+/// Produces a deliberately conservative live transcript, shared by the Whisper
+/// and Parakeet previews. Both are independent decodes of a growing, then
+/// rolling, audio window. The tail is
 /// therefore provisional. A word that has survived an overlap between two
 /// windows is old enough to make the overlay monotonic: it is never rewritten
 /// by a later, noisier snapshot. The current provisional tail remains visible
@@ -8285,7 +8289,7 @@ fn start_native_dictation(
 /// user speaks. The actual final decode still replaces the overlay when
 /// recording stops.
 #[derive(Default)]
-struct WhisperPreviewStability {
+struct PreviewStability {
     /// The best chronological sequence assembled from preview windows. Its
     /// suffix remains editable until a subsequent window overlaps it.
     timeline_words: Vec<String>,
@@ -8294,7 +8298,7 @@ struct WhisperPreviewStability {
     confirmed_words: usize,
 }
 
-impl WhisperPreviewStability {
+impl PreviewStability {
     fn observe(&mut self, candidate: &str) -> Option<String> {
         let current_words = candidate
             .split_whitespace()
@@ -8405,7 +8409,7 @@ fn spawn_live_whisper_preview(
         // machine: GPU inference refreshes several times per second while
         // CPU inference backs off to its own cost instead of piling up.
         let mut interval = Duration::from_millis(600);
-        let mut stability = WhisperPreviewStability::default();
+        let mut stability = PreviewStability::default();
         loop {
             tokio::time::sleep(interval).await;
             let capture_state = app.state::<NativeCaptureState>();
@@ -8515,9 +8519,9 @@ fn spawn_live_whisper_preview(
 /// (like the cloud preview) rather than the whole capture: re-decoding a
 /// growing recording every tick is O(total) work that holds `INFERENCE_LOCK`
 /// progressively longer and starves the final decode. The overlay only shows
-/// the recent tail anyway, and `fluidvoice_preview_reconcile` gracefully falls
-/// back to current-only text once the window slides past the recording start,
-/// so bounding the window costs no visible context. The authoritative final
+/// the recent tail anyway, and a cross-snapshot stability pass (shared with the
+/// Whisper preview) refuses to retract words it has already shown as the window
+/// slides, so bounding the window costs no visible context. The authoritative final
 /// pass still decodes the complete capture. Voxide additionally hides the
 /// timestamped, still-tentative tail of each CUDA hypothesis before showing
 /// it, because Sherpa's INT8 ONNX decoder can otherwise invent words at the
@@ -8531,24 +8535,24 @@ fn spawn_live_parakeet_preview(
     preview_char_limit: usize,
 ) {
     tauri::async_runtime::spawn(async move {
-        const PREVIEW_INTERVAL: Duration = Duration::from_millis(600);
         const MINIMUM_PREVIEW_SAMPLES: usize = audio::WHISPER_SAMPLE_RATE as usize;
         // Trailing audio window each preview decodes. Bounds per-tick cost so a
         // long recording cannot grow the decode (and its `INFERENCE_LOCK` hold)
         // without limit; matches the cloud preview's window.
         const PARAKEET_PREVIEW_WINDOW: Duration = Duration::from_secs(20);
 
-        let mut skip_next_snapshot = false;
+        // Pace by how long a decode actually takes on this machine (like the
+        // Whisper preview) instead of a fixed cadence: a warm GPU refreshes
+        // several times a second, while a CPU-fallback decode backs off rather
+        // than piling up. This replaces the old fixed 600 ms tick and the
+        // skip-after-a-slow-snapshot flag — adaptive backoff subsumes the skip.
+        let mut interval = Duration::from_millis(600);
+        let mut stability = PreviewStability::default();
         loop {
-            tokio::time::sleep(PREVIEW_INTERVAL).await;
+            tokio::time::sleep(interval).await;
             let capture_state = app.state::<NativeCaptureState>();
             if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
                 return;
-            }
-            if skip_next_snapshot {
-                skip_next_snapshot = false;
-                debug_log::append("Live Parakeet preview skipped after a slow snapshot");
-                continue;
             }
             let captured = capture_state.capture.lock().ok().and_then(|capture| {
                 capture
@@ -8590,7 +8594,9 @@ fn spawn_live_parakeet_preview(
             .and_then(|result| result);
             finish_preview(&capture_state, preview_generation);
             let elapsed = started.elapsed();
-            skip_next_snapshot = elapsed > PREVIEW_INTERVAL;
+            interval = elapsed
+                .mul_f32(1.5)
+                .clamp(Duration::from_millis(350), Duration::from_millis(1_500));
             let capture_state = app.state::<NativeCaptureState>();
             if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
                 return;
@@ -8599,18 +8605,28 @@ fn spawn_live_parakeet_preview(
                 Ok(stored) if stored.generation == preview_generation => stored,
                 _ => return,
             };
+            let audio_ms =
+                (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64;
             match result {
                 Ok(text) if !text.trim().is_empty() => {
-                    let text = parakeet_preview_cleanup(&text, &settings, &dictionary);
-                    if text.is_empty() {
+                    let cleaned = parakeet_preview_cleanup(&text, &settings, &dictionary);
+                    if cleaned.is_empty() {
                         continue;
                     }
-                    let text = fluidvoice_preview_reconcile(&stored.previous_full_text, &text);
-                    stored.previous_full_text = text.clone();
+                    // Confirm across snapshots before showing, so a word already
+                    // on the overlay is never silently rewritten when the 20 s
+                    // window slides, the normalization gain shifts, or the int8
+                    // decoder flips a token. Complements the 0.75 s trailing
+                    // guard already applied inside `transcribe_preview`.
+                    let Some(text) = stability.observe(&cleaned) else {
+                        debug_log::append(&format!(
+                            "Live Parakeet preview is waiting for confirmation (audio_ms: {audio_ms})"
+                        ));
+                        continue;
+                    };
+                    stored.last_preview_text = text.clone();
                     debug_log::append(&format!(
-                        "Live Parakeet preview emitted (audio_ms: {}, decode_ms: {})",
-                        (sample_count as u64).saturating_mul(1_000)
-                            / audio::WHISPER_SAMPLE_RATE as u64,
+                        "Live Parakeet preview emitted (audio_ms: {audio_ms}, decode_ms: {})",
                         elapsed.as_millis()
                     ));
                     emit_overlay(
@@ -8620,12 +8636,10 @@ fn spawn_live_parakeet_preview(
                     );
                 }
                 Ok(_) => debug_log::append(&format!(
-                    "Live Parakeet preview was empty (audio_ms: {})",
-                    (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64
+                    "Live Parakeet preview was empty (audio_ms: {audio_ms})"
                 )),
                 Err(error) => debug_log::append(&format!(
-                    "Live Parakeet preview skipped (audio_ms: {}): {error}",
-                    (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64
+                    "Live Parakeet preview skipped (audio_ms: {audio_ms}): {error}"
                 )),
             }
         }
@@ -8800,30 +8814,6 @@ fn parakeet_preview_cleanup(
         dictionary,
         DictationCleanupStyle::FluidVoiceParakeet,
     )
-}
-
-/// Direct Rust equivalent of FluidVoice's `smartDiffUpdate`. Its source
-/// calculates a common prefix to avoid a visibly disruptive replacement; the
-/// returned hypothesis remains the newest complete snapshot, which is why the
-/// overlay can correct itself as the capture grows.
-fn fluidvoice_preview_reconcile(previous: &str, current: &str) -> String {
-    let previous = previous.trim();
-    let current = current.trim();
-    if previous.is_empty() || current.is_empty() {
-        return current.to_owned();
-    }
-    let previous_words = previous.split_whitespace().collect::<Vec<_>>();
-    let current_words = current.split_whitespace().collect::<Vec<_>>();
-    let shared_prefix = previous_words
-        .iter()
-        .zip(&current_words)
-        .take_while(|(previous, current)| preview_words_match(previous, current))
-        .count();
-    if shared_prefix > previous_words.len() / 2 {
-        current_words.join(" ")
-    } else {
-        current.to_owned()
-    }
 }
 
 fn spawn_live_cloud_preview(
@@ -9227,7 +9217,28 @@ async fn stop_native_dictation(
     let is_isolated_test = is_isolated_dictation_test(is_prompt_test, is_engine_test);
     let _overlay_cleanup = OverlayHideOnDrop(app.clone());
     if settings.enable_streaming_preview {
-        emit_overlay(&app, "processing", "Transcribing…");
+        // Keep the last preview text on screen through the final decode instead
+        // of blanking to a status string the whole time the offline pass holds
+        // `INFERENCE_LOCK`; "complete" replaces it when the final lands. Only
+        // Parakeet records its last preview here, so other engines fall back to
+        // the status text. The empty-string fallback is required — an empty
+        // overlay renders as "Listening…".
+        let held = if settings.selected_voice_engine.is_parakeet() {
+            capture_state
+                .parakeet_live
+                .lock()
+                .ok()
+                .map(|live| live.last_preview_text.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let handoff = if held.trim().is_empty() {
+            "Transcribing…".to_string()
+        } else {
+            tail_characters(&held, settings.transcription_preview_char_limit)
+        };
+        emit_overlay(&app, "processing", handoff);
     }
     let should_save_audio_history = !is_isolated_test
         && settings.save_transcription_history
@@ -12861,7 +12872,7 @@ mod tests {
 
     #[test]
     fn live_preview_keeps_a_provisional_tail_while_committing_repeated_words() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(preview.observe("hello world"), Some("hello world".into()));
         assert_eq!(preview.observe("hello word"), Some("hello word".into()));
         assert_eq!(
@@ -12876,7 +12887,7 @@ mod tests {
 
     #[test]
     fn live_preview_keeps_confirmed_text_when_the_audio_window_moves() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(
             preview.observe("one two three"),
             Some("one two three".into())
@@ -12896,8 +12907,31 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_appends_a_repeated_phrase_instead_of_snapping_to_the_earlier_one() {
+        // The Parakeet preview re-decodes a rolling 20 s window, so a phrase the
+        // speaker repeats ("next slide") can appear twice in the assembled
+        // timeline. Max-overlap alignment must extend the latest occurrence, not
+        // snap back to the earlier one and retract everything spoken between.
+        let mut preview = PreviewStability::default();
+        assert_eq!(
+            preview.observe("next slide please"),
+            Some("next slide please".into())
+        );
+        assert_eq!(
+            preview.observe("next slide please and now the next"),
+            Some("next slide please and now the next".into())
+        );
+        // The window has slid forward: this snapshot starts mid-timeline and
+        // ends on the repeated "slide". It appends, keeping the prefix intact.
+        assert_eq!(
+            preview.observe("now the next slide"),
+            Some("next slide please and now the next slide".into())
+        );
+    }
+
+    #[test]
     fn live_preview_never_rewrites_a_confirmed_word() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(
             preview.observe("hello world again"),
             Some("hello world again".into())
@@ -12920,7 +12954,7 @@ mod tests {
 
     #[test]
     fn live_preview_stays_visible_when_early_snapshots_do_not_align() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(preview.observe("first guess"), Some("first guess".into()));
         assert_eq!(preview.observe("second guess"), Some("second guess".into()));
         assert_eq!(preview.observe("third guess"), Some("third guess".into()));
@@ -12928,7 +12962,7 @@ mod tests {
 
     #[test]
     fn live_preview_ignores_punctuation_when_matching_snapshots() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(
             preview.observe("one, two, three"),
             Some("one, two, three".into())
@@ -12941,7 +12975,7 @@ mod tests {
 
     #[test]
     fn live_preview_discards_an_unconfirmed_tail_after_silence() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         assert_eq!(
             preview.observe("one two three"),
             Some("one two three".into())
@@ -12955,7 +12989,7 @@ mod tests {
 
     #[test]
     fn pause_heavy_preview_fixture_updates_after_each_spoken_section() {
-        let mut preview = WhisperPreviewStability::default();
+        let mut preview = PreviewStability::default();
         let mut updates = Vec::new();
 
         updates.push(
@@ -12985,24 +13019,6 @@ mod tests {
         assert_eq!(updates[2], "one two three test again");
         assert_eq!(updates[3], "one two three");
         assert_eq!(updates[4], "one two three test again final words");
-    }
-
-    #[test]
-    fn parakeet_preview_matches_fluidvoice_full_snapshot_reconciliation() {
-        assert_eq!(
-            fluidvoice_preview_reconcile("", "one two three"),
-            "one two three"
-        );
-        assert_eq!(
-            fluidvoice_preview_reconcile("one two three", "one two three test"),
-            "one two three test"
-        );
-        // A significant correction replaces the preview with FluidVoice's
-        // newest full hypothesis instead of retaining a VAD-committed prefix.
-        assert_eq!(
-            fluidvoice_preview_reconcile("one two three test", "one two tree test again"),
-            "one two tree test again"
-        );
     }
 
     #[test]

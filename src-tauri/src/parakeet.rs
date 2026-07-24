@@ -67,19 +67,61 @@ fn stable_preview_text(
 /// 0.05 gave "good afternoon" -> "good left to know", fixed once lifted). Peak-
 /// normalize toward a healthy level before decoding, with a gain cap so faint
 /// background is never blown up and near-silence is left untouched.
+///
+/// The gain is derived from a high-percentile magnitude, not the absolute peak.
+/// The live preview re-decodes a rolling 20 s window every tick; with an
+/// absolute-max gain a single loud transient (a cough or a click) sliding into
+/// or out of the window swings the gain, re-scales the trailing speech, and the
+/// amplitude-sensitive int8 model re-decodes already-shown words differently —
+/// visible flicker on text the trailing guard and the stability pass otherwise
+/// protect. A 99th-percentile level barely moves as an outlier enters or leaves,
+/// removing that flicker at its source. On steady speech the percentile equals
+/// the max, so this matches the previous behaviour; the loud transient itself is
+/// clipped rather than the speech left un-lifted, which is the right trade for
+/// dictation (the outlier is not the speech).
 #[cfg(any(feature = "parakeet", test))]
 fn normalize_for_decode(samples: &[f32]) -> std::borrow::Cow<'_, [f32]> {
     const TARGET_PEAK: f32 = 0.9;
     const MAX_GAIN: f32 = 8.0;
     const SILENCE_FLOOR: f32 = 1e-3;
-    let peak = samples
+    let true_peak = samples
         .iter()
         .fold(0.0f32, |maximum, &s| maximum.max(s.abs()));
-    if peak < SILENCE_FLOOR || peak >= TARGET_PEAK {
+    if true_peak < SILENCE_FLOOR {
         return std::borrow::Cow::Borrowed(samples);
     }
-    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    let robust_peak = robust_peak_magnitude(samples, true_peak);
+    if robust_peak >= TARGET_PEAK {
+        return std::borrow::Cow::Borrowed(samples);
+    }
+    let gain = (TARGET_PEAK / robust_peak).min(MAX_GAIN);
     std::borrow::Cow::Owned(samples.iter().map(|&s| s * gain).collect())
+}
+
+/// The 99th-percentile absolute sample magnitude, via a cheap O(n) histogram
+/// bounded by the (already-computed, strictly positive) true peak. Stable
+/// against a handful of loud outliers that a plain abs-max would track.
+#[cfg(any(feature = "parakeet", test))]
+fn robust_peak_magnitude(samples: &[f32], true_peak: f32) -> f32 {
+    const BUCKETS: usize = 1024;
+    let scale = BUCKETS as f32 / true_peak;
+    let mut histogram = [0usize; BUCKETS];
+    for &sample in samples {
+        let bucket = ((sample.abs() * scale) as usize).min(BUCKETS - 1);
+        histogram[bucket] += 1;
+    }
+    // Walk down from the loudest bucket until the top 1% of samples has been
+    // passed; the bucket we stop in is the 99th-percentile level. Its upper
+    // edge is returned so the top populated bucket reproduces the true peak.
+    let top_count = ((samples.len() as f32) * 0.01).ceil().max(1.0) as usize;
+    let mut seen = 0usize;
+    for bucket in (0..BUCKETS).rev() {
+        seen += histogram[bucket];
+        if seen >= top_count {
+            return ((bucket + 1) as f32 / BUCKETS as f32) * true_peak;
+        }
+    }
+    true_peak
 }
 
 pub fn is_compiled() -> bool {
@@ -276,7 +318,36 @@ mod implementation {
             vocabulary_boosting,
             recognizer: Arc::clone(&recognizer),
         });
+        warmup(&recognizer);
         Ok(recognizer)
+    }
+
+    /// Runs one throwaway decode so the ONNX Runtime CUDA execution provider
+    /// pays its cold-start cost — context creation, kernel/PTX JIT, cuDNN /
+    /// cuBLASLt init, arena reservation — here, when the recognizer is first
+    /// built (at `preload` off the hot path), rather than on the first
+    /// user-visible preview or final decode. Without it the first decode of a
+    /// session eats the whole cold start; worse, an utterance under the preview
+    /// minimum never previews, so its final is the first-ever inference.
+    ///
+    /// Best-effort: any failure is logged and ignored so it can never block
+    /// loading the model. Uses ~1 s of low-amplitude tone (above `SILENCE_FLOOR`
+    /// so it survives `normalize_for_decode` and actually exercises the joiner
+    /// and decoder kernels, not just the encoder). This warms the shape-
+    /// independent costs; ORT still re-runs the cuDNN algo search for the larger
+    /// real window/final shapes, which the crate config exposes no knob to skip.
+    fn warmup(recognizer: &OfflineRecognizer) {
+        let Ok(_inference) = INFERENCE_LOCK.lock() else {
+            return;
+        };
+        let samples: Vec<f32> = (0..16_000)
+            .map(|index| if index % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16_000, &super::normalize_for_decode(&samples));
+        recognizer.decode(&stream);
+        let _ = stream.get_result();
+        debug_log::append("Parakeet recognizer warmed up");
     }
 
     pub fn preload(model_directory: &Path) -> Result<(), String> {
@@ -487,6 +558,34 @@ mod tests {
             normalize_for_decode(&silence),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn normalize_gain_ignores_a_lone_loud_transient() {
+        // Two otherwise-identical 20 s windows of quiet speech; the second also
+        // contains a brief loud transient (a cough sliding into the rolling
+        // preview window). An abs-max gain would swing between them and re-scale
+        // the shown speech; the percentile level keeps the speech gain steady.
+        let speech = vec![0.15f32; 320_000];
+        let mut with_transient = speech.clone();
+        for sample in with_transient.iter_mut().take(100) {
+            *sample = 0.95;
+        }
+
+        let lifted_speech = normalize_for_decode(&speech);
+        let lifted_transient = normalize_for_decode(&with_transient);
+        // The transient must not trip the "already healthy" pass-through: the
+        // quiet speech still has to be lifted (owned, not borrowed).
+        assert!(matches!(lifted_transient, std::borrow::Cow::Owned(_)));
+
+        // A speech sample well past the transient is scaled almost identically
+        // in both windows (histogram quantization aside), so no visible flicker.
+        let quiet_speech = lifted_speech[200_000];
+        let quiet_with_transient = lifted_transient[200_000];
+        assert!(
+            (quiet_speech - quiet_with_transient).abs() < 0.01,
+            "speech scaled to {quiet_speech} vs {quiet_with_transient} — gain swung with the transient"
+        );
     }
 
     #[test]
