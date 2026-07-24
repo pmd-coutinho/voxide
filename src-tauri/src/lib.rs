@@ -8543,6 +8543,20 @@ fn spawn_live_whisper_preview(
     });
 }
 
+/// Whether the last `window` of 16 kHz mono samples sits below `rms_floor` — a
+/// coarse trailing-silence signal for preview endpointing (cheap RMS, not VAD).
+/// Returns false when there is not yet a full window to judge.
+fn trailing_window_is_silent(samples: &[f32], window: Duration, rms_floor: f32) -> bool {
+    let window_samples = (window.as_secs_f32() * audio::WHISPER_SAMPLE_RATE as f32) as usize;
+    if window_samples == 0 || samples.len() < window_samples {
+        return false;
+    }
+    let tail = &samples[samples.len() - window_samples..];
+    let mean_square =
+        tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / tail.len() as f64;
+    (mean_square.sqrt() as f32) < rms_floor
+}
+
 /// Mirrors FluidVoice's Parakeet TDT v2 preview cadence. TDT is an offline
 /// model, so each snapshot is a fresh decode—not VAD-sliced audio and not a
 /// stateful streaming decoder. The decode is bounded to a trailing window
@@ -8578,6 +8592,16 @@ fn spawn_live_parakeet_preview(
         // skip-after-a-slow-snapshot flag — adaptive backoff subsumes the skip.
         let mut interval = Duration::from_millis(600);
         let mut stability = PreviewStability::default();
+        // Trailing-silence endpointing (Tier 1: cheap RMS, not VAD). Once the
+        // speaker pauses past the trailing guard, stop re-decoding identical
+        // text — freeing the GPU and `INFERENCE_LOCK` during the pause — and
+        // reveal the last word a tick sooner by dropping the guard while the
+        // tail is silent. The RMS floor sits above room noise but below speech.
+        const TRAILING_SILENCE_WINDOW: Duration = Duration::from_millis(900);
+        const TRAILING_SILENCE_RMS: f32 = 0.008;
+        let trailing_guard = Duration::from_secs_f32(parakeet::PREVIEW_TRAILING_GUARD_SECONDS);
+        let mut emitted_nonempty = false;
+        let mut silent_since: Option<Instant> = None;
         loop {
             tokio::time::sleep(interval).await;
             let capture_state = app.state::<NativeCaptureState>();
@@ -8610,6 +8634,20 @@ fn spawn_live_parakeet_preview(
             if samples.len() < MINIMUM_PREVIEW_SAMPLES {
                 continue;
             }
+            let trailing_silent =
+                trailing_window_is_silent(&samples, TRAILING_SILENCE_WINDOW, TRAILING_SILENCE_RMS);
+            if trailing_silent {
+                let silent_for = silent_since.get_or_insert_with(Instant::now).elapsed();
+                // Skip only once the pause is settled (past the guard plus one
+                // interval) AND a preview is already on screen, so the first
+                // silent ticks still reveal the final word before we idle.
+                if emitted_nonempty && silent_for > trailing_guard + interval {
+                    debug_log::append("Live Parakeet preview idle on trailing silence");
+                    continue;
+                }
+            } else {
+                silent_since = None;
+            }
             if !begin_preview(&capture_state, preview_generation) {
                 continue;
             }
@@ -8617,7 +8655,7 @@ fn spawn_live_parakeet_preview(
             let started = Instant::now();
             let model_path = model_path.clone();
             let result = tauri::async_runtime::spawn_blocking(move || {
-                parakeet::transcribe_preview_samples(&samples, &model_path)
+                parakeet::transcribe_preview_samples(&samples, &model_path, trailing_silent)
             })
             .await
             .map_err(|error| format!("preview task failed: {error}"))
@@ -8655,6 +8693,7 @@ fn spawn_live_parakeet_preview(
                         continue;
                     };
                     stored.last_preview_text = text.clone();
+                    emitted_nonempty = true;
                     debug_log::append(&format!(
                         "Live Parakeet preview emitted (audio_ms: {audio_ms}, decode_ms: {})",
                         elapsed.as_millis()
@@ -12968,6 +13007,23 @@ mod tests {
             preview.observe("now the next slide"),
             Some("next slide please and now the next slide".into())
         );
+    }
+
+    #[test]
+    fn trailing_silence_is_detected_only_below_the_rms_floor() {
+        let rate = crate::audio::WHISPER_SAMPLE_RATE as usize;
+        let window = Duration::from_millis(900);
+        let floor = 0.01;
+        // A speech-level tail is not silence.
+        let loud = vec![0.2f32; rate];
+        assert!(!trailing_window_is_silent(&loud, window, floor));
+        // A room-noise tail below the floor is silence, even after loud speech.
+        let mut mixed = vec![0.2f32; rate];
+        mixed.extend(std::iter::repeat(0.001f32).take(rate));
+        assert!(trailing_window_is_silent(&mixed, window, floor));
+        // Too little audio to fill the window is never an endpoint.
+        let short = vec![0.0f32; rate / 4];
+        assert!(!trailing_window_is_silent(&short, window, floor));
     }
 
     #[test]

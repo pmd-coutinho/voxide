@@ -85,7 +85,8 @@ const REQUIRED_FILES: [&str; 7] = [
 /// decode are tentative: the model has not yet seen the following audio that
 /// can disambiguate them. Keep that short tail out of the display only. The
 /// final transcription always decodes and returns the complete recording.
-#[cfg(feature = "parakeet")]
+/// Not feature-gated: the live preview loop also uses it as the trailing-silence
+/// endpointing threshold.
 pub const PREVIEW_TRAILING_GUARD_SECONDS: f32 = 0.75;
 
 /// Builds a display-safe prefix from Sherpa's per-token timing result.
@@ -438,12 +439,24 @@ mod implementation {
     /// Decodes a full live snapshot, but returns only tokens that end before
     /// the unstable tail. This is deliberately display-only: the final pass
     /// below still receives every captured sample and every decoded token.
-    pub fn transcribe_preview(samples: &[f32], model_directory: &Path) -> Result<String, String> {
+    pub fn transcribe_preview(
+        samples: &[f32],
+        model_directory: &Path,
+        reveal_full_tail: bool,
+    ) -> Result<String, String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
         let result = decode(samples, model_directory, None)?;
-        let cutoff_seconds = samples.len() as f32 / 16_000.0 - PREVIEW_TRAILING_GUARD_SECONDS;
+        // Normally hide the still-tentative trailing tokens; when the caller has
+        // detected trailing silence there is no unstable tail to hide, so reveal
+        // the full hypothesis one tick sooner.
+        let trailing_guard = if reveal_full_tail {
+            0.0
+        } else {
+            PREVIEW_TRAILING_GUARD_SECONDS
+        };
+        let cutoff_seconds = samples.len() as f32 / 16_000.0 - trailing_guard;
         Ok(stable_preview_text(
             &result.tokens,
             result.timestamps.as_deref(),
@@ -567,7 +580,7 @@ pub fn transcribe_samples(_: &[f32], _: &Path) -> Result<String, String> {
 }
 
 #[cfg(not(feature = "parakeet"))]
-pub fn transcribe_preview_samples(_: &[f32], _: &Path) -> Result<String, String> {
+pub fn transcribe_preview_samples(_: &[f32], _: &Path, _: bool) -> Result<String, String> {
     Err("Parakeet is included only in the CUDA build".into())
 }
 
@@ -691,7 +704,7 @@ mod tests {
         println!("Parakeet reference transcript: {text}");
         assert!(!text.trim().is_empty());
 
-        let preview = transcribe_preview_samples(&samples, &directory)
+        let preview = transcribe_preview_samples(&samples, &directory, false)
             .expect("decode a timestamp-guarded Parakeet preview with CUDA");
         println!("Parakeet timestamp-guarded preview: {preview}");
         assert!(!preview.trim().is_empty());
