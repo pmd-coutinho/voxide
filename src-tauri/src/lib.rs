@@ -7967,6 +7967,116 @@ fn install_parakeet_archives(
     install_result
 }
 
+/// Downloads `url` into `temporary`, resuming from any bytes already on disk via
+/// an HTTP Range request and retrying transient stalls or drops. A per-read
+/// stall timeout turns a dead connection into an error instead of an indefinite
+/// hang (the failure mode that stranded a 1 GB+ model download). `expected_bytes`
+/// is the pinned full size; progress is reported as `prior_bytes + this archive`
+/// against `combined_total`, so one progress bar spans a multi-archive download.
+/// The partial file is intentionally left in place on failure so a later attempt
+/// resumes it instead of restarting from zero.
+async fn download_archive_resumable(
+    app: &AppHandle,
+    progress_id: &str,
+    url: &str,
+    temporary: &Path,
+    expected_bytes: u64,
+    prior_bytes: u64,
+    combined_total: u64,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const MAX_ATTEMPTS: usize = 5;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("Could not create the download client: {error}"))?;
+    let emit = |downloaded: u64| {
+        let _ = app.emit(
+            "model-download-progress",
+            ModelDownloadProgress {
+                id: progress_id.into(),
+                downloaded_bytes: prior_bytes + downloaded,
+                total_bytes: Some(combined_total),
+            },
+        );
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut have = tokio::fs::metadata(temporary)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if have > expected_bytes {
+            let _ = tokio::fs::remove_file(temporary).await;
+            have = 0;
+        }
+        if have == expected_bytes {
+            emit(have);
+            return Ok(());
+        }
+        let mut request = client.get(url);
+        if have > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let attempt_result = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|error| format!("Could not download the model: {error}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("Could not download the model: HTTP {status}"));
+            }
+            if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+                return Err("Could not download the model: the server returned HTML or XML instead of model data.".into());
+            }
+            // If the server honoured the Range we append; if it ignored it (200),
+            // it sends the whole file, so start the temp fresh.
+            let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+            let mut file = if resuming {
+                tokio::fs::OpenOptions::new().append(true).open(temporary).await
+            } else {
+                tokio::fs::File::create(temporary).await
+            }
+            .map_err(|error| format!("Could not open the model download: {error}"))?;
+            let mut downloaded = if resuming { have } else { 0 };
+            let mut stream = response.bytes_stream();
+            loop {
+                let next = tokio::time::timeout(STALL_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| "the connection stalled".to_string())?;
+                let Some(chunk) = next else { break };
+                let chunk =
+                    chunk.map_err(|error| format!("the transfer was interrupted: {error}"))?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| format!("Could not save the model download: {error}"))?;
+                downloaded += chunk.len() as u64;
+                emit(downloaded);
+            }
+            file.flush()
+                .await
+                .map_err(|error| format!("Could not finalize the model download: {error}"))?;
+            Ok::<u64, String>(downloaded)
+        }
+        .await;
+        match attempt_result {
+            Ok(total) if total >= expected_bytes => return Ok(()),
+            Ok(_) if attempt >= MAX_ATTEMPTS => {
+                return Err(
+                    "Could not download the model: the transfer ended early after several attempts"
+                        .into(),
+                );
+            }
+            Err(error) if attempt >= MAX_ATTEMPTS => return Err(error),
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+    }
+}
+
 #[tauri::command]
 async fn download_parakeet_model(
     app: AppHandle,
@@ -7979,74 +8089,37 @@ async fn download_parakeet_model(
     }
     let directory = state.models_directory()?;
     let combined_total = parakeet::MODEL_ARCHIVE_BYTES;
-    // (archive, downloaded temp path) pairs, kept for install and for cleanup.
+    // (archive, downloaded temp path) pairs, kept for install.
     let mut downloaded: Vec<(&'static parakeet::ModelArchive, PathBuf)> = Vec::new();
-    let download_result = async {
-        // Progress is reported cumulatively across both archives so the single
-        // progress bar advances smoothly from 0 to the combined total.
-        let mut completed_bytes = 0_u64;
-        for archive in parakeet::MODEL_ARCHIVES.iter() {
-            let temporary = directory.join(format!(".{}.tar.bz2.download", archive.root));
-            let response = reqwest::get(archive.url)
-                .await
-                .map_err(|error| format!("Could not download the Parakeet model: {error}"))?;
-            if !response.status().is_success() {
-                return Err(format!(
-                    "Could not download the Parakeet model: HTTP {}",
-                    response.status()
-                ));
-            }
-            if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
-                return Err("Could not download the Parakeet model: the server returned HTML or XML instead of model data.".into());
-            }
-            let reported_bytes = response.content_length();
-            let mut archive_bytes = 0_u64;
-            {
-                let mut stream = response.bytes_stream();
-                let mut output = tokio::fs::File::create(&temporary)
-                    .await
-                    .map_err(|error| format!("Could not create the Parakeet download: {error}"))?;
-                use tokio::io::AsyncWriteExt;
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|error| {
-                        format!("The Parakeet download was interrupted: {error}")
-                    })?;
-                    output
-                        .write_all(&chunk)
-                        .await
-                        .map_err(|error| format!("Could not save the Parakeet download: {error}"))?;
-                    archive_bytes += chunk.len() as u64;
-                    let _ = app.emit(
-                        "model-download-progress",
-                        ModelDownloadProgress {
-                            id: parakeet::MODEL_ID.into(),
-                            downloaded_bytes: completed_bytes + archive_bytes,
-                            total_bytes: Some(combined_total),
-                        },
-                    );
-                }
-                output
-                    .flush()
-                    .await
-                    .map_err(|error| format!("Could not finalize the Parakeet download: {error}"))?;
-            }
-            let validate_path = temporary.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                validate_parakeet_archive(&validate_path, reported_bytes, archive_bytes, archive)
-            })
-            .await
-            .map_err(|error| format!("Parakeet validation task failed: {error}"))??;
-            completed_bytes += archive_bytes;
-            downloaded.push((archive, temporary));
+    // Progress is reported cumulatively across both archives so the single
+    // progress bar advances from 0 to the combined total.
+    let mut completed_bytes = 0_u64;
+    for archive in parakeet::MODEL_ARCHIVES.iter() {
+        let temporary = directory.join(format!(".{}.tar.bz2.download", archive.root));
+        download_archive_resumable(
+            &app,
+            parakeet::MODEL_ID,
+            archive.url,
+            &temporary,
+            archive.bytes,
+            completed_bytes,
+            combined_total,
+        )
+        .await
+        .map_err(|error| format!("Could not download the Parakeet model: {error}"))?;
+        let validate_path = temporary.clone();
+        let validation = tauri::async_runtime::spawn_blocking(move || {
+            validate_parakeet_archive(&validate_path, Some(archive.bytes), archive.bytes, archive)
+        })
+        .await
+        .map_err(|error| format!("Parakeet validation task failed: {error}"))?;
+        if let Err(error) = validation {
+            // A complete-but-corrupt temp must be discarded so a retry re-fetches.
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
         }
-        Ok::<(), String>(())
-    }
-    .await;
-    if let Err(error) = download_result {
-        for (_, temporary) in &downloaded {
-            let _ = tokio::fs::remove_file(temporary).await;
-        }
-        return Err(error);
+        completed_bytes += archive.bytes;
+        downloaded.push((archive, temporary));
     }
     let install_directory = directory.clone();
     let install_archives = downloaded.clone();
@@ -8195,63 +8268,29 @@ async fn download_parakeet_stream_model(
     }
     let directory = state.models_directory()?;
     let temporary = directory.join(format!(".{}.tar.bz2.download", parakeet_stream::MODEL_ID));
-    let response = reqwest::get(parakeet_stream::MODEL_ARCHIVE_URL)
-        .await
-        .map_err(|error| format!("Could not download the streaming preview model: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Could not download the streaming preview model: HTTP {}",
-            response.status()
-        ));
-    }
-    if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
-        return Err("Could not download the streaming preview model: the server returned HTML or XML instead of model data.".into());
-    }
-    let reported_bytes = response.content_length();
-    let download_result = async {
-        let mut downloaded_bytes = 0_u64;
-        let mut stream = response.bytes_stream();
-        let mut output = tokio::fs::File::create(&temporary)
-            .await
-            .map_err(|error| format!("Could not create the streaming preview download: {error}"))?;
-        use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                format!("The streaming preview download was interrupted: {error}")
-            })?;
-            output.write_all(&chunk).await.map_err(|error| {
-                format!("Could not save the streaming preview download: {error}")
-            })?;
-            downloaded_bytes += chunk.len() as u64;
-            let _ = app.emit(
-                "model-download-progress",
-                ModelDownloadProgress {
-                    id: parakeet_stream::MODEL_ID.into(),
-                    downloaded_bytes,
-                    total_bytes: Some(parakeet_stream::MODEL_ARCHIVE_BYTES),
-                },
-            );
-        }
-        output.flush().await.map_err(|error| {
-            format!("Could not finalize the streaming preview download: {error}")
-        })?;
-        Ok::<u64, String>(downloaded_bytes)
-    }
-    .await;
-    let downloaded_bytes = match download_result {
-        Ok(downloaded_bytes) => downloaded_bytes,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(error);
-        }
-    };
+    download_archive_resumable(
+        &app,
+        parakeet_stream::MODEL_ID,
+        parakeet_stream::MODEL_ARCHIVE_URL,
+        &temporary,
+        parakeet_stream::MODEL_ARCHIVE_BYTES,
+        0,
+        parakeet_stream::MODEL_ARCHIVE_BYTES,
+    )
+    .await
+    .map_err(|error| format!("Could not download the streaming preview model: {error}"))?;
     let validate_path = temporary.clone();
     let validation = tauri::async_runtime::spawn_blocking(move || {
-        validate_parakeet_stream_archive(&validate_path, reported_bytes, downloaded_bytes)
+        validate_parakeet_stream_archive(
+            &validate_path,
+            Some(parakeet_stream::MODEL_ARCHIVE_BYTES),
+            parakeet_stream::MODEL_ARCHIVE_BYTES,
+        )
     })
     .await
     .map_err(|error| format!("Streaming preview validation task failed: {error}"))?;
     if let Err(error) = validation {
+        // A complete-but-corrupt temp must be discarded so a retry re-fetches.
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
