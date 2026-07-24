@@ -800,7 +800,9 @@ function renderVoiceEngine(): void {
   const downloadDetail = downloading
     ? downloadId === "nemotron-cuda-runtime"
       ? "Installing the local CUDA runtime…"
-      : `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
+      : downloading.totalBytes && downloading.downloadedBytes >= downloading.totalBytes
+        ? "Verifying and installing… (large models take a minute to extract; it is not stuck)"
+        : `${formatBytes(downloading.downloadedBytes)}${downloading.totalBytes ? ` / ${formatBytes(downloading.totalBytes)} (${Math.round((downloading.downloadedBytes / downloading.totalBytes) * 100)}%)` : " downloaded"}`
     : "";
   const canDeleteDownloadedModel = (isWhisper && !database.settings.localModelPath || isParakeet || isNemotron) && modelStatus?.installed;
   // The stored value is a stable device `name`; older builds stored the
