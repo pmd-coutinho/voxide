@@ -2129,7 +2129,10 @@ function syncOverlayHeightToContent(): void {
   if (!copy) return;
   const rootPadding = 42;
   const waveformHeight = 48;
-  const desired = Math.ceil((rootPadding + Math.max(waveformHeight, copy.scrollHeight)) * window.devicePixelRatio);
+  // CSS (logical) pixels: the backend sizes the overlay in logical units so it
+  // is the intended size at any monitor scale. Do NOT multiply by
+  // devicePixelRatio — that made the window shrink by the scale factor on HiDPI.
+  const desired = Math.ceil(rootPadding + Math.max(waveformHeight, copy.scrollHeight));
   if (Math.abs(desired - lastOverlayContentHeight) < 6) return;
   lastOverlayContentHeight = desired;
   void invoke("resize_overlay_to_content", { contentHeight: desired }).catch(() => undefined);

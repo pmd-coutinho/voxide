@@ -20,7 +20,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State};
 use tauri_plugin_autostart::ManagerExt as AutoStartManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 #[cfg(not(target_os = "linux"))]
@@ -5963,10 +5963,12 @@ fn apply_overlay_window_layout(app: &AppHandle, settings: &Settings) -> Result<(
     layout_overlay_window(app, settings, None)
 }
 
-/// Sizes and anchors the overlay. `content_height` (physical pixels) grows
+/// Sizes and anchors the overlay. `content_height` (logical/CSS pixels) grows
 /// the window to fit the live transcript, bounded between the configured
 /// overlay size and its growth cap, while keeping the configured top/bottom
-/// anchor fixed.
+/// anchor fixed. The size is set in logical pixels so it is the intended size
+/// at any monitor scale; the anchor math converts to physical for the (physical)
+/// work-area coordinates.
 fn layout_overlay_window(
     app: &AppHandle,
     settings: &Settings,
@@ -5982,7 +5984,7 @@ fn layout_overlay_window(
         })
         .unwrap_or(base_height);
     window
-        .set_size(PhysicalSize::new(width, height))
+        .set_size(LogicalSize::new(width, height))
         .map_err(|error| format!("Could not resize the dictation overlay: {error}"))?;
     let monitor = window
         .current_monitor()
@@ -5992,22 +5994,27 @@ fn layout_overlay_window(
     let Some(monitor) = monitor else {
         return Ok(());
     };
+    // work_area is physical, so convert the logical overlay size to physical for
+    // the centering/anchoring arithmetic.
+    let scale = monitor.scale_factor();
+    let physical_width = (width as f64 * scale).round() as u32;
+    let physical_height = (height as f64 * scale).round() as u32;
     let work_area = monitor.work_area();
-    let horizontal_space = work_area.size.width.saturating_sub(width);
+    let horizontal_space = work_area.size.width.saturating_sub(physical_width);
     let x = work_area.position.x + (horizontal_space / 2) as i32;
-    let offset = (settings.overlay_bottom_offset * monitor.scale_factor()).round() as i32;
+    let offset = (settings.overlay_bottom_offset * scale).round() as i32;
     let minimum_y = work_area.position.y.saturating_add(10);
     let maximum_y = work_area
         .position
         .y
-        .saturating_add(work_area.size.height.saturating_sub(height) as i32)
+        .saturating_add(work_area.size.height.saturating_sub(physical_height) as i32)
         .saturating_sub(40);
     let raw_y = match settings.overlay_position {
         OverlayPosition::Top => work_area.position.y.saturating_add(offset),
         OverlayPosition::Bottom => work_area
             .position
             .y
-            .saturating_add(work_area.size.height.saturating_sub(height) as i32)
+            .saturating_add(work_area.size.height.saturating_sub(physical_height) as i32)
             .saturating_sub(offset),
     };
     let y = raw_y.clamp(minimum_y, maximum_y.max(minimum_y));
