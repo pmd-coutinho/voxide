@@ -264,8 +264,8 @@ mod implementation {
     use crate::debug_log;
 
     use super::{
-        model_is_installed, stable_preview_text, FP16_FILES, INT8_FILES,
-        PREVIEW_TRAILING_GUARD_SECONDS, TOKENS_FILE,
+        model_is_installed, stable_preview_text, INT8_FILES, PREVIEW_TRAILING_GUARD_SECONDS,
+        TOKENS_FILE,
     };
 
     #[derive(Clone)]
@@ -337,16 +337,18 @@ mod implementation {
             return Ok(Arc::clone(&cached.recognizer));
         }
 
-        // Prefer the fp16 export on the CUDA EP (natively fast there, and more
-        // robust on quiet input than int8). sherpa-onnx has no built-in CPU
-        // fallback (unlike whisper.cpp/ggml), so when the CUDA provider fails to
-        // load — e.g. the CUDA 12 / cuDNN 9 runtime is missing — retry the int8
-        // export on CPU with a real thread count (fp16 on the CPU EP is emulated
-        // and slow). Degraded but functional; intact-but-unsupported files still
-        // fail below.
+        // Use the int8 export on both CUDA and CPU. The fp16 export was measured
+        // to load and run on this sherpa-onnx 1.13.4 CUDA EP but decode to an
+        // empty transcript (ORT's CUDA fp16 transducer path yields no tokens
+        // here, and sherpa exposes no fp16 knob to correct it), whereas int8
+        // decodes correctly and fast. sherpa-onnx has no built-in CPU fallback
+        // (unlike whisper.cpp/ggml), so when the CUDA provider fails to load —
+        // e.g. the CUDA 12 / cuDNN 9 runtime is missing — retry on CPU with a
+        // real thread count. Degraded but functional; intact-but-unsupported
+        // files still fail below. (The fp16 files remain installed but unused.)
         let recognizer = match OfflineRecognizer::create(&model_config(
             model_directory,
-            &FP16_FILES,
+            &INT8_FILES,
             "cuda",
             1,
             vocabulary_boosting,
@@ -354,7 +356,7 @@ mod implementation {
             Some(recognizer) => recognizer,
             None => {
                 debug_log::append(
-                    "Parakeet fp16 CUDA recognizer failed to load; retrying the int8 export on CPU (degraded performance)",
+                    "Parakeet CUDA recognizer failed to load; retrying on CPU (degraded performance)",
                 );
                 OfflineRecognizer::create(&model_config(
                     model_directory,
