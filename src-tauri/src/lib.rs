@@ -6449,7 +6449,7 @@ async fn verify_voice_engine_installation(
                     && component_receipt_is_verified(
                         &model,
                         parakeet::MODEL_ID,
-                        parakeet::MODEL_ARCHIVE_SHA256,
+                        parakeet::MODEL_RECEIPT_VERSION,
                     )
             })
             .await
@@ -7737,11 +7737,12 @@ fn validate_parakeet_archive(
     path: &Path,
     expected_bytes: Option<u64>,
     downloaded_bytes: u64,
+    archive: &parakeet::ModelArchive,
 ) -> Result<(), String> {
-    if downloaded_bytes != parakeet::MODEL_ARCHIVE_BYTES {
+    if downloaded_bytes != archive.bytes {
         return Err("The Parakeet download size did not match the pinned release asset".into());
     }
-    if expected_bytes.is_some_and(|expected| expected != parakeet::MODEL_ARCHIVE_BYTES) {
+    if expected_bytes.is_some_and(|expected| expected != archive.bytes) {
         return Err("The Parakeet server reported an unexpected release asset size".into());
     }
     let metadata = fs::metadata(path)
@@ -7756,7 +7757,7 @@ fn validate_parakeet_archive(
     if &prefix != b"BZh" {
         return Err("The Parakeet download is not a bzip2 model archive".into());
     }
-    if sha256_file(path)? != parakeet::MODEL_ARCHIVE_SHA256 {
+    if sha256_file(path)? != archive.sha256 {
         return Err("The Parakeet download checksum did not match the pinned release asset".into());
     }
     Ok(())
@@ -7866,7 +7867,7 @@ pub(crate) fn parakeet_model_is_verified(model_directory: &Path) -> bool {
         && component_receipt_is_recorded(
             model_directory,
             parakeet::MODEL_ID,
-            parakeet::MODEL_ARCHIVE_SHA256,
+            parakeet::MODEL_RECEIPT_VERSION,
             parakeet::required_files(),
         )
 }
@@ -7890,48 +7891,68 @@ fn nemotron_runtime_is_verified(runtime_directory: &Path) -> bool {
         )
 }
 
-fn install_parakeet_archive(
-    archive_path: &Path,
+/// Extracts each pinned precision archive and assembles the files they
+/// contribute into a single model directory (fp16 for CUDA, int8 for the CPU
+/// fallback, shared `tokens.txt`). Both archives are validated by the caller
+/// before this runs.
+fn install_parakeet_archives(
+    archives: &[(&'static parakeet::ModelArchive, PathBuf)],
     models_directory: &Path,
 ) -> Result<PathBuf, String> {
     let staging = models_directory.join(format!(".parakeet-install-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&staging)
         .map_err(|error| format!("Could not prepare the Parakeet installation: {error}"))?;
     let install_result = (|| {
-        let archive = fs::File::open(archive_path)
-            .map_err(|error| format!("Could not open the Parakeet archive: {error}"))?;
-        let decoder = bzip2::read::BzDecoder::new(archive);
-        let mut archive = tar::Archive::new(decoder);
-        for entry in archive
-            .entries()
-            .map_err(|error| format!("Could not read the Parakeet archive: {error}"))?
-        {
-            entry
-                .map_err(|error| format!("Could not read a Parakeet archive entry: {error}"))?
-                .unpack_in(&staging)
-                .map_err(|error| {
-                    format!("Could not extract the Parakeet archive safely: {error}")
+        let merged = staging.join("model");
+        fs::create_dir(&merged)
+            .map_err(|error| format!("Could not prepare the Parakeet installation: {error}"))?;
+        for (archive, archive_path) in archives {
+            let file = fs::File::open(archive_path)
+                .map_err(|error| format!("Could not open the Parakeet archive: {error}"))?;
+            let decoder = bzip2::read::BzDecoder::new(file);
+            let mut tarball = tar::Archive::new(decoder);
+            for entry in tarball
+                .entries()
+                .map_err(|error| format!("Could not read the Parakeet archive: {error}"))?
+            {
+                entry
+                    .map_err(|error| format!("Could not read a Parakeet archive entry: {error}"))?
+                    .unpack_in(&staging)
+                    .map_err(|error| {
+                        format!("Could not extract the Parakeet archive safely: {error}")
+                    })?;
+            }
+            let extracted = staging.join(archive.root);
+            for file in archive.files {
+                fs::copy(extracted.join(file), merged.join(file)).map_err(|error| {
+                    format!("Could not assemble the Parakeet model ({file}): {error}")
                 })?;
+            }
         }
-        let extracted = staging.join(parakeet::archive_root());
-        if !parakeet::model_is_installed(&extracted) {
-            return Err(parakeet::installation_error(&extracted));
+        if !parakeet::model_is_installed(&merged) {
+            return Err(parakeet::installation_error(&merged));
         }
         write_component_receipt(
-            &extracted,
+            &merged,
             &ComponentReceipt {
                 schema: COMPONENT_RECEIPT_SCHEMA,
                 id: parakeet::MODEL_ID.into(),
-                version: parakeet::MODEL_ARCHIVE_SHA256.into(),
-                source: parakeet::MODEL_ARCHIVE_URL.into(),
-                files: component_file_hashes(
-                    &extracted,
-                    parakeet::required_files().iter().copied(),
-                )?,
+                version: parakeet::MODEL_RECEIPT_VERSION.into(),
+                source: parakeet::MODEL_ARCHIVES
+                    .iter()
+                    .map(|archive| archive.url)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                files: component_file_hashes(&merged, parakeet::required_files().iter().copied())?,
             },
         )?;
         let destination = parakeet::model_directory(models_directory);
-        replace_component_directory(&extracted, &destination)?;
+        replace_component_directory(&merged, &destination)?;
+        // Retire the pre-fp16, int8-only install directory if it lingers.
+        let legacy = models_directory.join("parakeet-tdt-0.6b-v2-int8");
+        if legacy != destination {
+            let _ = fs::remove_dir_all(&legacy);
+        }
         Ok(destination)
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -7949,78 +7970,87 @@ async fn download_parakeet_model(
         );
     }
     let directory = state.models_directory()?;
-    let archive_name = format!("{}.tar.bz2", parakeet::MODEL_ID);
-    let temporary = directory.join(format!("{archive_name}.download"));
-    let response = reqwest::get(parakeet::MODEL_ARCHIVE_URL)
-        .await
-        .map_err(|error| format!("Could not download the Parakeet model: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Could not download the Parakeet model: HTTP {}",
-            response.status()
-        ));
-    }
-    if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
-        return Err("Could not download the Parakeet model: the server returned HTML or XML instead of model data.".into());
-    }
-    let total_bytes = response.content_length();
+    let combined_total = parakeet::MODEL_ARCHIVE_BYTES;
+    // (archive, downloaded temp path) pairs, kept for install and for cleanup.
+    let mut downloaded: Vec<(&'static parakeet::ModelArchive, PathBuf)> = Vec::new();
     let download_result = async {
-        let mut downloaded_bytes = 0_u64;
-        let mut stream = response.bytes_stream();
-        let mut output = tokio::fs::File::create(&temporary)
-            .await
-            .map_err(|error| format!("Could not create the Parakeet download: {error}"))?;
-        use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| format!("The Parakeet download was interrupted: {error}"))?;
-            output
-                .write_all(&chunk)
+        // Progress is reported cumulatively across both archives so the single
+        // progress bar advances smoothly from 0 to the combined total.
+        let mut completed_bytes = 0_u64;
+        for archive in parakeet::MODEL_ARCHIVES.iter() {
+            let temporary = directory.join(format!(".{}.tar.bz2.download", archive.root));
+            let response = reqwest::get(archive.url)
                 .await
-                .map_err(|error| format!("Could not save the Parakeet download: {error}"))?;
-            downloaded_bytes += chunk.len() as u64;
-            let _ = app.emit(
-                "model-download-progress",
-                ModelDownloadProgress {
-                    id: parakeet::MODEL_ID.into(),
-                    downloaded_bytes,
-                    total_bytes,
-                },
-            );
-        }
-        output
-            .flush()
+                .map_err(|error| format!("Could not download the Parakeet model: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "Could not download the Parakeet model: HTTP {}",
+                    response.status()
+                ));
+            }
+            if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+                return Err("Could not download the Parakeet model: the server returned HTML or XML instead of model data.".into());
+            }
+            let reported_bytes = response.content_length();
+            let mut archive_bytes = 0_u64;
+            {
+                let mut stream = response.bytes_stream();
+                let mut output = tokio::fs::File::create(&temporary)
+                    .await
+                    .map_err(|error| format!("Could not create the Parakeet download: {error}"))?;
+                use tokio::io::AsyncWriteExt;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|error| {
+                        format!("The Parakeet download was interrupted: {error}")
+                    })?;
+                    output
+                        .write_all(&chunk)
+                        .await
+                        .map_err(|error| format!("Could not save the Parakeet download: {error}"))?;
+                    archive_bytes += chunk.len() as u64;
+                    let _ = app.emit(
+                        "model-download-progress",
+                        ModelDownloadProgress {
+                            id: parakeet::MODEL_ID.into(),
+                            downloaded_bytes: completed_bytes + archive_bytes,
+                            total_bytes: Some(combined_total),
+                        },
+                    );
+                }
+                output
+                    .flush()
+                    .await
+                    .map_err(|error| format!("Could not finalize the Parakeet download: {error}"))?;
+            }
+            let validate_path = temporary.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                validate_parakeet_archive(&validate_path, reported_bytes, archive_bytes, archive)
+            })
             .await
-            .map_err(|error| format!("Could not finalize the Parakeet download: {error}"))?;
-        Ok::<u64, String>(downloaded_bytes)
+            .map_err(|error| format!("Parakeet validation task failed: {error}"))??;
+            completed_bytes += archive_bytes;
+            downloaded.push((archive, temporary));
+        }
+        Ok::<(), String>(())
     }
     .await;
-    let downloaded_bytes = match download_result {
-        Ok(downloaded_bytes) => downloaded_bytes,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(error);
+    if let Err(error) = download_result {
+        for (_, temporary) in &downloaded {
+            let _ = tokio::fs::remove_file(temporary).await;
         }
-    };
-    let archive_to_validate = temporary.clone();
-    let validation = tauri::async_runtime::spawn_blocking(move || {
-        validate_parakeet_archive(&archive_to_validate, total_bytes, downloaded_bytes)
-    })
-    .await
-    .map_err(|error| format!("Parakeet validation task failed: {error}"))?;
-    if let Err(error) = validation {
-        let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
     let install_directory = directory.clone();
-    let install_archive = temporary.clone();
-    let destination = tauri::async_runtime::spawn_blocking(move || {
-        install_parakeet_archive(&install_archive, &install_directory)
+    let install_archives = downloaded.clone();
+    let install = tauri::async_runtime::spawn_blocking(move || {
+        install_parakeet_archives(&install_archives, &install_directory)
     })
     .await
-    .map_err(|error| format!("Parakeet installation task failed: {error}"))?;
-    let _ = tokio::fs::remove_file(&temporary).await;
-    let destination = destination?;
+    .map_err(|error| format!("Parakeet installation task failed: {error}"));
+    for (_, temporary) in &downloaded {
+        let _ = tokio::fs::remove_file(temporary).await;
+    }
+    let destination = install??;
     Ok(VoiceModelStatus {
         id: parakeet::MODEL_ID.into(),
         installed: true,
@@ -12467,12 +12497,23 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_archive_is_pinned_to_a_digest_and_exact_size() {
-        assert_eq!(parakeet::MODEL_ARCHIVE_SHA256.len(), 64);
-        assert!(parakeet::MODEL_ARCHIVE_SHA256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit()));
-        assert!(parakeet::MODEL_ARCHIVE_BYTES > 50 * 1024 * 1024);
+    fn parakeet_archives_are_pinned_to_digests_and_exact_sizes() {
+        assert_eq!(parakeet::MODEL_ARCHIVES.len(), 2);
+        for archive in &parakeet::MODEL_ARCHIVES {
+            assert_eq!(archive.sha256.len(), 64);
+            assert!(archive.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(archive.bytes > 50 * 1024 * 1024);
+            assert!(archive.url.starts_with("https://"));
+            assert!(!archive.files.is_empty());
+        }
+        // The pinned combined size must equal the sum of the archive sizes.
+        assert_eq!(
+            parakeet::MODEL_ARCHIVE_BYTES,
+            parakeet::MODEL_ARCHIVES
+                .iter()
+                .map(|archive| archive.bytes)
+                .sum::<u64>()
+        );
     }
 
     #[test]

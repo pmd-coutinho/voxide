@@ -9,19 +9,76 @@ use std::path::{Path, PathBuf};
 
 use crate::{audio, media};
 
-pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v2-int8";
-pub const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
-/// GitHub release asset digest verified on 2026-07-22. The release tag is a
-/// mutable URL, so installation must authenticate the downloaded archive.
-pub const MODEL_ARCHIVE_SHA256: &str =
-    "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad";
-pub const MODEL_ARCHIVE_BYTES: u64 = 482_468_385;
-const MODEL_ARCHIVE_ROOT: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
-const REQUIRED_FILES: [&str; 4] = [
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "joiner.int8.onnx",
-    "tokens.txt",
+pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v2";
+
+/// One downloadable sherpa-onnx release archive. Parakeet installs two precision
+/// exports into a single model directory: the fp16 export used on CUDA (natively
+/// fast on the ONNX Runtime CUDA EP and more robust on quiet input than int8),
+/// and the int8 export kept for the CPU fallback (fp16 on the ORT CPU EP is
+/// emulated and slow). Each archive is pinned by digest because the release tag
+/// is a mutable URL, so installation must authenticate every downloaded archive.
+pub struct ModelArchive {
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub bytes: u64,
+    /// Top-level directory inside the tarball.
+    pub root: &'static str,
+    /// Files copied out of `root/` into the shared model directory.
+    pub files: &'static [&'static str],
+}
+
+/// Digests verified on 2026-07-24. A `static` (not `const`) so install/download
+/// can hold `&'static ModelArchive` across `spawn_blocking`.
+pub static MODEL_ARCHIVES: [ModelArchive; 2] = [
+    // int8 first: smaller, and it carries the shared tokens.txt.
+    ModelArchive {
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        sha256: "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad",
+        bytes: 482_468_385,
+        root: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+        files: &[
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "joiner.int8.onnx",
+            "tokens.txt",
+        ],
+    },
+    ModelArchive {
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16.tar.bz2",
+        sha256: "37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0",
+        bytes: 1_120_982_957,
+        root: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16",
+        files: &["encoder.fp16.onnx", "decoder.fp16.onnx", "joiner.fp16.onnx"],
+    },
+];
+
+/// Combined download across both archives — the pinned total-size check and the
+/// unit for the download progress bar. Kept a literal sum because a `const`
+/// cannot read the `static` archive table.
+pub const MODEL_ARCHIVE_BYTES: u64 = 482_468_385 + 1_120_982_957;
+
+/// Receipt version, bound to both archive digests so re-pinning either export
+/// invalidates an existing install and forces a fresh, authenticated download.
+pub const MODEL_RECEIPT_VERSION: &str = concat!(
+    "int8:157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad;",
+    "fp16:37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0"
+);
+
+/// The CUDA-preferred fp16 encoder/decoder/joiner.
+const FP16_FILES: [&str; 3] = ["encoder.fp16.onnx", "decoder.fp16.onnx", "joiner.fp16.onnx"];
+/// The CPU-fallback int8 encoder/decoder/joiner.
+const INT8_FILES: [&str; 3] = ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx"];
+const TOKENS_FILE: &str = "tokens.txt";
+
+/// Every file that must be present in an installed model directory.
+const REQUIRED_FILES: [&str; 7] = [
+    FP16_FILES[0],
+    FP16_FILES[1],
+    FP16_FILES[2],
+    INT8_FILES[0],
+    INT8_FILES[1],
+    INT8_FILES[2],
+    TOKENS_FILE,
 ];
 
 /// TDT is an offline recognizer, so the newest tokens in a live full-buffer
@@ -132,10 +189,6 @@ pub fn model_directory(models_directory: &Path) -> PathBuf {
     models_directory.join(MODEL_ID)
 }
 
-pub fn archive_root() -> &'static str {
-    MODEL_ARCHIVE_ROOT
-}
-
 pub fn required_files() -> &'static [&'static str] {
     &REQUIRED_FILES
 }
@@ -210,7 +263,8 @@ mod implementation {
     use crate::debug_log;
 
     use super::{
-        model_is_installed, stable_preview_text, PREVIEW_TRAILING_GUARD_SECONDS, REQUIRED_FILES,
+        model_is_installed, stable_preview_text, FP16_FILES, INT8_FILES,
+        PREVIEW_TRAILING_GUARD_SECONDS, TOKENS_FILE,
     };
 
     #[derive(Clone)]
@@ -225,6 +279,41 @@ mod implementation {
     // time. A single gate also prevents an older preview from delaying the
     // final tail when a dictation stops.
     static INFERENCE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Builds a recognizer config for one precision export. `trio` is the
+    /// encoder/decoder/joiner filenames; `provider` selects the CUDA or CPU
+    /// execution provider. Vocabulary boosting uses Sherpa's modified-beam
+    /// search plus a BPE context graph over the model's SentencePiece
+    /// `tokens.txt` (FluidVoice applies its rescoring only to the final).
+    fn model_config(
+        model_directory: &Path,
+        trio: &[&str; 3],
+        provider: &str,
+        num_threads: i32,
+        vocabulary_boosting: bool,
+    ) -> OfflineRecognizerConfig {
+        let tokens = model_directory.join(TOKENS_FILE).display().to_string();
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.transducer = OfflineTransducerModelConfig {
+            encoder: Some(model_directory.join(trio[0]).display().to_string()),
+            decoder: Some(model_directory.join(trio[1]).display().to_string()),
+            joiner: Some(model_directory.join(trio[2]).display().to_string()),
+        };
+        config.model_config.tokens = Some(tokens.clone());
+        config.model_config.model_type = Some("nemo_transducer".into());
+        config.model_config.provider = Some(provider.into());
+        config.model_config.num_threads = num_threads;
+        if vocabulary_boosting {
+            config.decoding_method = Some("modified_beam_search".into());
+            config.max_active_paths = 4;
+            config.hotwords_score = 1.5;
+            config.model_config.modeling_unit = Some("bpe".into());
+            config.model_config.bpe_vocab = Some(tokens);
+        } else {
+            config.decoding_method = Some("greedy_search".into());
+        }
+        config
+    }
 
     fn recognizer(
         model_directory: &Path,
@@ -247,63 +336,33 @@ mod implementation {
             return Ok(Arc::clone(&cached.recognizer));
         }
 
-        let tokens = model_directory
-            .join(REQUIRED_FILES[3])
-            .display()
-            .to_string();
-        let mut config = OfflineRecognizerConfig::default();
-        config.model_config.transducer = OfflineTransducerModelConfig {
-            encoder: Some(
-                model_directory
-                    .join(REQUIRED_FILES[0])
-                    .display()
-                    .to_string(),
-            ),
-            decoder: Some(
-                model_directory
-                    .join(REQUIRED_FILES[1])
-                    .display()
-                    .to_string(),
-            ),
-            joiner: Some(
-                model_directory
-                    .join(REQUIRED_FILES[2])
-                    .display()
-                    .to_string(),
-            ),
-        };
-        config.model_config.tokens = Some(tokens.clone());
-        config.model_config.model_type = Some("nemo_transducer".into());
-        config.model_config.provider = Some("cuda".into());
-        config.model_config.num_threads = 1;
-        if vocabulary_boosting {
-            // The FluidVoice final manager applies its optional vocabulary
-            // rescoring only after recording stops. Sherpa's equivalent for
-            // this TDT export is modified-beam search plus a BPE context graph.
-            // `tokens.txt` is the model's SentencePiece vocabulary.
-            config.decoding_method = Some("modified_beam_search".into());
-            config.max_active_paths = 4;
-            config.hotwords_score = 1.5;
-            config.model_config.modeling_unit = Some("bpe".into());
-            config.model_config.bpe_vocab = Some(tokens);
-        } else {
-            config.decoding_method = Some("greedy_search".into());
-        }
-        let recognizer = match OfflineRecognizer::create(&config) {
+        // Prefer the fp16 export on the CUDA EP (natively fast there, and more
+        // robust on quiet input than int8). sherpa-onnx has no built-in CPU
+        // fallback (unlike whisper.cpp/ggml), so when the CUDA provider fails to
+        // load — e.g. the CUDA 12 / cuDNN 9 runtime is missing — retry the int8
+        // export on CPU with a real thread count (fp16 on the CPU EP is emulated
+        // and slow). Degraded but functional; intact-but-unsupported files still
+        // fail below.
+        let recognizer = match OfflineRecognizer::create(&model_config(
+            model_directory,
+            &FP16_FILES,
+            "cuda",
+            1,
+            vocabulary_boosting,
+        )) {
             Some(recognizer) => recognizer,
             None => {
-                // sherpa-onnx has no built-in CPU fallback (unlike whisper.cpp/
-                // ggml), so when the CUDA provider fails to load — e.g. the
-                // CUDA 12 / cuDNN 9 runtime is missing — retry once on CPU with
-                // a real thread count (CUDA only needed one). Degraded but
-                // functional; missing model files or an unsupported decoding
-                // method still fail below.
                 debug_log::append(
-                    "Parakeet CUDA recognizer failed to load; retrying on CPU (degraded performance)",
+                    "Parakeet fp16 CUDA recognizer failed to load; retrying the int8 export on CPU (degraded performance)",
                 );
-                config.model_config.provider = Some("cpu".into());
-                config.model_config.num_threads = crate::speech::cpu_decode_threads();
-                OfflineRecognizer::create(&config).ok_or_else(|| {
+                OfflineRecognizer::create(&model_config(
+                    model_directory,
+                    &INT8_FILES,
+                    "cpu",
+                    crate::speech::cpu_decode_threads(),
+                    vocabulary_boosting,
+                ))
+                .ok_or_else(|| {
                     if vocabulary_boosting {
                         "Could not load Parakeet vocabulary boosting on CUDA or CPU. Check that the sherpa-onnx runtime supports Parakeet TDT modified-beam decoding and the model files are intact.".to_string()
                     } else {
