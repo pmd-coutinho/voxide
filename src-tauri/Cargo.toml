@@ -35,12 +35,23 @@ vulkan = ["whisper-rs-sys/vulkan"]
 # native runtime.
 parakeet = ["dep:sherpa-onnx"]
 cuda = ["whisper-rs/cuda", "parakeet"]
+# GTCRN speech enhancement: a ~520 KB ONNX denoiser applied frame by frame ahead
+# of recognition. Opt-in because a denoiser that strips phonemes along with noise
+# makes transcription worse, and that failure is inaudible in the metrics.
+denoise = ["dep:rustfft", "dep:ort", "dep:ndarray"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
 active-win-pos-rs = "0.11.0"
+# All three are built only with the `denoise` feature.
+rustfft = { version = "6", optional = true }
+# `load-dynamic` so onnxruntime is dlopened at runtime rather than linked at
+# build time: the build host then needs no ONNX Runtime, and the library can be
+# the one the Parakeet runtime already ships. Point ORT_DYLIB_PATH at it.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "load-dynamic"] }
+ndarray = { version = "0.16", optional = true }
 chrono = { version = "0.4.42", features = ["serde"] }
 axum = "0.8.9"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control", "image-data"] }

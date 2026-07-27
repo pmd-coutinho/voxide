@@ -36,6 +36,8 @@ mod audio;
 #[cfg(target_os = "linux")]
 mod compositor_bindings;
 mod debug_log;
+#[cfg(feature = "denoise")]
+mod denoise;
 mod formatting;
 #[cfg(target_os = "linux")]
 mod libei_input;

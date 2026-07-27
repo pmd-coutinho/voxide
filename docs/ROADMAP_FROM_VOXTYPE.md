@@ -14,7 +14,7 @@ checking before coding, not after.
 | 4 | Cohere Transcribe on CPU | **5 of 7** — see `COHERE_ENGINE.md` |
 | 5 | Overlay on layer-shell | planned; blocker identified below |
 | 6a | Eager chunked transcription | **declined** — already covered, and its mechanism regresses here |
-| 6b | GTCRN speech enhancement | planned; model located |
+| 6b | GTCRN speech enhancement | **built & verified**, not yet wired |
 | 6c | Bounded GPU memory on idle | **shipped** (different mechanism) |
 | 6d | Packaging: tag-triggered release | **shipped** |
 
@@ -92,14 +92,29 @@ A 48k-parameter, ~520 KB ONNX denoiser in front of the ASR, cleaning noise and
 speaker bleed-through. Useful for plain dictation on a bad microphone, not just
 for meeting capture.
 
-ONNX exports are on the Hub — `bitsydarel/gtcrn-onnx` and the sherpa-onnx
-variants. The STFT front end already exists in `cohere_fbank.rs` and can be
-generalised: GTCRN wants 512-point FFT with a 256 hop and a sqrt-Hann window,
-against Cohere's 512/160 and symmetric Hann.
+`denoise.rs` implements it behind the `denoise` feature. The model is streaming
+with fully static shapes: one STFT frame in (`[1, 257, 1, 2]`, interleaved real
+and imaginary), one enhanced frame out, plus three recurrent caches threaded from
+call to call. Caches start zeroed per utterance so one recording cannot leak into
+the next.
 
-Gate it behind a setting that defaults **off**, and verify on real recordings
-before recommending it — a denoiser that removes phonemes along with noise makes
-transcription worse, and the failure is invisible without listening.
+STFT is 512-point with a 256 hop and a **sqrt-Hann** window used for both analysis
+and synthesis: squared it is a periodic Hann, which sums to exactly 1 at 50%
+overlap, so overlap-add is unity gain with no correction pass.
+
+Verified objectively rather than by ear: a 300 Hz tone under a 4 Hz envelope plus
+deterministic broadband noise goes in at **6.01 dB SNR and comes out at
+10.47 dB — a 4.46 dB gain**. That one number validates the whole chain, because
+the window, hop, scaling, conjugate mirror and cache threading all have to be
+correct for noise to fall instead of the signal garbling.
+
+`ort` uses `load-dynamic`, so onnxruntime is dlopened at runtime instead of linked
+at build time — the build host needs no ONNX Runtime, and `ORT_DYLIB_PATH` can
+point at the copy the Parakeet runtime already ships.
+
+**Still to do:** wire it into the capture path behind a setting that defaults
+off, and validate on real recordings. An SNR gain on synthetic noise is not proof
+it preserves phonemes, and that failure is invisible without listening.
 
 ## 6c. Bounded GPU memory on idle — shipped, not as a subprocess
 
