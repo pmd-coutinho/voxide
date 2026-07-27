@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -130,9 +131,20 @@ jobs:
 
   cuda-linux-nvidia:
     name: CUDA build checks (Linux/NVIDIA)
-    # Self-hosted runners must never execute code supplied by an untrusted
-    # fork. Repository PRs and trusted pushes still receive the GPU gate.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    # Manual only. This needs a self-hosted GPU runner, and there is none
+    # attached — a push-triggered job would just sit in the queue for 24 hours
+    # and then report failure, which is how the CUDA gates went unwatched long
+    # enough for 30 clippy errors to pile up behind them. Run the same checks
+    # locally with `scripts/check-cuda.sh`; re-attach a runner and this job
+    # works as written.
+    #
+    # A self-hosted runner would also execute repository code, unsandboxed, as
+    # the runner's user. If one is attached again it should run as a dedicated
+    # user and be registered `--ephemeral`, and the fork guard below must stay:
+    # without it anyone could fork this public repo and run code on that host.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (github.event.pull_request.head.repo.fork == false || github.event.pull_request == null)
     runs-on: [self-hosted, linux, x64, nvidia-cuda]
     timeout-minutes: 45
     env:

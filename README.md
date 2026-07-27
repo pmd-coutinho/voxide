@@ -175,6 +175,24 @@ Without it the check is skipped entirely and text is typed immediately, exactly 
 
 On PipeWire and PulseAudio desktops the microphone picker lists the sound server's actual sources (your headset, the built-in microphone, …) rather than raw ALSA PCM names, and capture is routed to the selected source. This uses `pactl` when available and falls back to ALSA device enumeration otherwise. Selecting a specific microphone also prevents Bluetooth headphones from being forced into their low-quality headset profile when you dictate.
 
+## Verifying the CUDA build
+
+CI cannot check the CUDA feature: those gates need an NVIDIA GPU, and the
+`cuda-linux-nvidia` job is manual-dispatch only because no self-hosted runner is
+attached. Run the same checks locally instead:
+
+```sh
+./scripts/check-cuda.sh           # fmt, dependency audit, tests, GPU inference
+                                  # fixtures, clippy, release build
+./scripts/check-cuda.sh --quick   # everything except the release build
+```
+
+It uses the toolchain CI pins and exports the environment the build needs,
+including the `--allow-unsupported-compiler` flag nvcc requires when the host GCC
+is newer than it supports. Point `VOXIDE_PARAKEET_MODEL_DIR` at an installed
+Parakeet model to override the default, and `CMAKE_CUDA_ARCHITECTURES` at your
+GPU's compute capability if it is not sm_89.
+
 ## Linux packaging
 
 `npm exec tauri build` produces deb, rpm, and AppImage bundles. The build host additionally needs development packages whose `.pc` files the bundler queries (Fedora names): `libappindicator-gtk3-devel` and, for the AppImage gtk plugin, `librsvg2-devel`. On distributions whose system libraries carry `.relr.dyn` relocation sections (Fedora 40+, Ubuntu 24.04+), set `NO_STRIP=1` for AppImage bundling because linuxdeploy's bundled `strip` cannot process them.
