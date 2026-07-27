@@ -13,7 +13,7 @@ checking before coding, not after.
 | 3 | Compositor keybinding writer | **shipped** |
 | 4 | Cohere Transcribe on CPU | **5 of 7** — see `COHERE_ENGINE.md` |
 | 5 | Overlay on layer-shell | planned; blocker identified below |
-| 6a | Eager chunked transcription | planned |
+| 6a | Eager chunked transcription | **declined** — already covered, and its mechanism regresses here |
 | 6b | GTCRN speech enhancement | planned; model located |
 | 6c | Bounded GPU memory on idle | **shipped** (different mechanism) |
 | 6d | Packaging: tag-triggered release | **shipped** |
@@ -55,23 +55,36 @@ proves the pattern), and deleting the webview overlay path.
 Do this before item 6b: it removes a whole class of bug rather than adding a
 capability, and the overlay is on the latency path.
 
-## 6a. Eager chunked transcription
+## 6a. Eager chunked transcription — declined, with reasons
 
-Whisper currently waits for the recording to stop before decoding. Chunk during
-capture with a small overlap, decode chunks concurrently, and stitch with
-deduplication at the boundaries — voxtype's `eager.rs` is the reference.
+Voxtype's `eager.rs` chunks audio during recording, decodes chunks in parallel and
+stitches them at the boundaries, so decode work overlaps capture instead of
+starting at the stop. Recommending it for Voxide was a mistake in the original
+comparison: it was drawn from voxtype's module list without checking what Voxide
+already does.
 
-Two constraints specific to this codebase. `INFERENCE_LOCK` in `speech.rs`
-serialises inference because concurrent decodes on one `WhisperContext` corrupt
-results, so chunks queue rather than truly parallelise unless a second context is
-built — which costs the memory the warm-context cache exists to avoid. And VAD is
-deliberately a gate on the whole utterance, not a segmenter: mid-utterance
-segmentation was tried and measurably lost words. Chunk boundaries must therefore
-not be VAD-derived.
+**The latency win already exists here.** `spawn_live_whisper_preview` decodes
+during capture — a rolling 8-second window every 600 ms, paced by how long
+transcription actually takes on the machine. Voxtype needs `eager.rs` because it
+has no live preview; Voxide has had one all along. What overlapping decode with
+capture buys, this codebase already banks.
 
-Because of the inference lock the honest win here is *perceived* latency on slow
-CPUs, not throughput. Worth measuring before building: instrument the existing
-`decode_ms` against wall-clock capture and see how much is actually recoverable.
+**And the mechanism eager mode needs is known to regress here.** Chunk-and-stitch
+requires cutting mid-utterance and reassembling. That was tried in this codebase
+and *measurably lost words*, which is why VAD is a gate on the whole utterance
+rather than a segmenter and why the final pass decodes the complete buffer. Adding
+eager chunking would reintroduce a regression that was deliberately removed.
+
+`INFERENCE_LOCK` independently caps the gain: concurrent decodes on one
+`WhisperContext` corrupt results, so chunks would queue rather than parallelise
+unless a second context were built — costing exactly the memory the warm-context
+cache and the new idle timeout exist to bound.
+
+The one genuine remaining gap is narrower than the item as written: the final pass
+re-decodes audio the preview has already seen, so preview work is thrown away. If
+that is worth reclaiming it should be framed as *reusing the preview's output*,
+not as chunking, and it needs the measurement below first — instrument `decode_ms`
+against wall-clock capture and see how much is actually recoverable.
 
 ## 6b. GTCRN speech enhancement
 
