@@ -54,6 +54,16 @@ jobs:
       - name: Lint portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
+      # `custom-protocol` makes Tauri embed the built frontend, so
+      # `generate_context!` fails with "frontendDist ... doesn't exist" unless
+      # dist/ has been produced first. dist/ is gitignored, so each job that
+      # compiles the release target has to build it.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build the frontend Tauri will embed
+        run: npm ci && npm run build
       - name: Compile portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 build --release --no-default-features --features custom-protocol
@@ -74,6 +84,16 @@ jobs:
       - name: Lint portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
+      # `custom-protocol` makes Tauri embed the built frontend, so
+      # `generate_context!` fails with "frontendDist ... doesn't exist" unless
+      # dist/ has been produced first. dist/ is gitignored, so each job that
+      # compiles the release target has to build it.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build the frontend Tauri will embed
+        run: npm ci && npm run build
       - name: Compile portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 build --release --no-default-features --features custom-protocol
@@ -94,6 +114,16 @@ jobs:
       - name: Lint portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 clippy --lib --no-default-features -- -D warnings
+      # `custom-protocol` makes Tauri embed the built frontend, so
+      # `generate_context!` fails with "frontendDist ... doesn't exist" unless
+      # dist/ has been produced first. dist/ is gitignored, so each job that
+      # compiles the release target has to build it.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build the frontend Tauri will embed
+        run: npm ci && npm run build
       - name: Compile portable Rust target
         working-directory: src-tauri
         run: cargo +1.89 build --release --no-default-features --features custom-protocol
