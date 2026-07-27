@@ -498,7 +498,9 @@ fn wait_for_copied_text(clipboard: &mut Clipboard, sentinel: &str) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{insertion_plan, KeySynthesis, Strategy, TextInsertionMode};
+    #[cfg(target_os = "linux")]
+    use super::KeySynthesis;
+    use super::{insertion_plan, Strategy, TextInsertionMode};
 
     #[test]
     fn persisted_insertion_modes_follow_the_reference_contract() {
@@ -525,6 +527,7 @@ mod tests {
         assert!(super::copy_text_to_clipboard(" \n\t ").is_ok());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn each_enigo_backend_disables_the_protocols_it_does_not_own() {
         // The whole ordered chain depends on this: enigo forwards every event
@@ -582,6 +585,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn libei_is_only_offered_for_clipboard_shortcuts() {
         // libei receives the compositor's keymap rather than supplying one, so
