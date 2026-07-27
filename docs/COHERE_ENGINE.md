@@ -264,18 +264,26 @@ Two ort details that cost time and are not obvious:
   build host needs no ONNX Runtime. Set `ORT_DYLIB_PATH`; the library the Parakeet
   runtime already ships works.
 
-### Not yet trustworthy
+### Accuracy and speed, measured
 
-The 2.26× figure is one 0.5 s fragment on one machine — not a benchmark, and far
-from voxtype's reported 9–11×. Nothing about speed should be claimed until a real
-utterance is timed.
+Decoding the whole reference WAV (3.85 s, resampled 24→16 kHz) gives:
 
-And accuracy is unproven. `"Ask,"` from the first half second of the Parakeet
-reference WAV is *plausible* for a fragment cut mid-word and resampled 24→16 kHz,
-but it has not been checked against a known transcript. The next step is decoding
-the **whole** WAV and comparing against its reference text — that is the test that
-would catch a subtly wrong front end or a cache-threading error, neither of which
-a short fragment reliably exposes.
+> "Ask not what your country can do for you. Ask what you can do for your country."
 
-Remaining after that: the in-app download (five precisions, external data shards,
-sha256 per file), engine registration and settings UI.
+Verbatim correct, with the punctuation and capitalisation the `<|pnc|>` token is
+there to produce. It also retroactively explains the earlier `"Ask,"` from the
+first half second — the utterance genuinely starts with "Ask".
+
+This is the check a fragment cannot substitute for. A subtly wrong front end or a
+mis-threaded K/V cache degrades a full utterance into garbage or into the same
+token repeating; a correct sentence with correct punctuation exercises the front
+end, the encoder, mixed-precision cache threading across all 8 layers, EOS
+detection and the tokenizer at once. The test asserts against repetition
+explicitly, since cache loss is the failure mode that most resembles success.
+
+**5.07× realtime on CPU** (0.76 s for 3.85 s of audio, model already loaded).
+Real, and short of voxtype's reported 9–11× on a Zen 4 — different CPU, and worth
+re-measuring on longer audio before either figure goes in the README.
+
+Remaining: the in-app download (five precisions, external data shards, sha256 per
+file), engine registration and the settings UI. The engine itself is done.

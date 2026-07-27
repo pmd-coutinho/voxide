@@ -11,7 +11,7 @@ checking before coding, not after.
 | 1 | libei output leg + ordered insertion chain | **shipped** |
 | 2 | Held-modifier guard | **shipped** |
 | 3 | Compositor keybinding writer | **shipped** |
-| 4 | Cohere Transcribe on CPU | **5 of 7** — see `COHERE_ENGINE.md` |
+| 4 | Cohere Transcribe on CPU | **engine works & verified** — see `COHERE_ENGINE.md` |
 | 5 | Overlay on layer-shell | planned; blocker identified below |
 | 6a | Eager chunked transcription | planned |
 | 6b | GTCRN speech enhancement | planned; model located |

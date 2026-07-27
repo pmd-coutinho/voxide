@@ -314,6 +314,76 @@ mod tests {
         assert_eq!(EOS, 3);
     }
 
+    /// Decodes the *whole* reference WAV, which is the check a half-second
+    /// fragment cannot substitute for: a subtly wrong front end or a
+    /// cache-threading error yields garbage or repetition over a full utterance
+    /// even when a fragment happens to look plausible.
+    #[test]
+    #[ignore = "needs the 1.5 GB q4f16 model and ORT_DYLIB_PATH"]
+    fn transcribes_a_full_utterance() {
+        let directory = model_directory();
+        if !directory.join("onnx/encoder_model_q4f16.onnx").is_file() {
+            eprintln!("skipping: no model");
+            return;
+        }
+        // The Parakeet reference WAV: a full sentence, and 24 kHz so it also
+        // exercises the resample the app does before any engine sees audio.
+        let source = std::env::var("VOXIDE_PARAKEET_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set VOXIDE_PARAKEET_MODEL_DIR")
+            .join("test_wavs/en.wav");
+        let mut reader = hound::WavReader::open(&source).expect("wav opens");
+        let spec = reader.spec();
+        let raw: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+                .collect(),
+        };
+        // Mono, then linear resample to 16 kHz. Crude but adequate: this test is
+        // asking whether the words come out right, not measuring resampler quality.
+        let channels = spec.channels as usize;
+        let mono: Vec<f32> = raw
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect();
+        let ratio = spec.sample_rate as f64 / 16_000.0;
+        let target = (mono.len() as f64 / ratio) as usize;
+        let samples: Vec<f32> = (0..target)
+            .map(|index| {
+                let position = index as f64 * ratio;
+                let left = position.floor() as usize;
+                let fraction = (position - left as f64) as f32;
+                let a = mono.get(left).copied().unwrap_or(0.0);
+                let b = mono.get(left + 1).copied().unwrap_or(a);
+                a + (b - a) * fraction
+            })
+            .collect();
+
+        let transcriber = CohereTranscriber::load(&directory).expect("model loads");
+        let started = std::time::Instant::now();
+        let text = transcriber
+            .transcribe(&samples)
+            .expect("transcription runs");
+        let elapsed = started.elapsed();
+        let seconds = samples.len() as f32 / 16_000.0;
+        println!(
+            "FULL TRANSCRIPT: {text:?}\n{seconds:.2} s audio in {:.2} s ({:.2}x realtime)",
+            elapsed.as_secs_f32(),
+            seconds / elapsed.as_secs_f32()
+        );
+        let words: Vec<&str> = text.split_whitespace().collect();
+        assert!(words.len() >= 5, "expected a sentence, got {text:?}");
+        // Repetition is the signature of a broken K/V cache: the decoder loses
+        // its context and emits the same token forever.
+        let unique: std::collections::HashSet<&&str> = words.iter().collect();
+        assert!(
+            unique.len() * 2 > words.len(),
+            "output looks like cache-loss repetition: {text:?}"
+        );
+    }
+
     /// The end-to-end oracle: real speech in, readable words out. This is what a
     /// tolerance test on the front end cannot substitute for — a front end or a
     /// cache-threading error that survives numeric checks still produces visibly
