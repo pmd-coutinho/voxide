@@ -333,6 +333,8 @@ input[type="range"] { padding: 0; }
 /* Shared by the hotkey-backend and text-insertion readouts, which report the
    same kind of thing: which desktop protocol a feature resolved to. */
 .backend-status { margin: 0; font-size: 12px; }
+/* The exact lines that will be written to the user's compositor config. */
+.binding-snippet { margin: 0; padding: 9px 11px; overflow-x: auto; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; white-space: pre; border: 1px solid var(--line); border-radius: var(--radius-small); background: var(--bg); }
 .backend-status.warning { padding: 9px 11px; border: 1px solid var(--warn-line); border-radius: var(--radius-small); color: var(--warn-text) !important; background: var(--warn-bg); }
 
 /* ---------- Overlay (always iron, independent of theme) ---------- */

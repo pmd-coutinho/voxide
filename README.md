@@ -135,6 +135,8 @@ binds {
 }
 ```
 
+Settings → Global dictation can write those binds for you on niri, Sway, Hyprland, and river. It shows the exact lines first, and before replacing anything it copies the config to a timestamped `.voxide-backup-*` beside it, then checks the edited copy with the compositor's own validator (`niri validate`, `sway -C`) so a rejected edit never reaches your desktop. Chords are chosen around what you already bind — niri ships `Mod+Escape` bound and rejects the whole config on a duplicate keybind — and Voxide's lines live between `>>> voxide dictation binds (managed) >>>` markers, so re-applying replaces them instead of stacking copies. If the config is a symlink into a dotfiles repository, the UI says so, because the edit will show up there as an uncommitted change.
+
 Supported trigger actions: `dictate`, `prompt`, `command`, `rewrite`, `cancel`, `paste-last`. The command forwards the action to the running instance over a Unix socket in `$XDG_RUNTIME_DIR` and exits. Each trigger acts as a tap (press+release), so hold-to-record is not available through compositor triggers.
 
 Voxide enforces a single running instance — launching it again focuses the existing window, which also works as a "bring it back from the tray" gesture.

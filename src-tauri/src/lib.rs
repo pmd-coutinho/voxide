@@ -33,6 +33,8 @@ mod apple_speech;
 mod asr;
 mod asr_adapter;
 mod audio;
+#[cfg(target_os = "linux")]
+mod compositor_bindings;
 mod debug_log;
 mod formatting;
 #[cfg(target_os = "linux")]
@@ -10476,6 +10478,21 @@ fn text_insertion_status() -> typing::InsertionDiagnostics {
     typing::insertion_diagnostics()
 }
 
+/// Reports what installing compositor keybindings would involve. Read-only.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn compositor_binding_plan() -> Result<compositor_bindings::Plan, String> {
+    compositor_bindings::inspect()
+}
+
+/// Writes the keybindings. Only reachable from an explicit user action, because
+/// it edits a file Voxide does not own.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn compositor_binding_apply() -> Result<compositor_bindings::Applied, String> {
+    compositor_bindings::apply()
+}
+
 #[tauri::command]
 fn hotkey_backend_status(app: AppHandle) -> HotkeyBackendStatus {
     #[cfg(target_os = "linux")]
@@ -11063,6 +11080,10 @@ pub fn run() {
             configure_hotkeys,
             hotkey_backend_status,
             text_insertion_status,
+            #[cfg(target_os = "linux")]
+            compositor_binding_plan,
+            #[cfg(target_os = "linux")]
+            compositor_binding_apply,
             resize_overlay_to_content
         ])
         .run(tauri::generate_context!())

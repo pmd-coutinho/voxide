@@ -374,6 +374,29 @@ type ModifierGuardAvailability =
   | { state: "active"; detail: { keyboards: number } }
   | { state: "unavailable"; detail: { reason: string } };
 
+/// What installing compositor keybindings would involve. Produced without
+/// writing anything, so the user decides after seeing it.
+interface CompositorBindingPlan {
+  compositor: string;
+  compositorName: string;
+  configPath: string;
+  resolvedPath: string;
+  isSymlink: boolean;
+  gitRepository?: string | null;
+  configExists: boolean;
+  existingReferences: string[];
+  hasManagedBlock: boolean;
+  snippet: string;
+  blocked?: string | null;
+}
+
+interface CompositorBindingApplied {
+  configPath: string;
+  backupPath: string;
+  validated: boolean;
+  replacedExistingBlock: boolean;
+}
+
 interface LibeiStatus {
   connected: boolean;
   attempted: boolean;
@@ -549,6 +572,7 @@ let apiStatus: LocalApiStatus | undefined;
 let accessibilityPermissionStatus: AccessibilityPermissionStatus | undefined;
 let hotkeyBackendStatus: HotkeyBackendStatus | undefined;
 let insertionDiagnostics: InsertionDiagnostics | undefined;
+let compositorBindingPlan: CompositorBindingPlan | undefined;
 let recentReleaseNotes: ReleaseNote[] = [];
 let rewriteState: RewriteState = { selectedText: "", outputText: "", processing: false, draft: "", conversation: [] };
 let commandState: CommandState = { draft: "", processing: false };
@@ -1266,6 +1290,7 @@ function renderSettings(): void {
       ${settingToggle("typeIntoActiveApplication", "Type into active application", "Insert completed text where you were working.")}
       <label>Text insertion mode<select id="text-insertion-mode"><option value="standard" ${database.settings.textInsertionMode === "standard" ? "selected" : ""}>Clipboard-free insert</option><option value="reliablePaste" ${database.settings.textInsertionMode === "reliablePaste" ? "selected" : ""}>Clipboard paste</option></select><small>${database.settings.textInsertionMode === "reliablePaste" ? "Compatibility path: temporarily pastes through the clipboard, so clipboard-history apps may briefly record dictated text." : "Fastest path: direct insertion leaves the clipboard unchanged, with clipboard paste only if direct insertion is unavailable."}</small></label>
       ${insertionBackendNotice()}
+      ${compositorBindingNotice()}
       <button class="primary" data-action="save-hotkey">Apply shortcut</button>
     </section>
     <section class="card form-card"><h2>Dictation formatting</h2>
@@ -1401,6 +1426,46 @@ async function refreshHotkeyBackendStatus(): Promise<void> {
 
 async function refreshInsertionDiagnostics(): Promise<void> {
   insertionDiagnostics = await invoke<InsertionDiagnostics>("text_insertion_status");
+}
+
+async function refreshCompositorBindingPlan(): Promise<void> {
+  compositorBindingPlan = await invoke<CompositorBindingPlan>("compositor_binding_plan");
+}
+
+/// Offers to install compositor keybindings, but only after saying exactly which
+/// file is edited and flagging the two things that make that consequential: the
+/// config being a symlink into a repository, and bindings already existing.
+function compositorBindingNotice(): string {
+  const plan = compositorBindingPlan;
+  if (!plan) return "";
+  const parts: string[] = [];
+
+  if (plan.existingReferences.length > 0 && !plan.hasManagedBlock) {
+    parts.push(
+      `<p class="muted backend-status">Your ${escapeHtml(plan.compositorName)} config already binds Voxide by hand, so nothing needs adding:</p><pre class="binding-snippet">${escapeHtml(plan.existingReferences.join("\n"))}</pre>`,
+    );
+    return parts.join("");
+  }
+
+  parts.push(
+    `<p class="muted backend-status">${plan.hasManagedBlock ? "Voxide manages keybindings in" : "Voxide can add dictation keybindings to"} <code>${escapeHtml(plan.configPath)}</code>.</p>`,
+  );
+  if (plan.isSymlink) {
+    parts.push(
+      `<p class="warning backend-status">That path is a symlink to <code>${escapeHtml(plan.resolvedPath)}</code>${plan.gitRepository ? `, inside the git repository <code>${escapeHtml(plan.gitRepository)}</code> — the edit will show up there as an uncommitted change` : ""}. A timestamped backup is written next to it either way.</p>`,
+    );
+  }
+  if (plan.blocked) {
+    parts.push(
+      `<p class="warning backend-status">Voxide cannot place the bindings automatically: ${escapeHtml(plan.blocked)}. Add them by hand instead.</p>`,
+    );
+    return parts.join("");
+  }
+  parts.push(
+    `<pre class="binding-snippet">${escapeHtml(plan.snippet)}</pre>`,
+    `<button data-action="apply-compositor-bindings">${plan.hasManagedBlock ? "Update" : "Add"} ${escapeHtml(plan.compositorName)} keybindings</button>`,
+  );
+  return parts.join("");
 }
 
 const INSERTION_BACKEND_NAMES: Record<string, string> = {
@@ -1759,7 +1824,13 @@ async function handleTrayAction(event: TrayAction): Promise<void> {
         showNotice(`Could not paste the last transcription: ${String(error)}`);
       }
       break;
-    case "settings": currentView = "settings"; render(); break;
+    case "settings":
+      currentView = "settings";
+      render();
+      void refreshCompositorBindingPlan()
+        .catch(() => { compositorBindingPlan = undefined; })
+        .then(() => { if (currentView === "settings") render(); });
+      break;
     case "dictionary": currentView = "dictionary"; render(); break;
     default: break;
   }
@@ -2294,7 +2365,10 @@ function bindCommonEvents(): void {
       // Re-read on entry: whether libei has been reached, and whether it is
       // still worth offering, both change as dictations succeed or fail.
       render();
-      void refreshInsertionDiagnostics().catch(() => { insertionDiagnostics = undefined; }).then(() => {
+      void Promise.allSettled([
+        refreshInsertionDiagnostics().catch(() => { insertionDiagnostics = undefined; }),
+        refreshCompositorBindingPlan().catch(() => { compositorBindingPlan = undefined; }),
+      ]).then(() => {
         if (currentView === "settings") render();
       });
     } else {
@@ -2754,6 +2828,18 @@ async function presentAvailableUpdate(update: UpdateCheckResult, canSnooze: bool
 async function handleAction(element: HTMLElement): Promise<void> {
   switch (element.dataset.action) {
     case "toggle-recording": await toggleRecording(true); break;
+    case "apply-compositor-bindings":
+      try {
+        const applied = await invoke<CompositorBindingApplied>("compositor_binding_apply");
+        showNotice(
+          `Keybindings written to ${applied.configPath}${applied.validated ? " and accepted by the compositor" : ""}. Backup: ${applied.backupPath}. Reload your compositor config to activate them.`,
+        );
+        await refreshCompositorBindingPlan().catch(() => { compositorBindingPlan = undefined; });
+      } catch (error) {
+        showNotice(String(error));
+      }
+      render();
+      break;
     case "onboarding-voice":
       database.settings = await invoke<Settings>("set_onboarding_step", { step: 1 });
       currentView = "voice";
