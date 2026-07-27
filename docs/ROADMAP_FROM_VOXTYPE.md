@@ -12,7 +12,7 @@ checking before coding, not after.
 | 2 | Held-modifier guard | **shipped** |
 | 3 | Compositor keybinding writer | **shipped** |
 | 4 | Cohere Transcribe on CPU | **engine works & verified** — see `COHERE_ENGINE.md` |
-| 5 | Overlay on layer-shell | planned; blocker identified below |
+| 5 | Overlay on layer-shell | **surface working** — separate binary, verified on screen |
 | 6a | Eager chunked transcription | planned |
 | 6b | GTCRN speech enhancement | planned; model located |
 | 6c | GPU isolation option | planned |
@@ -52,8 +52,36 @@ story from doubling. Either way the work splits into a small `voxide-overlay`
 binary, an IPC channel (the existing `$XDG_RUNTIME_DIR` trigger socket already
 proves the pattern), and deleting the webview overlay path.
 
-Do this before item 6b: it removes a whole class of bug rather than adding a
-capability, and the overlay is on the latency path.
+### Built: `voxide-overlay`
+
+SCTK was taken over GTK 4, and `src/bin/voxide_overlay.rs` now creates a real
+layer surface. Verified on screen rather than assumed — niri reports it:
+
+```text
+Overlay layer:
+  Surface:
+    Namespace: "voxide"
+    Keyboard interactivity: none
+```
+
+Overlay layer, correct namespace, and **non-focusable**, which is the property the
+webview overlay could never guarantee. Sizes are logical, so the scaled-output bug
+that the webview version needed a fix for cannot recur.
+
+Two SCTK 0.21 details that cost time. The per-protocol `delegate_compositor!`,
+`delegate_output!`, `delegate_shm!` and `delegate_layer!` macros were removed after
+0.19 and replaced by a single `delegate_dispatch2!`. And a frame callback's
+userdata must be wrapped in `compositor::FrameCallbackData` so SCTK can route it
+back to `CompositorHandler::frame`.
+
+Teardown does not use `blocking_dispatch`: that parks until the compositor sends
+something, so an idle overlay would outlive its deadline. The loop drains pending
+events, flushes, and sleeps a frame instead.
+
+**Remaining:** text rendering (needs a font stack), and the IPC that will drive the
+level from the running app — `crate::trigger`'s socket is the pattern. Then delete
+the webview overlay path. Gated behind `overlay-layer-shell` with a
+`required-features` bin target until then, so no default build is affected.
 
 ## 6a. Eager chunked transcription
 

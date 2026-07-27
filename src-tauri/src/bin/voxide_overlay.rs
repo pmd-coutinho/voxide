@@ -1,7 +1,5 @@
 //! The dictation overlay as a `wlr-layer-shell` surface, in its own process.
 //!
-//! # DOES NOT COMPILE YET
-//!
 //! One blocker, precisely located: this uses `delegate_compositor!`,
 //! `delegate_output!`, `delegate_shm!` and `delegate_layer!`, which existed up to
 //! smithay-client-toolkit 0.19 but were **removed by 0.21.1**. That version ships
@@ -42,9 +40,14 @@
 
 use std::time::{Duration, Instant};
 
+use smithay_client_toolkit::reexports::client::{
+    globals::registry_queue_init,
+    protocol::{wl_output, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    delegate_dispatch2, delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -55,11 +58,6 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
-};
-use wayland_client::{
-    globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
 };
 
 /// Logical size of the overlay. Logical, not physical: the compositor scales it,
@@ -100,19 +98,18 @@ fn main() {
 }
 
 fn run(level: f32, lifetime: Duration) -> Result<(), String> {
-    let connection = Connection::connect_to_env()
-        .map_err(|error| format!("no Wayland display: {error}"))?;
+    let connection =
+        Connection::connect_to_env().map_err(|error| format!("no Wayland display: {error}"))?;
     let (globals, mut queue) = registry_queue_init(&connection)
         .map_err(|error| format!("could not read the Wayland registry: {error}"))?;
     let handle = queue.handle();
 
     let compositor = CompositorState::bind(&globals, &handle)
         .map_err(|error| format!("wl_compositor is unavailable: {error}"))?;
-    let layer_shell = LayerShell::bind(&globals, &handle).map_err(|error| {
-        format!("this compositor does not implement wlr-layer-shell: {error}")
-    })?;
-    let shm = Shm::bind(&globals, &handle)
-        .map_err(|error| format!("wl_shm is unavailable: {error}"))?;
+    let layer_shell = LayerShell::bind(&globals, &handle)
+        .map_err(|error| format!("this compositor does not implement wlr-layer-shell: {error}"))?;
+    let shm =
+        Shm::bind(&globals, &handle).map_err(|error| format!("wl_shm is unavailable: {error}"))?;
 
     let surface = compositor.create_surface(&handle);
     // Overlay layer so it sits above windows; no keyboard interactivity at all,
@@ -217,7 +214,9 @@ impl Overlay {
 
         let surface = self.layer.wl_surface();
         surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
-        surface.frame(handle, surface.clone());
+        // 0.21 wants the callback's userdata wrapped so SCTK can route it back
+        // to `CompositorHandler::frame`.
+        surface.frame(handle, FrameCallbackData(surface.clone()));
         if let Err(error) = buffer.attach_to(surface) {
             eprintln!("voxide-overlay: could not attach the buffer: {error}");
             return;
@@ -324,8 +323,7 @@ impl ProvidesRegistryState for Overlay {
     registry_handlers![OutputState];
 }
 
-delegate_compositor!(Overlay);
-delegate_output!(Overlay);
-delegate_shm!(Overlay);
-delegate_layer!(Overlay);
+// One macro for every protocol SCTK handles on our behalf: 0.21 replaced the
+// per-protocol `delegate_compositor!`/`delegate_layer!`/... family with this.
+delegate_dispatch2!(Overlay);
 delegate_registry!(Overlay);
