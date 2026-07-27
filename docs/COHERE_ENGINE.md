@@ -164,6 +164,55 @@ shifts every bin of every frame by roughly 0.1 in normalised space — around 10
 while looking entirely plausible. It was caught only by comparing element for
 element against the reference output.
 
+## ONNX graph contract
+
+Read from the q4f16 graphs themselves (opset 21, IR 10). The weights live in
+separate `.onnx_data` shards, so the graph protobufs can be fetched for ~1.6 MB
+without the 1.5 GB of parameters — worth doing before writing any session code.
+
+### Encoder — `encoder_model_q4f16.onnx`
+
+| Direction | Name | Type | Shape |
+| --------- | ---- | ---- | ----- |
+| in | `input_features` | f32 | `[batch, sequence_length, 128]` |
+| out | `last_hidden_state` | f32 | `[batch, encoder_sequence_length, 1024]` |
+
+The encoder output is **1024-wide, not 1280**: `d_model` 1280 is internal and a
+head projects to 1024 before it leaves the graph. Feed it the frames from
+`cohere_fbank`, unnormalised frames included — the mask has already zeroed them.
+
+### Decoder — `decoder_model_merged_q4f16.onnx`
+
+One graph serves both passes. Inputs:
+
+| Name | Type | Shape |
+| ---- | ---- | ----- |
+| `input_ids` | i64 | `[batch, sequence_length]` |
+| `attention_mask` | i64 | `[batch, total_sequence_length]` |
+| `position_ids` | i64 | `[batch, sequence_length]` |
+| `num_logits_to_keep` | i64 | `[]` (scalar) |
+| `encoder_hidden_states` | **f32** | `[batch, encoder_sequence_length, 1024]` |
+| `past_key_values.{0..7}.decoder.{key,value}` | **f16** | `[batch, 8, past_decoder_sequence_length, 128]` |
+| `past_key_values.{0..7}.encoder.{key,value}` | **f16** | `[batch, 8, past_encoder_sequence_length, 128]` |
+
+Outputs: `logits` **f16** `[batch, num_logits_to_keep, 16384]`, plus 32
+`present.{0..7}.{decoder,encoder}.{key,value}` tensors — 33 in total.
+
+Two things to get right:
+
+- **The cache is f16 while `encoder_hidden_states` is f32.** This variant is
+  mixed precision, so the `half` crate is needed for the cache and the logits;
+  do not assume one element type across the graph.
+- **Encoder K/V must be threaded through, not recomputed.** On the first call the
+  `past_key_values.N.encoder.*` inputs are empty and the graph projects the
+  encoder output itself; the resulting `present.N.encoder.*` must be fed back on
+  every later step. Recomputing them per token is correct but throws away most of
+  the speed, and on a 48-layer encoder output that is the whole budget.
+
+The prefix-fill pass passes the full 6-token prefix with empty decoder past and
+`num_logits_to_keep = 1`; each incremental step passes one token with the full
+past. `position_ids` continue from the prefix length.
+
 ## Remaining work
 
 1. ~~`cohere` cargo feature.~~ Done: `cohere = ["dep:rustfft"]`.
@@ -173,18 +222,20 @@ element against the reference output.
    speech, both within float32 STFT ordering noise. Two fixtures live in
    `src-tauri/fixtures/`; regenerate them with the reference env described above.
    The module is `#![allow(dead_code)]` until step 3 consumes it.
-3. `ort` + `tokenizers` behind the same feature.
+3. ~~Read the ONNX graph I/O contract.~~ Done, above — no assumptions left to
+   make about names, shapes or element types.
+4. `ort` + `tokenizers` + `half` behind the same feature, and the two sessions.
 3. `cohere.rs` — two ONNX sessions. The decoder is *merged*: one graph serves the
    prefix-fill pass (empty past, multi-token input) and incremental generation
    (full past, single token). Encoder K/V is projected on the first decoder call
    and reused via `past_key_values.N.encoder.{key,value}`, so it must not be
    recomputed per step. Confirm the real input/output names by inspecting the
    graph rather than assuming.
-4. Model download: five precisions, external data shards, sha256 per file. The
+5. Model download: five precisions, external data shards, sha256 per file. The
    existing resumable-download path already handles large archives.
-5. Engine registration, settings UI, and a benchmark before advertising a speed.
+6. Engine registration, settings UI, and a benchmark before advertising a speed.
 
 Voxtype's `src/transcribe/cohere.rs` is a working reference implementation for
-step 3. Its doc comment describes the encoder output as 1024-wide while
-`config.json` gives the encoder `d_model` 1280 with a 1024 head — check the graph
-before trusting either number.
+step 4. Its doc comment claims the K/V cache is F32; in the q4f16 export it is
+**F16**, so that shape is per-variant and should be read from the graph rather
+than copied. Its 1024-wide encoder output is correct.
