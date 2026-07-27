@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,82 @@ static VAD_CONTEXT_CACHE: ModelKeyed<WhisperVadContext> = OnceLock::new();
 /// the warm context, and concurrent runs on one context corrupt each other
 /// on GPU backends. The final pass simply waits out an in-flight preview.
 static INFERENCE_LOCK: Mutex<()> = Mutex::new(());
+
+/// When the warm caches above were last used, so they can be released after a
+/// long idle period.
+///
+/// whisper.cpp does not return GPU memory while a context is alive, so a session
+/// that dictates once and then sits idle for hours holds VRAM the whole time.
+/// voxtype's answer is to transcribe in a child process that exits; releasing the
+/// cache on idle reaches the same outcome without a second process, and without
+/// paying a model load on the dictations that actually follow each other.
+static LAST_MODEL_USE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long the caches may sit unused before being dropped. Long enough that a
+/// working session never reloads, short enough that a forgotten window does not
+/// hold a multi-gigabyte model overnight.
+pub const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Records that a model was just used. Called on every cache hit and miss.
+fn mark_model_used() {
+    if let Ok(mut stamp) = LAST_MODEL_USE.lock() {
+        *stamp = Some(Instant::now());
+    }
+}
+
+/// Drops the warm Whisper caches if they have gone unused for `idle`, returning
+/// whether anything was actually released.
+///
+/// Takes [`INFERENCE_LOCK`] first: dropping a context while a decode is running
+/// against it would free the model underneath in-flight inference. If a decode
+/// holds the lock the eviction is simply skipped — the model is plainly in use,
+/// and the next sweep will come round again.
+pub fn release_idle_models(idle: Duration) -> bool {
+    let Ok(stamp) = LAST_MODEL_USE.lock() else {
+        return false;
+    };
+    match *stamp {
+        Some(last) if last.elapsed() < idle => return false,
+        // Never used, so there is nothing warm to release.
+        None => return false,
+        Some(_) => {}
+    }
+    drop(stamp);
+
+    let Ok(_inference) = INFERENCE_LOCK.try_lock() else {
+        return false;
+    };
+
+    let mut released = false;
+    // States reference the context, so they go first.
+    for cache in [&PREVIEW_STATE_CACHE, &FINAL_STATE_CACHE] {
+        if let Some(cache) = cache.get() {
+            if let Ok(mut slot) = cache.lock() {
+                released |= slot.take().is_some();
+            }
+        }
+    }
+    if let Some(cache) = CONTEXT_CACHE.get() {
+        if let Ok(mut slot) = cache.lock() {
+            released |= slot.take().is_some();
+        }
+    }
+    if let Some(cache) = VAD_CONTEXT_CACHE.get() {
+        if let Ok(mut slot) = cache.lock() {
+            released |= slot.take().is_some();
+        }
+    }
+    if released {
+        if let Ok(mut stamp) = LAST_MODEL_USE.lock() {
+            *stamp = None;
+        }
+        crate::debug_log::append(&format!(
+            "released warm speech models after {} s idle",
+            idle.as_secs()
+        ));
+    }
+    released
+}
 
 /// A final transcription gets priority over previews. A preview only ever
 /// takes the inference lock when no final pass is waiting, preventing a new
@@ -385,6 +461,7 @@ fn load_context(model_path: &Path) -> Result<Arc<WhisperContext>, String> {
     let mut cached = cache
         .lock()
         .map_err(|_| "Whisper model cache lock was poisoned".to_string())?;
+    mark_model_used();
     if let Some((path, context)) = cached.as_ref() {
         if path == model_path {
             return Ok(Arc::clone(context));
@@ -792,6 +869,39 @@ fn clean_transcription_segment(segment: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::clean_transcription_segment;
+
+    #[test]
+    fn an_unused_cache_is_not_reported_as_released() {
+        // Nothing warm means nothing to free; a true return here would make the
+        // sweep log a release on every tick of an idle app.
+        if super::LAST_MODEL_USE
+            .lock()
+            .is_ok_and(|stamp| stamp.is_none())
+        {
+            assert!(!super::release_idle_models(std::time::Duration::from_secs(
+                0
+            )));
+        }
+    }
+
+    #[test]
+    fn a_recently_used_model_survives_the_sweep() {
+        // The guarantee that matters: consecutive dictations must not reload the
+        // model. A fresh timestamp with a long timeout has to be left alone.
+        super::mark_model_used();
+        assert!(
+            !super::release_idle_models(std::time::Duration::from_secs(3600)),
+            "a model used moments ago must not be evicted"
+        );
+    }
+
+    #[test]
+    fn the_idle_timeout_outlasts_a_working_session_but_not_a_forgotten_window() {
+        // Long enough that back-to-back dictation never reloads, short enough
+        // that an app left open does not hold VRAM all night.
+        assert!(super::MODEL_IDLE_TIMEOUT >= std::time::Duration::from_secs(60));
+        assert!(super::MODEL_IDLE_TIMEOUT <= std::time::Duration::from_secs(30 * 60));
+    }
 
     /// Debugs VAD behavior on a real recording. Point VOXIDE_TEST_WAV at a
     /// 16 kHz mono WAV and run:

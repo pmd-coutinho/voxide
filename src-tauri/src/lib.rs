@@ -10790,6 +10790,10 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// How many times per idle window the sweep runs. Several, so a model is released
+/// within a fraction of the timeout rather than up to a whole one late.
+const SPEECH_IDLE_SWEEPS: u32 = 5;
+
 pub fn run() {
     let state = AppState::load().unwrap_or_else(|error| panic!("Voxide could not start: {error}"));
     let analytics = analytics::AnalyticsService::load(state.analytics_identity_path());
@@ -10868,6 +10872,23 @@ pub fn run() {
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ));
+            // whisper.cpp holds GPU memory for as long as a context lives, so an
+            // app left open after one dictation keeps a multi-gigabyte model
+            // resident indefinitely. Sweeping for an idle cache releases it
+            // without the child-process indirection voxtype uses, and without
+            // costing a reload between dictations that follow each other.
+            tauri::async_runtime::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(speech::MODEL_IDLE_TIMEOUT / SPEECH_IDLE_SWEEPS);
+                loop {
+                    ticker.tick().await;
+                    // Cheap when nothing is warm, and it declines to evict while
+                    // a decode holds the inference lock.
+                    tauri::async_runtime::spawn_blocking(|| {
+                        speech::release_idle_models(speech::MODEL_IDLE_TIMEOUT)
+                    });
+                }
+            });
             let state = app.state::<AppState>();
             let cleanup_directories = [state.models_directory(), state.data_directory()]
                 .into_iter()
