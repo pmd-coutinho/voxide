@@ -38,6 +38,11 @@ cuda = ["whisper-rs/cuda", "parakeet"]
 # Cohere Transcribe: a CPU-capable engine for hosts without an NVIDIA GPU.
 # See docs/COHERE_ENGINE.md. `rustfft` backs the NeMo-style log-mel front end.
 cohere = ["dep:rustfft", "dep:ort", "dep:tokenizers", "dep:half", "dep:ndarray"]
+# The dictation overlay as a wlr-layer-shell surface in its own process. It has
+# to be a separate binary: Tauri links webkit2gtk-4.1 (GTK 3) and GTK 3 cannot
+# share a process with GTK 4, so gtk4-layer-shell is unusable from the app.
+# SCTK + shm rather than GTK 4 or wgpu keeps it to one dependency stack.
+overlay-layer-shell = ["dep:smithay-client-toolkit"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
@@ -48,6 +53,7 @@ active-win-pos-rs = "0.11.0"
 # merged decoder, `tokenizers` decodes the 16384-entry vocabulary, and `half`
 # handles the q4f16 export's f16 K/V cache and logits.
 rustfft = { version = "6", optional = true }
+smithay-client-toolkit = { version = "0.21", optional = true }
 ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "half", "load-dynamic"] }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 half = { version = "2", optional = true }
@@ -110,3 +116,8 @@ objc2-speech = { version = "0.3.2", default-features = false, features = ["std",
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[[bin]]
+name = "voxide-overlay"
+path = "src/bin/voxide_overlay.rs"
+required-features = ["overlay-layer-shell"]
