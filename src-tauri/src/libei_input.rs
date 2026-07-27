@@ -642,7 +642,7 @@ mod tests {
         );
         println!("offered as a rung: {}", is_possible());
         match Emulator::connect() {
-            Ok(mut emulator) => {
+            Ok(emulator) => {
                 println!("connected: {}", emulator.describe());
                 for name in ["Control_L", "v", "c"] {
                     match emulator.evdev_keycode(name) {

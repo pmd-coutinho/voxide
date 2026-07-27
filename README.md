@@ -141,7 +141,7 @@ Voxide enforces a single running instance — launching it again focuses the exi
 
 ## Text insertion on Wayland
 
-No single protocol can type into the focused window on every Wayland desktop, so Voxide tries the available ones in order and stops at the first that works. Which one won, and why the earlier ones declined, is recorded in the diagnostic log.
+No single protocol can type into the focused window on every Wayland desktop, so Voxide tries the available ones in order and stops at the first that works. Settings → Global dictation reports the order resolved for the current session, below the text insertion mode; which one won, and why the earlier ones declined, is recorded in the diagnostic log.
 
 | Order | Protocol | Available on | Notes |
 | ----- | -------- | ------------ | ----- |

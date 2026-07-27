@@ -613,6 +613,48 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_serialize_under_the_names_the_settings_screen_reads() {
+        // The Settings notice reads these keys off the command result, and a
+        // casing drift would silently render an empty panel rather than fail.
+        let json = serde_json::to_value(super::insertion_diagnostics())
+            .expect("the diagnostics must serialize");
+        let object = json
+            .as_object()
+            .expect("diagnostics serialize as an object");
+        assert!(object.contains_key("chain"), "missing chain: {json}");
+        assert!(
+            object.contains_key("directCapable"),
+            "missing directCapable: {json}"
+        );
+        assert!(json["chain"].is_array());
+        assert!(json["directCapable"].is_array());
+
+        #[cfg(target_os = "linux")]
+        {
+            let libei = object.get("libei").expect("Linux reports a libei status");
+            for key in ["connected", "attempted", "detail"] {
+                assert!(libei.get(key).is_some(), "missing libei.{key}: {libei}");
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_never_claim_libei_can_type_text() {
+        // The notice tells users libei drives a clipboard paste rather than
+        // typing; that promise has to hold in the data behind it.
+        let diagnostics = super::insertion_diagnostics();
+        assert!(!diagnostics
+            .direct_capable
+            .contains(&"libei-portal".to_string()));
+        for backend in &diagnostics.direct_capable {
+            assert!(
+                diagnostics.chain.contains(backend),
+                "{backend} can type but is not in the chain"
+            );
+        }
+    }
+
+    #[test]
     fn every_planned_pair_is_unique() {
         for mode in [
             TextInsertionMode::Standard,

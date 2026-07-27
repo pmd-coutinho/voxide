@@ -367,6 +367,20 @@ interface HotkeyBackendStatus {
   detail?: string;
 }
 
+interface LibeiStatus {
+  connected: boolean;
+  attempted: boolean;
+  detail: string;
+}
+
+/// Which key-synthesis backends this desktop offers, in the order Voxide tries
+/// them. Only Linux reports more than one; `libei` is absent off Linux.
+interface InsertionDiagnostics {
+  chain: string[];
+  directCapable: string[];
+  libei?: LibeiStatus;
+}
+
 interface PromptShortcutAssignment {
   promptProfileId: string;
   hotkey: string;
@@ -526,6 +540,7 @@ let editingProviderId: string | undefined;
 let apiStatus: LocalApiStatus | undefined;
 let accessibilityPermissionStatus: AccessibilityPermissionStatus | undefined;
 let hotkeyBackendStatus: HotkeyBackendStatus | undefined;
+let insertionDiagnostics: InsertionDiagnostics | undefined;
 let recentReleaseNotes: ReleaseNote[] = [];
 let rewriteState: RewriteState = { selectedText: "", outputText: "", processing: false, draft: "", conversation: [] };
 let commandState: CommandState = { draft: "", processing: false };
@@ -1242,6 +1257,7 @@ function renderSettings(): void {
       ${settingToggle("copyToClipboard", "Copy completed dictations", "Copy final text to the clipboard.")}
       ${settingToggle("typeIntoActiveApplication", "Type into active application", "Insert completed text where you were working.")}
       <label>Text insertion mode<select id="text-insertion-mode"><option value="standard" ${database.settings.textInsertionMode === "standard" ? "selected" : ""}>Clipboard-free insert</option><option value="reliablePaste" ${database.settings.textInsertionMode === "reliablePaste" ? "selected" : ""}>Clipboard paste</option></select><small>${database.settings.textInsertionMode === "reliablePaste" ? "Compatibility path: temporarily pastes through the clipboard, so clipboard-history apps may briefly record dictated text." : "Fastest path: direct insertion leaves the clipboard unchanged, with clipboard paste only if direct insertion is unavailable."}</small></label>
+      ${insertionBackendNotice()}
       <button class="primary" data-action="save-hotkey">Apply shortcut</button>
     </section>
     <section class="card form-card"><h2>Dictation formatting</h2>
@@ -1375,6 +1391,52 @@ async function refreshHotkeyBackendStatus(): Promise<void> {
   hotkeyBackendStatus = await invoke<HotkeyBackendStatus>("hotkey_backend_status");
 }
 
+async function refreshInsertionDiagnostics(): Promise<void> {
+  insertionDiagnostics = await invoke<InsertionDiagnostics>("text_insertion_status");
+}
+
+const INSERTION_BACKEND_NAMES: Record<string, string> = {
+  "wayland-virtual-keyboard": "Wayland virtual keyboard",
+  "x11-xtest": "X11 (XTEST)",
+  "libei-portal": "libei via the desktop portal",
+  native: "the system input API",
+};
+
+function insertionBackendName(backend: string): string {
+  return INSERTION_BACKEND_NAMES[backend] ?? backend;
+}
+
+/// Explains which input protocols will be tried, and flags the libei rung when
+/// it is the one carrying insertion. Rendered only where the answer varies —
+/// macOS and Windows have a single backend and nothing to explain.
+function insertionBackendNotice(): string {
+  if (!database.settings.typeIntoActiveApplication) return "";
+  const diagnostics = insertionDiagnostics;
+  if (!diagnostics || diagnostics.chain.length < 2) return "";
+
+  const order = diagnostics.chain.map(insertionBackendName).join(", then ");
+  const parts = [
+    `<p class="muted backend-status">Insertion is attempted through ${escapeHtml(order)}, stopping at the first that works.</p>`,
+  ];
+
+  // libei can only reach keys the active layout already has, so it drives the
+  // clipboard paste rather than typing. Worth saying, because it is the one rung
+  // whose behaviour differs from the others and the only one needing approval.
+  const libei = diagnostics.libei;
+  if (libei && diagnostics.chain.includes("libei-portal")) {
+    if (libei.connected) {
+      parts.push(
+        `<p class="muted backend-status">libei is connected and inserting through a clipboard paste, because it can only send keys your keyboard layout already has. ${escapeHtml(libei.detail)}.</p>`,
+      );
+    } else if (libei.attempted) {
+      parts.push(
+        `<p class="warning backend-status">The faster input paths failed and libei could not take over: ${escapeHtml(libei.detail)}. If your desktop asked for “remote control” permission, approving it will let the next dictation through.</p>`,
+      );
+    }
+  }
+  return parts.join("");
+}
+
 function hotkeyBackendNotice(): string {
   if (hotkeyBackendStatus?.backend !== "portal") return "";
   const detail = hotkeyBackendStatus.detail ? ` ${hotkeyBackendStatus.detail}.` : "";
@@ -1388,7 +1450,7 @@ function hotkeyBackendNotice(): string {
   }[hotkeyBackendStatus.state] ?? "";
   if (!message) return "";
   const tone = hotkeyBackendStatus.state === "active" ? "muted" : "warning";
-  return `<p class="${tone} hotkey-backend-status">${escapeHtml(message)}</p>`;
+  return `<p class="${tone} backend-status">${escapeHtml(message)}</p>`;
 }
 
 async function saveSettings(): Promise<void> {
@@ -2206,6 +2268,13 @@ function bindCommonEvents(): void {
     currentView = nextView;
     if (currentView === "dictionary") {
       void refreshDictionaryLearningSuggestions().catch(() => { dictionaryLearningSuggestions = []; }).then(render);
+    } else if (currentView === "settings") {
+      // Re-read on entry: whether libei has been reached, and whether it is
+      // still worth offering, both change as dictations succeed or fail.
+      render();
+      void refreshInsertionDiagnostics().catch(() => { insertionDiagnostics = undefined; }).then(() => {
+        if (currentView === "settings") render();
+      });
     } else {
       render();
     }
@@ -3295,6 +3364,7 @@ async function initialize(): Promise<void> {
   await refreshLocalApiStatus();
   await refreshAccessibilityPermissionStatus();
   await refreshHotkeyBackendStatus().catch(() => { hotkeyBackendStatus = undefined; });
+  await refreshInsertionDiagnostics().catch(() => { insertionDiagnostics = undefined; });
   if (bootstrap.recoveryNotice) showNotice(bootstrap.recoveryNotice);
   await listen<HotkeyBackendStatus>("voxide-hotkey-backend", (event) => {
     hotkeyBackendStatus = event.payload;
