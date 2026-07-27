@@ -187,7 +187,13 @@ attached. Run the same checks locally instead:
 ./scripts/check-cuda.sh --quick   # everything except the release build
 ```
 
-It uses the toolchain CI pins and exports the environment the build needs,
+The `cuda-linux-nvidia` job is kept for the case where a GPU runner is attached
+again, but the repository variables it read were deleted with the runner — on a
+public repository they only published the paths of a home directory. Re-create
+them for the new host before dispatching it; the job's first step names any that
+are missing.
+
+`scripts/check-cuda.sh` uses the toolchain CI pins and exports the environment the build needs,
 including the `--allow-unsupported-compiler` flag nvcc requires when the host GCC
 is newer than it supports. Point `VOXIDE_PARAKEET_MODEL_DIR` at an installed
 Parakeet model to override the default, and `CMAKE_CUDA_ARCHITECTURES` at your
