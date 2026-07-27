@@ -41,6 +41,7 @@ jobs:
             libpango1.0-dev \
             libsoup-3.0-dev \
             libwebkit2gtk-4.1-dev \
+            libxkbcommon-dev \
             pkg-config
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
