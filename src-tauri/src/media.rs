@@ -325,11 +325,30 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
+    /// A per-test scratch path for the decoded fixture.
+    ///
+    /// The thread name keeps concurrent tests from sharing a file, but the Rust
+    /// harness names threads after the test path — `media::tests::…` — and `:`
+    /// cannot appear in a Windows filename, which failed the write with
+    /// `ERROR_INVALID_NAME` (os error 123). Anything that is not alphanumeric is
+    /// folded to `-` so the name stays portable and still unique.
     fn spoken_fixture_path() -> std::path::PathBuf {
+        let thread = std::thread::current();
+        let label: String = thread
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
         let path = std::env::temp_dir().join(format!(
-            "voxide-spoken-fixture-{}-{}.wav",
+            "voxide-spoken-fixture-{}-{label}.wav",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ));
         let encoded = include_str!("../fixtures/spoken-a-espeak-ng-8khz.wav.b64").trim();
         std::fs::write(
@@ -340,6 +359,30 @@ mod tests {
         )
         .expect("spoken fixture should be written");
         path
+    }
+
+    #[test]
+    fn the_fixture_path_is_a_legal_filename_on_every_platform() {
+        // Regression: the harness names threads after the test path, so the raw
+        // name contains "::". Windows rejected the write with ERROR_INVALID_NAME
+        // while Linux happily created a file with colons in it.
+        let path = spoken_fixture_path();
+        let name = path
+            .file_name()
+            .expect("the fixture path has a filename")
+            .to_str()
+            .expect("the fixture filename is UTF-8")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        for illegal in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            assert!(
+                !name.contains(illegal),
+                "{illegal:?} is reserved in Windows filenames: {name}"
+            );
+        }
+        // Still distinct per test, which is why the thread name is used at all.
+        assert!(name.contains(&std::process::id().to_string()), "{name}");
+        assert!(name.ends_with(".wav"), "{name}");
     }
 
     #[test]

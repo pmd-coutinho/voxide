@@ -1814,9 +1814,26 @@ fn rotate_database_backups(path: &Path) -> Result<(), String> {
             newest.display()
         )
     })?;
-    fs::File::open(&newest)
+    // Flushing the backup is crash-durability for redundancy, strictly weaker
+    // than having the backup at all — so a failure here is logged rather than
+    // aborting the save. It used to be fatal, and combined with the read-only
+    // handle below that made *every* database write fail on Windows.
+    //
+    // The handle is opened for writing rather than with `File::open` because
+    // `sync_all` becomes `FlushFileBuffers` on Windows, which requires
+    // `GENERIC_WRITE` and rejects a read-only handle with "Access is denied"
+    // (os error 5). `write(true)` does not truncate, so the copy stays intact.
+    // Opening for write can itself fail on a read-only file, which is the other
+    // reason this is best-effort.
+    if let Err(error) = fs::OpenOptions::new()
+        .write(true)
+        .open(&newest)
         .and_then(|file| file.sync_all())
-        .map_err(|error| format!("Could not flush Voxide database backup: {error}"))?;
+    {
+        debug_log::append(&format!(
+            "database backup could not be flushed to disk (the backup itself was written): {error}"
+        ));
+    }
     Ok(())
 }
 
@@ -12837,6 +12854,55 @@ mod tests {
         );
         assert!(!database_backup_path(&path, DATABASE_BACKUP_COUNT).exists());
 
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Saving must survive a backup that cannot be flushed to disk.
+    ///
+    /// This is the invariant Windows broke: the flush used a read-only handle,
+    /// `FlushFileBuffers` rejected it with "Access is denied", and because the
+    /// error was fatal *every* database write failed on that platform. Unix can
+    /// reproduce the shape of it — `fs::copy` preserves the source's mode, so a
+    /// read-only database yields a read-only backup that cannot be opened for
+    /// writing, while the copy itself succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn persisting_survives_a_backup_that_cannot_be_flushed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "voxide-database-unflushable-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join(DATABASE_FILE);
+        fs::write(&path, "initial snapshot").expect("initial database");
+        // Read-only, so the backup copied from it is read-only too.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("make read-only");
+
+        let state = AppState {
+            database: Mutex::new(AppDatabase::default()),
+            path: path.clone(),
+            startup_recovery_notice: Mutex::new(None),
+        };
+        state
+            .persist(&AppDatabase::default())
+            .expect("a backup that cannot be flushed must not fail the save");
+
+        // The backup still exists and still holds the previous contents; only
+        // its durability flush was skipped.
+        assert_eq!(
+            fs::read_to_string(database_backup_path(&path, 0)).expect("newest backup"),
+            "initial snapshot"
+        );
+        // And the live database really was replaced.
+        let saved = fs::read_to_string(&path).expect("live database");
+        assert!(
+            saved.contains("schemaVersion") || saved.contains("schema_version"),
+            "{saved}"
+        );
+
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(directory);
     }
 
