@@ -11,11 +11,11 @@ checking before coding, not after.
 | 1 | libei output leg + ordered insertion chain | **shipped** |
 | 2 | Held-modifier guard | **shipped** |
 | 3 | Compositor keybinding writer | **shipped** |
-| 4 | Cohere Transcribe on CPU | **5 of 7** — see `COHERE_ENGINE.md` |
-| 5 | Overlay on layer-shell | planned; blocker identified below |
-| 6a | Eager chunked transcription | **declined** — already covered, and its mechanism regresses here |
-| 6b | GTCRN speech enhancement | **built & verified**, not yet wired |
-| 6c | Bounded GPU memory on idle | **shipped** (different mechanism) |
+| 4 | Cohere Transcribe on CPU | **engine works & verified** — see `COHERE_ENGINE.md` |
+| 5 | Overlay on layer-shell | **surface working** — separate binary, verified on screen |
+| 6a | Eager chunked transcription | **declined** — already covered; its mechanism regresses here (see main) |
+| 6b | GTCRN speech enhancement | **built & verified** — +4.46 dB SNR (see main) |
+| 6c | Bounded GPU memory on idle | **shipped** (idle eviction, not a subprocess — see main) |
 | 6d | Packaging: tag-triggered release | **shipped** |
 
 Shipped items 1–3 also fixed three things the comparison did not predict: enigo
@@ -52,39 +52,54 @@ story from doubling. Either way the work splits into a small `voxide-overlay`
 binary, an IPC channel (the existing `$XDG_RUNTIME_DIR` trigger socket already
 proves the pattern), and deleting the webview overlay path.
 
-Do this before item 6b: it removes a whole class of bug rather than adding a
-capability, and the overlay is on the latency path.
+### Built: `voxide-overlay`
 
-## 6a. Eager chunked transcription — declined, with reasons
+SCTK was taken over GTK 4, and `src/bin/voxide_overlay.rs` now creates a real
+layer surface. Verified on screen rather than assumed — niri reports it:
 
-Voxtype's `eager.rs` chunks audio during recording, decodes chunks in parallel and
-stitches them at the boundaries, so decode work overlaps capture instead of
-starting at the stop. Recommending it for Voxide was a mistake in the original
-comparison: it was drawn from voxtype's module list without checking what Voxide
-already does.
+```text
+Overlay layer:
+  Surface:
+    Namespace: "voxide"
+    Keyboard interactivity: none
+```
 
-**The latency win already exists here.** `spawn_live_whisper_preview` decodes
-during capture — a rolling 8-second window every 600 ms, paced by how long
-transcription actually takes on the machine. Voxtype needs `eager.rs` because it
-has no live preview; Voxide has had one all along. What overlapping decode with
-capture buys, this codebase already banks.
+Overlay layer, correct namespace, and **non-focusable**, which is the property the
+webview overlay could never guarantee. Sizes are logical, so the scaled-output bug
+that the webview version needed a fix for cannot recur.
 
-**And the mechanism eager mode needs is known to regress here.** Chunk-and-stitch
-requires cutting mid-utterance and reassembling. That was tried in this codebase
-and *measurably lost words*, which is why VAD is a gate on the whole utterance
-rather than a segmenter and why the final pass decodes the complete buffer. Adding
-eager chunking would reintroduce a regression that was deliberately removed.
+Two SCTK 0.21 details that cost time. The per-protocol `delegate_compositor!`,
+`delegate_output!`, `delegate_shm!` and `delegate_layer!` macros were removed after
+0.19 and replaced by a single `delegate_dispatch2!`. And a frame callback's
+userdata must be wrapped in `compositor::FrameCallbackData` so SCTK can route it
+back to `CompositorHandler::frame`.
 
-`INFERENCE_LOCK` independently caps the gain: concurrent decodes on one
-`WhisperContext` corrupt results, so chunks would queue rather than parallelise
-unless a second context were built — costing exactly the memory the warm-context
-cache and the new idle timeout exist to bound.
+Teardown does not use `blocking_dispatch`: that parks until the compositor sends
+something, so an idle overlay would outlive its deadline. The loop drains pending
+events, flushes, and sleeps a frame instead.
 
-The one genuine remaining gap is narrower than the item as written: the final pass
-re-decodes audio the preview has already seen, so preview work is thrown away. If
-that is worth reclaiming it should be framed as *reusing the preview's output*,
-not as chunking, and it needs the measurement below first — instrument `decode_ms`
-against wall-clock capture and see how much is actually recoverable.
+**Remaining:** text rendering (needs a font stack), and the IPC that will drive the
+level from the running app — `crate::trigger`'s socket is the pattern. Then delete
+the webview overlay path. Gated behind `overlay-layer-shell` with a
+`required-features` bin target until then, so no default build is affected.
+
+## 6a. Eager chunked transcription
+
+Whisper currently waits for the recording to stop before decoding. Chunk during
+capture with a small overlap, decode chunks concurrently, and stitch with
+deduplication at the boundaries — voxtype's `eager.rs` is the reference.
+
+Two constraints specific to this codebase. `INFERENCE_LOCK` in `speech.rs`
+serialises inference because concurrent decodes on one `WhisperContext` corrupt
+results, so chunks queue rather than truly parallelise unless a second context is
+built — which costs the memory the warm-context cache exists to avoid. And VAD is
+deliberately a gate on the whole utterance, not a segmenter: mid-utterance
+segmentation was tried and measurably lost words. Chunk boundaries must therefore
+not be VAD-derived.
+
+Because of the inference lock the honest win here is *perceived* latency on slow
+CPUs, not throughput. Worth measuring before building: instrument the existing
+`decode_ms` against wall-clock capture and see how much is actually recoverable.
 
 ## 6b. GTCRN speech enhancement
 
@@ -92,53 +107,29 @@ A 48k-parameter, ~520 KB ONNX denoiser in front of the ASR, cleaning noise and
 speaker bleed-through. Useful for plain dictation on a bad microphone, not just
 for meeting capture.
 
-`denoise.rs` implements it behind the `denoise` feature. The model is streaming
-with fully static shapes: one STFT frame in (`[1, 257, 1, 2]`, interleaved real
-and imaginary), one enhanced frame out, plus three recurrent caches threaded from
-call to call. Caches start zeroed per utterance so one recording cannot leak into
-the next.
+ONNX exports are on the Hub — `bitsydarel/gtcrn-onnx` and the sherpa-onnx
+variants. The STFT front end already exists in `cohere_fbank.rs` and can be
+generalised: GTCRN wants 512-point FFT with a 256 hop and a sqrt-Hann window,
+against Cohere's 512/160 and symmetric Hann.
 
-STFT is 512-point with a 256 hop and a **sqrt-Hann** window used for both analysis
-and synthesis: squared it is a periodic Hann, which sums to exactly 1 at 50%
-overlap, so overlap-add is unity gain with no correction pass.
+Gate it behind a setting that defaults **off**, and verify on real recordings
+before recommending it — a denoiser that removes phonemes along with noise makes
+transcription worse, and the failure is invisible without listening.
 
-Verified objectively rather than by ear: a 300 Hz tone under a 4 Hz envelope plus
-deterministic broadband noise goes in at **6.01 dB SNR and comes out at
-10.47 dB — a 4.46 dB gain**. That one number validates the whole chain, because
-the window, hop, scaling, conjugate mirror and cache threading all have to be
-correct for noise to fall instead of the signal garbling.
+## 6c. GPU isolation option
 
-`ort` uses `load-dynamic`, so onnxruntime is dlopened at runtime instead of linked
-at build time — the build host needs no ONNX Runtime, and `ORT_DYLIB_PATH` can
-point at the copy the Parakeet runtime already ships.
+whisper.cpp does not return GPU memory after an in-process transcription, so VRAM
+grows across a long session. voxtype's answer is an opt-in subprocess that
+transcribes and exits, trading model-load latency for bounded memory.
 
-**Still to do:** wire it into the capture path behind a setting that defaults
-off, and validate on real recordings. An SNR gain on synthetic noise is not proof
-it preserves phonemes, and that failure is invisible without listening.
+Voxide already has the harder half of this: `nemotron.rs` runs a child process
+and streams PCM to it over stdin, and `pronunciation.rs` does the same for a
+sidecar. The pattern to copy is local. What needs deciding is the default —
+voxtype's guidance is explicitly not to assume users want isolation, because
+keeping the model warm is why the second dictation is fast.
 
-## 6c. Bounded GPU memory on idle — shipped, not as a subprocess
-
-The problem voxtype solves with GPU isolation is that whisper.cpp holds GPU memory
-for as long as a context is alive, so an app left open after one dictation keeps a
-multi-gigabyte model resident. Its answer is an opt-in child process that
-transcribes and exits.
-
-Voxide solves the same problem by releasing the warm caches after
-`MODEL_IDLE_TIMEOUT` (5 minutes) of no use, swept several times per window from a
-background task. Chosen over the subprocess because it costs nothing on the case
-that actually matters — dictations that follow one another keep the model warm and
-reload nothing — whereas isolation pays a model load every time. voxtype's own
-guidance is not to assume users want isolation for exactly that reason, which makes
-an idle timeout the better default rather than a second mode to explain.
-
-`release_idle_models` takes `INFERENCE_LOCK` before dropping anything, since
-freeing a context underneath a running decode would be a use-after-free; if a
-decode holds the lock it declines and the next sweep retries. States are dropped
-before the context they borrow from.
-
-Not covered: a single very long session that never idles, if whisper-rs leaks
-across decodes on one context. Subprocess isolation is the fallback, and the
-child-process pattern already exists in `nemotron.rs` and `pronunciation.rs`.
+Measure first: log VRAM across a long session and confirm the growth is real on
+this whisper-rs version before adding a mode.
 
 ## 6d. Packaging
 

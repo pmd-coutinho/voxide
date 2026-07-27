@@ -33,6 +33,10 @@ mod apple_speech;
 mod asr;
 mod asr_adapter;
 mod audio;
+#[cfg(feature = "cohere")]
+mod cohere;
+#[cfg(feature = "cohere")]
+mod cohere_fbank;
 #[cfg(target_os = "linux")]
 mod compositor_bindings;
 mod debug_log;

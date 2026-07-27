@@ -39,18 +39,31 @@ cuda = ["whisper-rs/cuda", "parakeet"]
 # of recognition. Opt-in because a denoiser that strips phonemes along with noise
 # makes transcription worse, and that failure is inaudible in the metrics.
 denoise = ["dep:rustfft", "dep:ort", "dep:ndarray"]
+# Cohere Transcribe: a CPU-capable engine for hosts without an NVIDIA GPU.
+# See docs/COHERE_ENGINE.md. `rustfft` backs the NeMo-style log-mel front end.
+cohere = ["dep:rustfft", "dep:ort", "dep:tokenizers", "dep:half", "dep:ndarray"]
+# The dictation overlay as a wlr-layer-shell surface in its own process. It has
+# to be a separate binary: Tauri links webkit2gtk-4.1 (GTK 3) and GTK 3 cannot
+# share a process with GTK 4, so gtk4-layer-shell is unusable from the app.
+# SCTK + shm rather than GTK 4 or wgpu keeps it to one dependency stack.
+overlay-layer-shell = ["dep:smithay-client-toolkit"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
 active-win-pos-rs = "0.11.0"
-# All three are built only with the `denoise` feature.
+# Optional throughout: only the feature that names each one builds it, so the
+# default, vulkan and cuda builds pull in none of them.
 rustfft = { version = "6", optional = true }
-# `load-dynamic` so onnxruntime is dlopened at runtime rather than linked at
-# build time: the build host then needs no ONNX Runtime, and the library can be
-# the one the Parakeet runtime already ships. Point ORT_DYLIB_PATH at it.
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "load-dynamic"] }
+smithay-client-toolkit = { version = "0.21", optional = true }
+# `half` for the q4f16 K/V cache and logits; `load-dynamic` so onnxruntime is
+# dlopened rather than linked, which leaves the build host needing no ONNX Runtime
+# and lets ORT_DYLIB_PATH point at the library the Parakeet runtime already ships.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "half", "load-dynamic"] }
+# Decodes Cohere's 16384-entry vocabulary.
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+half = { version = "2", optional = true }
 ndarray = { version = "0.16", optional = true }
 chrono = { version = "0.4.42", features = ["serde"] }
 axum = "0.8.9"
@@ -110,3 +123,8 @@ objc2-speech = { version = "0.3.2", default-features = false, features = ["std",
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[[bin]]
+name = "voxide-overlay"
+path = "src/bin/voxide_overlay.rs"
+required-features = ["overlay-layer-shell"]
