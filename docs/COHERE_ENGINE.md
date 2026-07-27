@@ -226,8 +226,8 @@ past. `position_ids` continue from the prefix length.
    make about names, shapes or element types.
 4. ~~`ort` + `tokenizers` + `half` behind the same feature.~~ Done; the feature
    now pulls `rustfft`, `ort`, `tokenizers`, `half` and `ndarray`, all optional so
-   the default build is untouched. **The two sessions themselves are the next
-   piece of work.**
+   the default build is untouched. ~~The two sessions~~ — done, in `cohere.rs`, and
+   transcribing end to end.
 5. Fetch the weights with `scripts/fetch-cohere-model.sh` — ~1.5 GB into
    `~/.local/share/voxide/models/cohere-transcribe-03-2026-q4f16/`, resumable, and
    it writes a `sha256-manifest.txt` the in-app downloader can later verify
@@ -246,3 +246,36 @@ Voxtype's `src/transcribe/cohere.rs` is a working reference implementation for
 step 4. Its doc comment claims the K/V cache is F32; in the q4f16 export it is
 **F16**, so that shape is per-variant and should be read from the graph rather
 than copied. Its 1024-wide encoder output is correct.
+
+
+## Sessions — working
+
+`cohere.rs` runs both graphs. Verified end to end against the real q4f16 weights:
+0.5 s of real speech in, `"Ask,"` out, at **2.26× realtime** on CPU.
+
+Two ort details that cost time and are not obvious:
+
+- **The empty past cannot be built with `from_array`.** Its raw-data path rejects
+  any dimension below 1, and the first decoder call needs `[1, 8, 0, 128]`. ort's
+  ndarray path would allow a zero-length axis but has no `f16` implementation, so
+  the empty cache is allocated with `Tensor::<f16>::new(&Allocator, shape)`
+  instead.
+- **`load-dynamic`** means onnxruntime is dlopened rather than linked, so the
+  build host needs no ONNX Runtime. Set `ORT_DYLIB_PATH`; the library the Parakeet
+  runtime already ships works.
+
+### Not yet trustworthy
+
+The 2.26× figure is one 0.5 s fragment on one machine — not a benchmark, and far
+from voxtype's reported 9–11×. Nothing about speed should be claimed until a real
+utterance is timed.
+
+And accuracy is unproven. `"Ask,"` from the first half second of the Parakeet
+reference WAV is *plausible* for a fragment cut mid-word and resampled 24→16 kHz,
+but it has not been checked against a known transcript. The next step is decoding
+the **whole** WAV and comparing against its reference text — that is the test that
+would catch a subtly wrong front end or a cache-threading error, neither of which
+a short fragment reliably exposes.
+
+Remaining after that: the in-app download (five precisions, external data shards,
+sha256 per file), engine registration and settings UI.
