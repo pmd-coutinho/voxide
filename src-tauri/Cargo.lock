@@ -4304,6 +4304,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "reis"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3fedd2777cde52c1be5e572efbec485eac7b801c47820eda388d4f13b9c4b"
+dependencies = [
+ "enumflags2",
+ "log",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6375,6 +6386,7 @@ dependencies = [
  "cpal",
  "directories",
  "enigo",
+ "enumflags2",
  "futures-util",
  "hound",
  "keyring",
@@ -6383,6 +6395,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-speech",
  "regex",
+ "reis",
  "reqwest 0.12.28",
  "rtrb",
  "serde",
@@ -6405,6 +6418,7 @@ dependencies = [
  "uuid",
  "whisper-rs",
  "whisper-rs-sys",
+ "xkbcommon",
  "zip",
 ]
 

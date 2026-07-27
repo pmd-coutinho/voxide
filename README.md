@@ -139,6 +139,22 @@ Supported trigger actions: `dictate`, `prompt`, `command`, `rewrite`, `cancel`, 
 
 Voxide enforces a single running instance — launching it again focuses the existing window, which also works as a "bring it back from the tray" gesture.
 
+## Text insertion on Wayland
+
+No single protocol can type into the focused window on every Wayland desktop, so Voxide tries the available ones in order and stops at the first that works. Settings → Global dictation reports the resolved order for the current session.
+
+| Order | Protocol | Available on | Notes |
+| ----- | -------- | ------------ | ----- |
+| 1 | `zwp_virtual_keyboard_v1` | wlroots compositors — Sway, Niri, Hyprland, river | Supplies its own keymap, so any Unicode is typed regardless of your layout. |
+| 2 | XTEST | X11, and Wayland sessions whose compositor forwards Xwayland's XTEST (Mutter, KWin) | Unavailable in a pure-Wayland session with Xwayland disabled. |
+| 3 | libei via `org.freedesktop.portal.RemoteDesktop` | GNOME, KDE | Needs one-time permission approval; used for the clipboard paste only (see below). |
+
+Each protocol is used exclusively. This matters because `enigo`, the input library Voxide uses for the first two, connects to every protocol it can and forwards each keystroke to all of them at once — on a Wayland session that also runs Xwayland that means the text is synthesized twice. Voxide pins the display name of the protocols a given attempt does not own so only one connection is ever live.
+
+libei is restricted to sending Ctrl+V rather than typing the text. Unlike the virtual-keyboard protocol, libei hands the client the *compositor's* keymap instead of accepting one, so it can only reach keysyms your active layout already has — enough for the clipboard shortcuts, not enough for arbitrary dictation on a Dvorak or Cyrillic layout. The text itself travels through the clipboard, which carries any Unicode faithfully, and the previous clipboard contents are restored afterwards.
+
+The first libei dictation on GNOME or KDE raises a "remote control" permission dialog. That dictation reports a failure rather than blocking until you notice the dialog; approving it lets every later dictation through, and the portal's restore token is cached so approval is only asked for once.
+
 ## Microphone selection on Linux
 
 On PipeWire and PulseAudio desktops the microphone picker lists the sound server's actual sources (your headset, the built-in microphone, …) rather than raw ALSA PCM names, and capture is routed to the selected source. This uses `pactl` when available and falls back to ALSA device enumeration otherwise. Selecting a specific microphone also prevents Bluetooth headphones from being forced into their low-quality headset profile when you dictate.
