@@ -150,11 +150,30 @@ The end-to-end oracle is stronger and worth doing once the sessions are wired: r
 a known WAV all the way through and check the transcript. A front end that is
 wrong in a way tolerance-testing misses will still produce visibly wrong words.
 
+### One detail that only reading the reference reveals
+
+`features_lengths` is computed as
+`(audio_len + 2 * (n_fft / 2) - n_fft) / hop`, which for 8000 samples gives
+**50** — one fewer than the 51 frames the centred STFT actually produces. The
+reference therefore takes its per-bin mean and variance over the first 50 frames
+(with a `49` denominator), scales all 51 by them, and then **zeroes the last one**
+through the attention mask.
+
+Missing this is not a boundary curiosity. Using 51 frames for the statistics
+shifts every bin of every frame by roughly 0.1 in normalised space — around 10% —
+while looking entirely plausible. It was caught only by comparing element for
+element against the reference output.
+
 ## Remaining work
 
-1. `cohere` cargo feature; `ort` + `tokenizers` + `ndarray` behind it. `ort` is
-   already an optional dependency shape used by nothing else here.
-2. `cohere_fbank.rs` — the algorithm above, plus its reference-comparison test.
+1. ~~`cohere` cargo feature.~~ Done: `cohere = ["dep:rustfft"]`.
+2. ~~`cohere_fbank.rs` — the algorithm above, plus its reference-comparison
+   test.~~ Done and verified against `CohereAsrFeatureExtractor` element for
+   element: worst deviation 4.2e-4 on a synthetic chirp and 2.5e-5 on real
+   speech, both within float32 STFT ordering noise. Two fixtures live in
+   `src-tauri/fixtures/`; regenerate them with the reference env described above.
+   The module is `#![allow(dead_code)]` until step 3 consumes it.
+3. `ort` + `tokenizers` behind the same feature.
 3. `cohere.rs` — two ONNX sessions. The decoder is *merged*: one graph serves the
    prefix-fill pass (empty past, multi-token input) and incremental generation
    (full past, single token). Encoder K/V is projected on the first decoder call
