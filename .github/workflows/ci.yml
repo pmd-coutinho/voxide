@@ -142,6 +142,9 @@ jobs:
       VOXIDE_PARAKEET_MODEL_DIR: ${{ vars.VOXIDE_PARAKEET_MODEL_DIR }}
       VOXIDE_SHERPA_ONNX_LIB_DIR: ${{ vars.VOXIDE_SHERPA_ONNX_LIB_DIR }}
       VOXIDE_PARAKEET_CUDA_LIB_DIRS: ${{ vars.VOXIDE_PARAKEET_CUDA_LIB_DIRS }}
+      # Compute capability of the runner's GPU. Overridable so a different GPU
+      # does not need a workflow edit; sm_89 is the RTX 40-series default.
+      VOXIDE_CMAKE_CUDA_ARCHITECTURES: ${{ vars.VOXIDE_CMAKE_CUDA_ARCHITECTURES }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Verify NVIDIA/CUDA runner contract
@@ -161,6 +164,13 @@ jobs:
           echo "SHERPA_ONNX_LIB_DIR=$VOXIDE_SHERPA_ONNX_LIB_DIR" >> "$GITHUB_ENV"
           echo "PARAKEET_CUDA_LIB_DIRS=$VOXIDE_PARAKEET_CUDA_LIB_DIRS" >> "$GITHUB_ENV"
           echo "$VOXIDE_CUDA_HOME/bin" >> "$GITHUB_PATH"
+          # GGML's CUDA backend is compiled by CMake through nvcc, which refuses
+          # a host GCC newer than it knows about — the runner is on GCC 16 while
+          # nvcc 13.3 caps at 15, so CUDA compiler detection fails outright
+          # without this. GGML itself builds fine under GCC 16 once allowed.
+          # Pinning the architecture also avoids compiling every other one.
+          echo "CMAKE_CUDA_FLAGS=--allow-unsupported-compiler" >> "$GITHUB_ENV"
+          echo "CMAKE_CUDA_ARCHITECTURES=${VOXIDE_CMAKE_CUDA_ARCHITECTURES:-89}" >> "$GITHUB_ENV"
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt --component clippy
       - name: Check formatting
@@ -178,6 +188,14 @@ jobs:
       - name: Lint CUDA Rust target
         working-directory: src-tauri
         run: cargo +1.89 clippy --lib --features cuda -- -D warnings
+      # Same reason as the portable jobs: `custom-protocol` embeds dist/, which is
+      # gitignored, so `generate_context!` panics unless it is built first.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build the frontend Tauri will embed
+        run: npm ci && npm run build
       - name: Build CUDA release target
         working-directory: src-tauri
         run: cargo +1.89 build --release --features cuda,custom-protocol
