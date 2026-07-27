@@ -35,6 +35,8 @@ mod asr_adapter;
 mod audio;
 mod debug_log;
 mod formatting;
+#[cfg(target_os = "linux")]
+mod libei_input;
 mod local_api;
 mod media;
 mod nemotron;
@@ -10464,6 +10466,14 @@ fn configure_hotkeys(
     Ok(settings)
 }
 
+/// Reports which text-insertion backends this desktop session offers, in the
+/// order they are tried. Read-only: it never synthesizes input and never asks
+/// the portal for permission.
+#[tauri::command]
+fn text_insertion_status() -> typing::InsertionDiagnostics {
+    typing::insertion_diagnostics()
+}
+
 #[tauri::command]
 fn hotkey_backend_status(app: AppHandle) -> HotkeyBackendStatus {
     #[cfg(target_os = "linux")]
@@ -11050,6 +11060,7 @@ pub fn run() {
             set_primary_hotkey,
             configure_hotkeys,
             hotkey_backend_status,
+            text_insertion_status,
             resize_overlay_to_content
         ])
         .run(tauri::generate_context!())

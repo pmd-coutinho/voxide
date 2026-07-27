@@ -330,8 +330,10 @@ input[type="range"] { padding: 0; }
 .shortcut-control input { font-family: var(--font-mono); font-size: 12px; }
 .shortcut-control button { padding: 8px 11px; font-size: 12px; }
 
-.hotkey-backend-status { margin: 0; font-size: 12px; }
-.hotkey-backend-status.warning { padding: 9px 11px; border: 1px solid var(--warn-line); border-radius: var(--radius-small); color: var(--warn-text) !important; background: var(--warn-bg); }
+/* Shared by the hotkey-backend and text-insertion readouts, which report the
+   same kind of thing: which desktop protocol a feature resolved to. */
+.backend-status { margin: 0; font-size: 12px; }
+.backend-status.warning { padding: 9px 11px; border: 1px solid var(--warn-line); border-radius: var(--radius-small); color: var(--warn-text) !important; background: var(--warn-bg); }
 
 /* ---------- Overlay (always iron, independent of theme) ---------- */
 
