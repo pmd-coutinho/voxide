@@ -88,6 +88,10 @@ impl AnalyticsService {
     }
 
     pub fn capture(&self, event_name: &str, enabled: bool, mut properties: Map<String, Value>) {
+        // Empty only because this build supplied no VOXIDE_POSTHOG_KEY. clippy
+        // folds the const away and calls the check redundant; it is what keeps
+        // source builds and forks from sending anything, so it has to stay.
+        #[allow(clippy::const_is_empty)]
         if POSTHOG_API_KEY.is_empty() {
             return;
         }
@@ -150,6 +154,7 @@ impl AnalyticsService {
                 Ok(core) => core,
                 Err(_) => return,
             };
+            #[allow(clippy::const_is_empty)] // See `capture`: build-time key, not a constant truth.
             if !core.enabled || core.queue.is_empty() || POSTHOG_API_KEY.is_empty() {
                 return;
             }

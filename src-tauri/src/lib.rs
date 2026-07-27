@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Write},
@@ -175,7 +176,7 @@ impl Default for AppDatabase {
 fn normalize_command_chats(database: &mut AppDatabase) {
     database
         .command_chats
-        .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        .sort_by_key(|chat| Reverse(chat.updated_at));
     database.command_chats.truncate(30);
     for chat in &mut database.command_chats {
         if chat.messages.len() > 100 {
@@ -353,7 +354,7 @@ fn normalize_database(database: &mut AppDatabase) {
     }
     database
         .file_transcription_history
-        .sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        .sort_by_key(|entry| Reverse(entry.created_at));
     database.file_transcription_history.truncate(50);
     restore_missing_builtin_provider_profiles(&mut database.ai_providers);
     if database.ai_providers.iter().all(|profile| !profile.enabled) {
@@ -427,7 +428,7 @@ fn normalize_database(database: &mut AppDatabase) {
             && database.prompt_profiles.iter().any(|profile| {
                 profile.mode == binding.mode && profile.id == binding.prompt_profile_id
             })
-            && seen_app_bindings.insert((binding.mode.clone(), application.to_lowercase()))
+            && seen_app_bindings.insert((binding.mode, application.to_lowercase()))
     });
     for assignment in &mut database.settings.prompt_shortcut_assignments {
         assignment.prompt_profile_id = assignment.prompt_profile_id.trim().to_owned();
@@ -2203,7 +2204,7 @@ fn abort_failed_capture(app: &AppHandle, session_id: u64, stream_errors: u64) {
         "Capture failed unrecoverably (session: {session_id}, stream_errors: {stream_errors})"
     ));
     emit_overlay(
-        &app,
+        app,
         "error",
         "Microphone connection lost. Reconnect or reselect the input device.",
     );
@@ -2284,10 +2285,13 @@ struct ContinuousDictationContext {
 
 impl ContinuousDictationContext {
     fn preceding_text_for(&self, application: Option<&str>, window_title: Option<&str>) -> String {
-        (self.source_application.as_deref() == application
-            && self.source_window_title.as_deref() == window_title)
-            .then(|| self.inserted_text.clone())
-            .unwrap_or_default()
+        if self.source_application.as_deref() == application
+            && self.source_window_title.as_deref() == window_title
+        {
+            self.inserted_text.clone()
+        } else {
+            String::new()
+        }
     }
 
     fn record(&mut self, application: Option<String>, window_title: Option<String>, text: String) {
@@ -2936,6 +2940,9 @@ async fn import_backup(
     Ok(restored)
 }
 
+// A Tauri command's parameter list is its IPC contract; grouping these would
+// change the shape the frontend has to send.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn save_dictation(
     state: State<'_, AppState>,
@@ -3987,7 +3994,7 @@ fn apply_reasoning_configuration(
     database: &AppDatabase,
     profile: &mut provider::AiProviderProfile,
 ) {
-    if let Some(config) = database.settings.reasoning_config_for(&profile) {
+    if let Some(config) = database.settings.reasoning_config_for(profile) {
         let parameter_name = config.parameter_name.trim();
         let parameter_value = config.parameter_value.trim();
         if !parameter_name.is_empty() {
@@ -4237,7 +4244,7 @@ fn command_chats(state: State<'_, AppState>) -> Result<Vec<CommandChat>, String>
         .lock()
         .map_err(|_| "Voxide data lock was poisoned".to_string())?;
     let mut chats = database.command_chats.clone();
-    chats.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    chats.sort_by_key(|chat| Reverse(chat.updated_at));
     Ok(chats)
 }
 
@@ -4408,6 +4415,9 @@ fn platform_command_guidance() -> &'static str {
     "The user is on Linux and reviewed commands run in POSIX sh. Use standard shell commands and only use desktop-automation utilities after checking that they are available."
 }
 
+// Profile, credentials, prompts and the two callbacks are independent inputs
+// that a wrapper struct would only forward verbatim.
+#[allow(clippy::too_many_arguments)]
 async fn request_command_plan<F, G>(
     profile: &provider::AiProviderProfile,
     api_key: Option<&str>,
@@ -4436,12 +4446,12 @@ where
         } else {
             provider::process_command_with_tools(profile, api_key, system_prompt, &messages).await
         };
-        match response {
-            Ok(response) => return command_plan_from_provider_response(response),
-            // Some local OpenAI-compatible servers deliberately do not expose
-            // function calling. Preserve Command Mode for those endpoints with
-            // the same JSON protocol used by previous app versions.
-            Err(_) => {}
+        // A failure here is deliberately swallowed: some local
+        // OpenAI-compatible servers do not expose function calling, and Command
+        // Mode stays available on those endpoints through the same JSON
+        // protocol used by previous app versions.
+        if let Ok(response) = response {
+            return command_plan_from_provider_response(response);
         }
     }
     let response = provider::process_with_options(
@@ -4920,7 +4930,7 @@ fn parse_command_plan(response: &str) -> Result<CommandPlan, String> {
             if plan
                 .answer
                 .as_deref()
-                .map_or(true, |answer| answer.trim().is_empty())
+                .is_none_or(|answer| answer.trim().is_empty())
             {
                 return Err("The AI provider returned an empty answer".into());
             }
@@ -5149,7 +5159,7 @@ fn apply_dictionary(text: &str, dictionary: &[DictionaryEntry]) -> String {
         .collect::<Vec<_>>();
     // The macOS implementation applies the longest escaped regex patterns first, so a
     // phrase such as "vox side" wins over a shorter overlapping "vox" trigger.
-    patterns.sort_by(|left, right| right.0.cmp(&left.0));
+    patterns.sort_by_key(|(length, _, _)| Reverse(*length));
 
     for (_, regex, replacement) in patterns {
         output = replace_dictionary_matches(&output, &regex, replacement);
@@ -5347,6 +5357,9 @@ fn fold_dictation_prompt(system_prompt: &str, transcript: &str) -> (String, Stri
     }
 }
 
+// The post-processing stage needs the whole dictation context: state, text,
+// timings, target application and mode all influence the result independently.
+#[allow(clippy::too_many_arguments)]
 async fn post_process_dictation_outcome(
     state: &AppState,
     raw_text: String,
@@ -5757,17 +5770,11 @@ fn calculate_usage_stats(
         total_words,
         total_characters,
         total_time_saved_minutes: time_saved_minutes(total_words, settings.user_typing_wpm),
-        average_words_per_dictation: if total_dictations == 0 {
-            0
-        } else {
-            total_words / total_dictations
-        },
+        average_words_per_dictation: total_words.checked_div(total_dictations).unwrap_or(0),
         ai_processed_count,
-        ai_enhancement_rate: if total_dictations == 0 {
-            0
-        } else {
-            ai_processed_count * 100 / total_dictations
-        },
+        ai_enhancement_rate: (ai_processed_count * 100)
+            .checked_div(total_dictations)
+            .unwrap_or(0),
         current_streak,
         best_streak,
         daily_activity_7: daily_usage(&day_totals, today, 7),
@@ -8686,6 +8693,9 @@ fn preview_words_match(previous: &str, current: &str) -> bool {
     previous.eq_ignore_ascii_case(current)
 }
 
+// Preview spawners take the capture timeline apart into its component handles;
+// see `asr_adapter::spawn_live_preview`, which passes the same set through.
+#[allow(clippy::too_many_arguments)]
 fn spawn_live_whisper_preview(
     app: AppHandle,
     preview_generation: u64,
@@ -9072,6 +9082,7 @@ fn spawn_live_parakeet_stream(
 /// preview above, this never re-decodes a growing recording: every successful
 /// poll sends only the samples captured since the previous poll to the Python
 /// sidecar, whose encoder/decoder caches retain the prior context.
+#[allow(clippy::too_many_arguments)] // Same capture-timeline argument set as the Whisper preview above.
 fn spawn_live_nemotron_stream(
     app: AppHandle,
     preview_generation: u64,
@@ -9154,12 +9165,12 @@ fn spawn_live_nemotron_stream(
                     } else {
                         Ok(())
                     }
-                    .and_then(|()| {
+                    .map(|()| {
                         let start = live.fed_samples.min(samples.len());
                         if start == samples.len() {
-                            return Ok(None);
+                            return None;
                         }
-                        Ok(Some(samples[start..].to_vec()))
+                        Some(samples[start..].to_vec())
                     })
                 }
             };
@@ -9438,6 +9449,7 @@ fn transcribe_parakeet_final(
 /// polling task has not observed yet. When a user stops immediately after
 /// recording starts, this lazily creates the same stream and feeds the whole
 /// recording, so final transcription never depends on preview timing.
+#[allow(clippy::too_many_arguments)] // Mirrors `spawn_live_nemotron_stream`'s inputs so the lazy path matches the polled one.
 async fn finish_nemotron_live(
     capture_state: &NativeCaptureState,
     recording_generation: u64,
@@ -9512,6 +9524,8 @@ fn capture_clock_diverges(wall_duration_ms: u64, canonical_duration_ms: u64) -> 
     !(0.5..=1.5).contains(&ratio)
 }
 
+// As with `save_dictation`, the parameter list is the IPC contract.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn stop_native_dictation(
     app: AppHandle,

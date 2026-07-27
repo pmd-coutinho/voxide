@@ -414,6 +414,10 @@ pub async fn process_with_options_timeout(
     }
 }
 
+// Streaming needs the profile, credentials, prompt, transcript, cancellation
+// flag and per-chunk sink as separate values; grouping them would only move the
+// list into a struct literal at every call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_streaming_with_options<F>(
     profile: &AiProviderProfile,
     api_key: Option<&str>,
@@ -1682,7 +1686,7 @@ async fn process_openai_compatible(
             format!("{} returned an unsupported response: {error}", profile.name)
         })?;
         responses_output_text(&response)
-            .and_then(|text| nonempty_nonstream_text(text))
+            .and_then(nonempty_nonstream_text)
             .ok_or_else(|| format!("{} returned an empty response", profile.name))
     } else {
         let response: OpenAiResponse = serde_json::from_str(&body).map_err(|error| {
@@ -1697,7 +1701,7 @@ async fn process_openai_compatible(
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 async fn process_openai_compatible_streaming(
     profile: &AiProviderProfile,
     api_key: Option<&str>,
@@ -1950,7 +1954,7 @@ fn split_nonstream_thinking_tags(text: &str) -> (String, Option<String>) {
     (result, filter.thinking())
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 async fn process_anthropic_streaming(
     profile: &AiProviderProfile,
     api_key: Option<&str>,
