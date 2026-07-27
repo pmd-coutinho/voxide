@@ -16,7 +16,7 @@ checking before coding, not after.
 | 6a | Eager chunked transcription | planned |
 | 6b | GTCRN speech enhancement | planned; model located |
 | 6c | GPU isolation option | planned |
-| 6d | Packaging | planned |
+| 6d | Packaging: tag-triggered release | **shipped** |
 
 Shipped items 1–3 also fixed three things the comparison did not predict: enigo
 fans every keystroke out to *all* connected Linux backends (so text was
@@ -109,11 +109,19 @@ this whisper-rs version before adding a mode.
 distribution rather than formats: AUR, Nix, Homebrew, and signed prebuilt binaries
 from a reproducible pipeline.
 
-The cheapest real improvement is a tag-triggered release workflow that builds the
-portable Linux, macOS and Windows binaries and attaches them to a GitHub release —
-CI already proves all three compile, so this is wiring rather than new ground. Note
-the CUDA build cannot be part of it: that job is manual-dispatch only now, with no
-runner (see `check-cuda.sh`).
+`.github/workflows/release.yml` now covers the first half of that: pushing a
+`v*` tag builds the portable Linux, macOS and Windows binaries on the toolchain CI
+gates against, renames them per platform, and attaches them to a GitHub release
+with a `SHA256SUMS.txt`. `workflow_dispatch` runs the builds but stops before
+publishing, so it doubles as a dry run against a branch.
+
+Deliberately absent: the CUDA build. It needs a self-hosted GPU runner and there
+is none, so a release must not claim GPU support it was never built with — build
+it locally with `scripts/check-cuda.sh` and attach it by hand.
+
+Still open: AUR, Nix and Homebrew, and the deb/rpm/AppImage bundles (which need
+`libappindicator-gtk3-devel` and `librsvg2-devel` for pkg-config, plus `NO_STRIP=1`
+on distributions with `.relr.dyn` sections).
 
 Two host-specific facts worth keeping: AppImage bundling needs `NO_STRIP=1` on
 distributions with `.relr.dyn` sections, and the bundler wants
