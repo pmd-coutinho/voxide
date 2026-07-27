@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     ffi::{c_void, CStr},
     os::raw::c_int,
     path::{Path, PathBuf},
@@ -341,6 +340,8 @@ fn has_hardware_gpu_backend() -> bool {
 fn physical_cpu_count() -> usize {
     #[cfg(target_os = "linux")]
     {
+        use std::collections::HashSet;
+
         let mut cores = HashSet::new();
         if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
             for entry in entries.flatten() {

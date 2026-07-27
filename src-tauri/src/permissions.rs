@@ -15,7 +15,7 @@ pub fn accessibility_trusted() -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
         // AXIsProcessTrusted returns the C `Boolean` type (an unsigned byte).
-        return Some(unsafe { AXIsProcessTrusted() != 0 });
+        Some(unsafe { AXIsProcessTrusted() != 0 })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -45,7 +45,7 @@ pub fn open_accessibility_settings() -> Result<(), String> {
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
             .spawn()
             .map_err(|error| format!("Could not open macOS Accessibility settings: {error}"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
@@ -55,7 +55,7 @@ pub fn open_accessibility_settings() -> Result<(), String> {
             .map_err(|error| {
                 format!("Could not open Windows keyboard accessibility settings: {error}")
             })?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
