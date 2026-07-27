@@ -93,7 +93,7 @@ fn redact_sensitive_tokens(value: &str) -> String {
                 || token.contains("\\\\")
                 || (token.len() > 2
                     && token.as_bytes()[1] == b':'
-                    && matches!(token.as_bytes()[0], b'a'..=b'z' | b'A'..=b'Z'));
+                    && token.as_bytes()[0].is_ascii_alphabetic());
             let looks_like_url = token.contains("://");
             let looks_like_secret = lower.contains("api_key")
                 || lower.contains("authorization")

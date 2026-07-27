@@ -3,11 +3,16 @@
 /// It intentionally knows nothing about audio or models: the caller owns those
 /// resources, while this type makes illegal overlapping and stale terminal
 /// transitions impossible to miss in tests and diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SessionState {
+    #[default]
     Idle,
-    Recording { id: u64 },
-    Finalizing { id: u64 },
+    Recording {
+        id: u64,
+    },
+    Finalizing {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,12 +27,6 @@ pub struct Coordinator {
     next_id: u64,
     state: SessionState,
     preview_in_flight: Option<u64>,
-}
-
-impl Default for SessionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl Coordinator {

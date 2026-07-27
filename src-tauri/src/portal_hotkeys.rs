@@ -314,7 +314,7 @@ async fn register_host_app(portal: &GlobalShortcuts<'_>, app: &AppHandle) -> Res
 }
 
 fn session_matches(session_path: Option<&str>, event_session: &str) -> bool {
-    session_path.map_or(true, |path| path == event_session)
+    session_path.is_none_or(|path| path == event_session)
 }
 
 fn emit_hotkey(

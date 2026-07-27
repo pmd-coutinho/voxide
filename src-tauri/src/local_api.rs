@@ -704,7 +704,6 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
             }
             match path {
                 Some(path) => {
-                    let path = std::path::PathBuf::from(path);
                     match tauri::async_runtime::spawn_blocking(move || {
                         speech::transcribe_media_file(
                             &path,
@@ -786,23 +785,20 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                 );
             }
             let result = match path {
-                Some(path) => {
-                    let path = std::path::PathBuf::from(path);
-                    tauri::async_runtime::spawn_blocking(move || {
-                        parakeet::transcribe_media_file(&path, &model_path, None).map(
-                            |(text, duration_ms)| {
-                                let sample_count = duration_ms
-                                    .saturating_mul(16)
-                                    .try_into()
-                                    .unwrap_or(usize::MAX);
-                                (text, sample_count)
-                            },
-                        )
-                    })
-                    .await
-                    .map_err(|error| format!("Parakeet task failed: {error}"))
-                    .and_then(|result| result)
-                }
+                Some(path) => tauri::async_runtime::spawn_blocking(move || {
+                    parakeet::transcribe_media_file(&path, &model_path, None).map(
+                        |(text, duration_ms)| {
+                            let sample_count = duration_ms
+                                .saturating_mul(16)
+                                .try_into()
+                                .unwrap_or(usize::MAX);
+                            (text, sample_count)
+                        },
+                    )
+                })
+                .await
+                .map_err(|error| format!("Parakeet task failed: {error}"))
+                .and_then(|result| result),
                 None => {
                     let (samples, sample_count) = match raw_audio_path
                         .as_deref()
@@ -841,25 +837,22 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
                 Err(message) => return error(StatusCode::BAD_REQUEST, message),
             };
             let result = match path {
-                Some(path) => {
-                    let path = std::path::PathBuf::from(path);
-                    provider::transcribe_openai_compatible_media(
-                        &profile,
-                        api_key.as_deref(),
-                        &settings.cloud_transcription_model,
-                        &language,
-                        &path,
-                        None,
-                    )
-                    .await
-                    .map(|(text, duration_ms)| {
-                        let sample_count = duration_ms
-                            .saturating_mul(16)
-                            .try_into()
-                            .unwrap_or(usize::MAX);
-                        (text, sample_count)
-                    })
-                }
+                Some(path) => provider::transcribe_openai_compatible_media(
+                    &profile,
+                    api_key.as_deref(),
+                    &settings.cloud_transcription_model,
+                    &language,
+                    &path,
+                    None,
+                )
+                .await
+                .map(|(text, duration_ms)| {
+                    let sample_count = duration_ms
+                        .saturating_mul(16)
+                        .try_into()
+                        .unwrap_or(usize::MAX);
+                    (text, sample_count)
+                }),
                 None => {
                     let (samples, sample_count) = match raw_audio_path
                         .as_deref()
@@ -888,7 +881,6 @@ async fn transcribe(State(api): State<ApiState>, headers: HeaderMap, body: Bytes
         }
         VoiceEngine::AppleSpeech => match path {
             Some(path) => {
-                let path = std::path::PathBuf::from(path);
                 match tauri::async_runtime::spawn_blocking(move || {
                     transcribe_apple_media_file(&path, &language, &custom_words.phrases, None).map(
                         |(text, duration_ms)| {

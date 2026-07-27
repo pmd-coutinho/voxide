@@ -23,18 +23,22 @@ pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
 /// The most recently used Whisper model, kept warm across transcriptions.
 /// Loading a model reads hundreds of megabytes from disk, which would
 /// otherwise be paid at the start of every dictation.
-static CONTEXT_CACHE: OnceLock<Mutex<Option<(PathBuf, Arc<WhisperContext>)>>> = OnceLock::new();
+/// A warm artefact together with the model file it was built from, so a model
+/// switch is detected by comparing paths rather than by invalidating eagerly.
+type ModelKeyed<T> = OnceLock<Mutex<Option<(PathBuf, T)>>>;
+
+static CONTEXT_CACHE: ModelKeyed<Arc<WhisperContext>> = OnceLock::new();
 
 /// A state owns Whisper's reusable compute buffers. Previews deliberately
 /// keep their own state: an aborted preview must never leave the final decode
 /// reusing partial decoder state. Inference remains serialized below because
 /// the two states still share one Whisper context/GPU backend.
-static FINAL_STATE_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperState)>>> = OnceLock::new();
-static PREVIEW_STATE_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperState)>>> = OnceLock::new();
+static FINAL_STATE_CACHE: ModelKeyed<WhisperState> = OnceLock::new();
+static PREVIEW_STATE_CACHE: ModelKeyed<WhisperState> = OnceLock::new();
 
 /// Silero's model is small but loading it for every utterance is still
 /// needless startup work on the stop-to-text path.
-static VAD_CONTEXT_CACHE: OnceLock<Mutex<Option<(PathBuf, WhisperVadContext)>>> = OnceLock::new();
+static VAD_CONTEXT_CACHE: ModelKeyed<WhisperVadContext> = OnceLock::new();
 
 /// Serializes inference: the live preview and the final transcription share
 /// the warm context, and concurrent runs on one context corrupt each other
@@ -292,7 +296,7 @@ fn preferred_gpu_device() -> Option<c_int> {
                 continue;
             }
             let score = if discrete { 2 } else { 1 };
-            if best.map_or(true, |(best_score, _)| score > best_score) {
+            if best.is_none_or(|(best_score, _)| score > best_score) {
                 best = Some((score, gpu_index));
             }
             gpu_index += 1;
@@ -633,9 +637,9 @@ fn transcribe_samples(
     let mut cached_state = state_cache
         .lock()
         .map_err(|_| "Whisper state cache lock was poisoned".to_string())?;
-    if !cached_state
+    if cached_state
         .as_ref()
-        .is_some_and(|(path, _)| path == model_path)
+        .is_none_or(|(path, _)| path != model_path)
     {
         let state = context
             .create_state()

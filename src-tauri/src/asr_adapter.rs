@@ -88,6 +88,9 @@ impl VoiceEngine {
     /// Starts the selected engine's preview adapter. Each adapter receives the
     /// same canonical capture timeline and coordinator generation; only its
     /// declared preview mode determines how it consumes that timeline.
+    // Every argument is a distinct part of the capture timeline the adapters
+    // share; a params struct would be threaded through unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_live_preview(
         self,
         app: AppHandle,
