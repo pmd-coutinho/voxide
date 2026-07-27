@@ -37,15 +37,21 @@ parakeet = ["dep:sherpa-onnx"]
 cuda = ["whisper-rs/cuda", "parakeet"]
 # Cohere Transcribe: a CPU-capable engine for hosts without an NVIDIA GPU.
 # See docs/COHERE_ENGINE.md. `rustfft` backs the NeMo-style log-mel front end.
-cohere = ["dep:rustfft"]
+cohere = ["dep:rustfft", "dep:ort", "dep:tokenizers", "dep:half", "dep:ndarray"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
 active-win-pos-rs = "0.11.0"
-# Only built with the `cohere` feature; backs its log-mel front end.
+# All four are built only with the `cohere` feature. `ort` runs the encoder and
+# merged decoder, `tokenizers` decodes the 16384-entry vocabulary, and `half`
+# handles the q4f16 export's f16 K/V cache and logits.
 rustfft = { version = "6", optional = true }
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "half"] }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+half = { version = "2", optional = true }
+ndarray = { version = "0.16", optional = true }
 chrono = { version = "0.4.42", features = ["serde"] }
 axum = "0.8.9"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control", "image-data"] }

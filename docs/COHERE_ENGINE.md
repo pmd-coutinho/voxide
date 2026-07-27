@@ -224,16 +224,23 @@ past. `position_ids` continue from the prefix length.
    The module is `#![allow(dead_code)]` until step 3 consumes it.
 3. ~~Read the ONNX graph I/O contract.~~ Done, above — no assumptions left to
    make about names, shapes or element types.
-4. `ort` + `tokenizers` + `half` behind the same feature, and the two sessions.
+4. ~~`ort` + `tokenizers` + `half` behind the same feature.~~ Done; the feature
+   now pulls `rustfft`, `ort`, `tokenizers`, `half` and `ndarray`, all optional so
+   the default build is untouched. **The two sessions themselves are the next
+   piece of work.**
+5. Fetch the weights with `scripts/fetch-cohere-model.sh` — ~1.5 GB into
+   `~/.local/share/voxide/models/cohere-transcribe-03-2026-q4f16/`, resumable, and
+   it writes a `sha256-manifest.txt` the in-app downloader can later verify
+   against. Needed before the sessions can be tested at all.
 3. `cohere.rs` — two ONNX sessions. The decoder is *merged*: one graph serves the
    prefix-fill pass (empty past, multi-token input) and incremental generation
    (full past, single token). Encoder K/V is projected on the first decoder call
    and reused via `past_key_values.N.encoder.{key,value}`, so it must not be
    recomputed per step. Confirm the real input/output names by inspecting the
    graph rather than assuming.
-5. Model download: five precisions, external data shards, sha256 per file. The
+6. In-app model download: five precisions, external data shards, sha256 per file. The
    existing resumable-download path already handles large archives.
-6. Engine registration, settings UI, and a benchmark before advertising a speed.
+7. Engine registration, settings UI, and a benchmark before advertising a speed.
 
 Voxtype's `src/transcribe/cohere.rs` is a working reference implementation for
 step 4. Its doc comment claims the K/V cache is F32; in the q4f16 export it is
