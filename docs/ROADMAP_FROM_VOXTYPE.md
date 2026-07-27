@@ -13,9 +13,9 @@ checking before coding, not after.
 | 3 | Compositor keybinding writer | **shipped** |
 | 4 | Cohere Transcribe on CPU | **engine works & verified** — see `COHERE_ENGINE.md` |
 | 5 | Overlay on layer-shell | **surface working** — separate binary, verified on screen |
-| 6a | Eager chunked transcription | planned |
-| 6b | GTCRN speech enhancement | planned; model located |
-| 6c | GPU isolation option | planned |
+| 6a | Eager chunked transcription | **declined** — already covered; its mechanism regresses here (see main) |
+| 6b | GTCRN speech enhancement | **built & verified** — +4.46 dB SNR (see main) |
+| 6c | Bounded GPU memory on idle | **shipped** (idle eviction, not a subprocess — see main) |
 | 6d | Packaging: tag-triggered release | **shipped** |
 
 Shipped items 1–3 also fixed three things the comparison did not predict: enigo
