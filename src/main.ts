@@ -367,6 +367,13 @@ interface HotkeyBackendStatus {
   detail?: string;
 }
 
+/// Whether held chord modifiers can be observed before text is synthesized.
+/// `Active` needs read access to /dev/input, which usually means the `input`
+/// group; `Unavailable` carries the reason so it can be acted on.
+type ModifierGuardAvailability =
+  | { state: "active"; detail: { keyboards: number } }
+  | { state: "unavailable"; detail: { reason: string } };
+
 interface LibeiStatus {
   connected: boolean;
   attempted: boolean;
@@ -379,6 +386,7 @@ interface InsertionDiagnostics {
   chain: string[];
   directCapable: string[];
   libei?: LibeiStatus;
+  modifierGuard?: ModifierGuardAvailability;
 }
 
 interface PromptShortcutAssignment {
@@ -1422,6 +1430,20 @@ function insertionBackendNotice(): string {
   // libei can only reach keys the active layout already has, so it drives the
   // clipboard paste rather than typing. Worth saying, because it is the one rung
   // whose behaviour differs from the others and the only one needing approval.
+  // The guard is what stops a still-held Mod or Ctrl from turning dictation
+  // into compositor shortcuts. It is off by default on most distributions, so
+  // say what it costs and exactly how to turn it on.
+  const guard = diagnostics.modifierGuard;
+  if (guard?.state === "active") {
+    parts.push(
+      `<p class="muted backend-status">Held modifier keys are detected before typing, so dictation is not mistaken for a keyboard shortcut when you are still resting on the trigger chord.</p>`,
+    );
+  } else if (guard?.state === "unavailable") {
+    parts.push(
+      `<p class="muted backend-status">Held modifier keys cannot be detected (${escapeHtml(guard.detail.reason)}), so text is typed immediately. If dictation sometimes triggers a window-manager shortcut instead of inserting text, add yourself to the <code>input</code> group and log back in: <code>sudo usermod -aG input $USER</code>.</p>`,
+    );
+  }
+
   const libei = diagnostics.libei;
   if (libei && diagnostics.chain.includes("libei-portal")) {
     if (libei.connected) {

@@ -155,6 +155,20 @@ libei is restricted to sending Ctrl+V rather than typing the text. Unlike the vi
 
 The first libei dictation on GNOME or KDE raises a "remote control" permission dialog. That dictation reports a failure rather than blocking until you notice the dialog; approving it lets every later dictation through, and the portal's restore token is cached so approval is only asked for once.
 
+### Held modifier keys
+
+Dictation is usually triggered by a chord, and the text is synthesized as soon as transcription finishes. If a modifier from that chord is still pressed at that moment, the compositor reads each synthesized keystroke as *modifier + key* and runs its own keybinding instead of inserting text — so a dictation can close a window or switch workspaces rather than typing.
+
+Voxide checks which keys are actually held before typing and waits up to 600 ms for them to clear, then types regardless so a stuck key can never strand a dictation. The check reads the kernel's pressed-key snapshot (`EVIOCGKEY`), because no Wayland client can ask the compositor about keys delivered to somebody else's window.
+
+That needs read access to `/dev/input/event*`, which on most distributions means the `input` group:
+
+```sh
+sudo usermod -aG input $USER   # then log out and back in
+```
+
+Without it the check is skipped entirely and text is typed immediately, exactly as before — no delay is substituted. Settings → Global dictation reports which of the two applies.
+
 ## Microphone selection on Linux
 
 On PipeWire and PulseAudio desktops the microphone picker lists the sound server's actual sources (your headset, the built-in microphone, …) rather than raw ALSA PCM names, and capture is routed to the selected source. This uses `pactl` when available and falls back to ALSA device enumeration otherwise. Selecting a specific microphone also prevents Bluetooth headphones from being forced into their low-quality headset profile when you dictate.

@@ -39,6 +39,8 @@ mod formatting;
 mod libei_input;
 mod local_api;
 mod media;
+#[cfg(target_os = "linux")]
+mod modifier_guard;
 mod nemotron;
 mod parakeet;
 mod parakeet_stream;

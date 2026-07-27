@@ -9,7 +9,7 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use crate::debug_log;
 
 #[cfg(target_os = "linux")]
-use crate::libei_input;
+use crate::{libei_input, modifier_guard};
 
 /// Chooses whether insertion should prefer clipboard-free desktop input or a
 /// temporary clipboard paste. Values intentionally match Voxide backups.
@@ -170,6 +170,9 @@ pub struct InsertionDiagnostics {
     /// State of the libei rung, which is the only one that needs permission.
     #[cfg(target_os = "linux")]
     pub libei: crate::libei_input::Status,
+    /// Whether held chord modifiers can be detected before typing.
+    #[cfg(target_os = "linux")]
+    pub modifier_guard: crate::modifier_guard::Availability,
 }
 
 /// Reports the insertion chain without synthesizing anything.
@@ -184,6 +187,8 @@ pub fn insertion_diagnostics() -> InsertionDiagnostics {
             .collect(),
         #[cfg(target_os = "linux")]
         libei: libei_input::status(),
+        #[cfg(target_os = "linux")]
+        modifier_guard: modifier_guard::availability(),
     }
 }
 
@@ -257,6 +262,10 @@ pub fn type_into_active_application(text: &str, mode: TextInsertionMode) -> Resu
     if text.trim().is_empty() {
         return Ok(());
     }
+    // Once per insertion, not per rung: the modifiers are whatever they are,
+    // and a fallback attempt should not pay the wait a second time.
+    #[cfg(target_os = "linux")]
+    let _ = modifier_guard::wait_for_release();
     let mut attempts = AttemptLog::new();
     for (backend, strategy) in insertion_plan(mode) {
         let outcome = match strategy {
@@ -600,6 +609,8 @@ mod tests {
         println!("can type text directly: {:?}", diagnostics.direct_capable);
         #[cfg(target_os = "linux")]
         println!("libei: {:?}", diagnostics.libei);
+        #[cfg(target_os = "linux")]
+        println!("modifier guard: {:?}", diagnostics.modifier_guard);
         for backend in super::synthesis_chain() {
             if backend.enigo_settings().is_none() {
                 println!("  {backend}: driven directly, not through enigo");
@@ -635,6 +646,17 @@ mod tests {
             for key in ["connected", "attempted", "detail"] {
                 assert!(libei.get(key).is_some(), "missing libei.{key}: {libei}");
             }
+            let guard = object
+                .get("modifierGuard")
+                .expect("Linux reports modifier-guard availability");
+            // The notice branches on `state` and reads `detail`, so both have to
+            // survive serialization under those exact names.
+            let state = guard.get("state").and_then(|state| state.as_str());
+            assert!(
+                matches!(state, Some("active") | Some("unavailable")),
+                "unexpected modifierGuard state: {guard}"
+            );
+            assert!(guard.get("detail").is_some(), "missing detail: {guard}");
         }
     }
 
