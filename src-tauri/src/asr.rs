@@ -86,10 +86,9 @@ pub(crate) const COHERE: EngineCapabilities = EngineCapabilities {
     label: "Cohere Transcribe",
     description: "Local CPU transcription with punctuation and inverse text normalisation",
     maturity: EngineMaturity::Experimental,
-    // Offline encoder/decoder, like Parakeet's final pass. Declared as a full
-    // snapshot because that is the shape, but the adapter does not spawn a live
-    // preview: re-decoding a growing buffer through a 48-layer encoder on CPU
-    // would cost more than the preview is worth.
+    // Re-decodes a short trailing window while recording, like Parakeet, but with
+    // an 8 s window rather than 20 s because decode time scales with audio length
+    // and there is no GPU to absorb it.
     preview_mode: PreviewMode::FullSnapshot,
     final_mode: FinalMode::IndependentFullDecode,
     supports_files: true,

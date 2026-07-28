@@ -9099,6 +9099,136 @@ fn trailing_window_is_silent(samples: &[f32], window: Duration, rms_floor: f32) 
 /// timestamped, still-tentative tail of each CUDA hypothesis before showing
 /// it, because Sherpa's INT8 ONNX decoder can otherwise invent words at the
 /// live endpoint that disappear in the final full decode.
+/// Live preview for Cohere: re-decodes a short trailing window while recording.
+///
+/// Cohere is an offline encoder/decoder, so a preview means re-decoding rather
+/// than reading a token stream — the same shape as the Parakeet preview, with two
+/// differences that matter on a CPU. The window is 8 s rather than 20 s because
+/// decode time scales with audio length and there is no GPU to absorb it, and the
+/// pacing floor is higher so a slow machine backs off instead of queueing.
+fn spawn_live_cohere_preview(
+    app: AppHandle,
+    preview_generation: u64,
+    model_path: PathBuf,
+    preview_char_limit: usize,
+) {
+    tauri::async_runtime::spawn(async move {
+        const MINIMUM_PREVIEW_SAMPLES: usize = audio::WHISPER_SAMPLE_RATE as usize;
+        /// Trailing window each preview decodes. Shorter than Parakeet's 20 s:
+        /// at roughly 5x realtime on a CPU an 8 s window costs ~1.6 s, which is
+        /// the most that can be spent and still feel live.
+        const COHERE_PREVIEW_WINDOW: Duration = Duration::from_secs(8);
+        const TRAILING_SILENCE_WINDOW: Duration = Duration::from_millis(900);
+        const TRAILING_SILENCE_RMS: f32 = 0.008;
+
+        let mut interval = Duration::from_millis(900);
+        let mut stability = PreviewStability::default();
+        let mut emitted_nonempty = false;
+        let mut silent_since: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(interval).await;
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let captured = capture_state.capture.lock().ok().and_then(|capture| {
+                capture
+                    .as_ref()
+                    .and_then(|capture| capture.snapshot_recent(COHERE_PREVIEW_WINDOW).ok())
+            });
+            let Some(captured) = captured else {
+                // Capture is briefly absent while a device error is recovered.
+                continue;
+            };
+            let samples = match audio::mono_resample_for_whisper(captured) {
+                Ok(samples) => samples,
+                Err(error) => {
+                    debug_log::append(&format!(
+                        "Live Cohere preview could not resample audio: {error}"
+                    ));
+                    continue;
+                }
+            };
+            if samples.len() < MINIMUM_PREVIEW_SAMPLES {
+                continue;
+            }
+            let trailing_silent =
+                trailing_window_is_silent(&samples, TRAILING_SILENCE_WINDOW, TRAILING_SILENCE_RMS);
+            if trailing_silent {
+                let silent_for = silent_since.get_or_insert_with(Instant::now).elapsed();
+                // Stop re-decoding identical audio through a 48-layer encoder once
+                // the speaker has clearly paused; the CPU is better spent on the
+                // final decode that follows.
+                if emitted_nonempty && silent_for > interval {
+                    continue;
+                }
+            } else {
+                silent_since = None;
+            }
+            if !begin_preview(&capture_state, preview_generation) {
+                continue;
+            }
+            let sample_count = samples.len();
+            let started = Instant::now();
+            let model = model_path.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                transcribe_cohere_preview(&samples, &model)
+            })
+            .await
+            .map_err(|error| format!("preview task failed: {error}"))
+            .and_then(|result| result);
+            finish_preview(&capture_state, preview_generation);
+            let elapsed = started.elapsed();
+            // Adaptive: never spend more than about half the time decoding
+            // previews, and never spin faster than the decode can sustain.
+            interval = elapsed
+                .mul_f32(1.5)
+                .clamp(Duration::from_millis(700), Duration::from_secs(4));
+            let capture_state = app.state::<NativeCaptureState>();
+            if capture_state.preview_generation.load(Ordering::SeqCst) != preview_generation {
+                return;
+            }
+            let audio_ms =
+                (sample_count as u64).saturating_mul(1_000) / audio::WHISPER_SAMPLE_RATE as u64;
+            match result {
+                Ok(text) if !text.trim().is_empty() => {
+                    // Confirm across snapshots before showing, so a word already on
+                    // the overlay is not rewritten when the window slides.
+                    let Some(text) = stability.observe(text.trim()) else {
+                        continue;
+                    };
+                    emitted_nonempty = true;
+                    debug_log::append(&format!(
+                        "Live Cohere preview emitted (audio_ms: {audio_ms}, decode_ms: {})",
+                        elapsed.as_millis()
+                    ));
+                    emit_overlay(
+                        &app,
+                        "recording",
+                        tail_characters(&text, preview_char_limit),
+                    );
+                }
+                Ok(_) => debug_log::append(&format!(
+                    "Live Cohere preview was empty (audio_ms: {audio_ms})"
+                )),
+                Err(error) => debug_log::append(&format!(
+                    "Live Cohere preview skipped (audio_ms: {audio_ms}): {error}"
+                )),
+            }
+        }
+    });
+}
+
+#[cfg(feature = "cohere")]
+fn transcribe_cohere_preview(samples: &[f32], model_directory: &Path) -> Result<String, String> {
+    cohere::transcribe_samples(model_directory, samples)
+}
+
+#[cfg(not(feature = "cohere"))]
+fn transcribe_cohere_preview(_samples: &[f32], _model: &Path) -> Result<String, String> {
+    Err("Cohere Transcribe is not compiled into this build".into())
+}
+
 fn spawn_live_parakeet_preview(
     app: AppHandle,
     preview_generation: u64,

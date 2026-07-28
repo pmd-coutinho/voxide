@@ -131,6 +131,20 @@ impl VoiceEngine {
                     settings.transcription_preview_char_limit,
                 );
             }
+            Self::Cohere if settings.enable_streaming_preview => {
+                // Only once the model is present; a preview that cannot load
+                // would log a failure on every tick.
+                if let Ok(model) = cohere_model_path(state) {
+                    if cohere::is_compiled() && cohere::model_is_installed(&model) {
+                        spawn_live_cohere_preview(
+                            app.clone(),
+                            session_id,
+                            model,
+                            settings.transcription_preview_char_limit,
+                        );
+                    }
+                }
+            }
             Self::Parakeet if settings.enable_streaming_preview => {
                 // Opt-in: drive the preview with the CPU streaming zipformer when
                 // it is enabled and its model is installed; otherwise fall back to

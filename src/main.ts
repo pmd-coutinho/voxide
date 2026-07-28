@@ -907,9 +907,13 @@ function renderVoiceEngine(): void {
     </section>`
     : "";
   const engineCapabilities = (engine: VoiceEngineDescriptor): string => {
+    // The type has always allowed "none"; without this branch an engine without a
+    // preview would be described as having a snapshot one.
     const preview = engine.previewMode === "incremental"
       ? "Live streaming preview"
-      : "Snapshot preview";
+      : engine.previewMode === "none"
+        ? "No live preview"
+        : "Snapshot preview";
     const features = [preview, engine.supportsFiles ? "File transcription" : "Live dictation only"];
     if (engine.supportsVocabulary) features.push("Custom vocabulary");
     if (engine.supportsTranslation) features.push("Translation");
