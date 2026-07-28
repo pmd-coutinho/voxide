@@ -24,6 +24,21 @@ impl VoiceEngine {
                     Err("The selected Whisper model is missing, empty, or invalid. Download it again before recording.".into())
                 }
             }
+            Self::Cohere => {
+                if !cohere::is_compiled() {
+                    return Err("Cohere Transcribe is available in builds compiled with the `cohere` feature".into());
+                }
+                let model = cohere_model_path(state)?;
+                let missing = cohere::missing_files(&model);
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "The Cohere model is incomplete — missing {}. Download it before recording.",
+                        missing.join(", ")
+                    ))
+                }
+            }
             Self::Parakeet => {
                 if !parakeet::is_compiled() {
                     return Err("Parakeet is available in Voxide's CUDA build".into());
@@ -225,6 +240,20 @@ impl VoiceEngine {
                     whisper_timings: Some(result.timings),
                 })
             }
+            Self::Cohere => {
+                // Offline encoder/decoder, so there is no live stream to flush:
+                // the whole capture is decoded once, like Parakeet's final pass.
+                let model = cohere_model_path(state)?;
+                let text = tauri::async_runtime::spawn_blocking(move || {
+                    transcribe_cohere(&samples, &model)
+                })
+                .await
+                .map_err(|error| format!("Cohere voice engine task failed: {error}"))??;
+                Ok(EngineFinalTranscript {
+                    text,
+                    whisper_timings: None,
+                })
+            }
             Self::Parakeet => {
                 let model = parakeet_model_path(state)?;
                 // Decide acoustic pronunciation matching before samples move
@@ -354,6 +383,15 @@ impl VoiceEngine {
                 .await
                 .map_err(|error| format!("File transcription task failed: {error}"))?
             }
+            Self::Cohere => {
+                self.prepare_live_capture(settings, state)?;
+                let model = cohere_model_path(state)?;
+                tauri::async_runtime::spawn_blocking(move || {
+                    transcribe_cohere_media_file(&path, &model, Some(progress))
+                })
+                .await
+                .map_err(|error| format!("Cohere file transcription task failed: {error}"))?
+            }
             Self::Parakeet => {
                 if !parakeet::is_compiled() {
                     return Err("Parakeet is available in Voxide's CUDA build".into());
@@ -477,6 +515,26 @@ impl VoiceEngine {
                 })
                 .await;
             }
+            #[cfg(feature = "cohere")]
+            Self::Cohere => {
+                // Loading is ~1.5 GB off disk, so warming it while the user is
+                // still setting up beats paying it on the first dictation.
+                if let Ok(model) = cohere_model_path(state) {
+                    if cohere::model_is_installed(&model) {
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            match cohere::warm_transcriber(&model) {
+                                Ok(_) => debug_log::append("Cohere model preloaded"),
+                                Err(error) => {
+                                    debug_log::append(&format!("Cohere preload failed: {error}"))
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                }
+            }
+            #[cfg(not(feature = "cohere"))]
+            Self::Cohere => {}
             Self::Parakeet | Self::Nemotron | Self::Cloud | Self::AppleSpeech => {}
         }
     }
@@ -572,4 +630,49 @@ mod tests {
 
         assert_eq!(error, "Nemotron is still finishing the previous dictation");
     }
+}
+
+/// Decodes a whole capture through Cohere. Blocking; callers use `spawn_blocking`.
+#[cfg(feature = "cohere")]
+fn transcribe_cohere(samples: &[f32], model_directory: &Path) -> Result<String, String> {
+    cohere::transcribe_samples(model_directory, samples)
+}
+
+#[cfg(not(feature = "cohere"))]
+fn transcribe_cohere(_samples: &[f32], _model_directory: &Path) -> Result<String, String> {
+    Err("Cohere Transcribe is available in builds compiled with the `cohere` feature".into())
+}
+
+/// Chunked file transcription, matching `parakeet::transcribe_media_file` so long
+/// media behaves the same way whichever local engine is selected.
+fn transcribe_cohere_media_file(
+    path: &Path,
+    model_directory: &Path,
+    progress: Option<speech::ProgressCallback>,
+) -> Result<(String, u64), String> {
+    let duration_ms = media::file_duration_ms(path)?;
+    let total_chunks = ((duration_ms as f64 / 1_000.0) / media::TRANSCRIPTION_CHUNK_SECONDS)
+        .ceil()
+        .max(1.0) as usize;
+    let mut chunks = Vec::with_capacity(total_chunks);
+    for chunk in 0..total_chunks {
+        let start_seconds = chunk as f64 * media::TRANSCRIPTION_CHUNK_SECONDS;
+        let remaining_seconds = (duration_ms as f64 / 1_000.0 - start_seconds).max(0.0);
+        let audio = media::decode_audio_segment(
+            path,
+            start_seconds,
+            remaining_seconds.min(media::TRANSCRIPTION_CHUNK_SECONDS),
+        )?;
+        let samples = audio::mono_resample_for_whisper(audio)?;
+        if audio::has_minimum_transcription_samples(&samples) {
+            let text = transcribe_cohere(&samples, model_directory)?;
+            if !text.trim().is_empty() {
+                chunks.push(text);
+            }
+        }
+        if let Some(progress) = &progress {
+            progress(chunk + 1, total_chunks);
+        }
+    }
+    Ok((chunks.join(" "), duration_ms))
 }

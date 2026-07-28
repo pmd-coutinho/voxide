@@ -33,7 +33,8 @@ mod apple_speech;
 mod asr;
 mod asr_adapter;
 mod audio;
-#[cfg(feature = "cohere")]
+// Always compiled so the engine can be described and its readiness reported in
+// any build; everything needing `ort` sits behind the feature inside.
 mod cohere;
 #[cfg(feature = "cohere")]
 mod cohere_fbank;
@@ -1454,15 +1455,17 @@ enum VoiceEngine {
     Whisper,
     Parakeet,
     Nemotron,
+    Cohere,
     AppleSpeech,
     Cloud,
 }
 
 impl VoiceEngine {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Whisper,
         Self::Parakeet,
         Self::Nemotron,
+        Self::Cohere,
         Self::AppleSpeech,
         Self::Cloud,
     ];
@@ -1485,6 +1488,7 @@ impl VoiceEngine {
             Self::Parakeet => &asr::PARAKEET,
             Self::Nemotron => &asr::NEMOTRON,
             Self::AppleSpeech => &asr::APPLE_SPEECH,
+            Self::Cohere => &asr::COHERE,
             Self::Cloud => &asr::CLOUD,
         }
     }
@@ -1496,6 +1500,7 @@ impl VoiceEngine {
             Self::AppleSpeech => "apple-speech".into(),
             Self::Parakeet => "parakeet".into(),
             Self::Nemotron => "nemotron".into(),
+            Self::Cohere => "cohere-transcribe-03-2026-q4f16".into(),
         }
     }
 
@@ -1506,6 +1511,7 @@ impl VoiceEngine {
         match self {
             Self::Whisper => "whisper-rs 0.16.0".into(),
             Self::Parakeet => "sherpa-onnx 1.13.4 CUDA 12/cuDNN 9".into(),
+            Self::Cohere => "onnxruntime (ort 2.0.0-rc.12), q4f16".into(),
             Self::Nemotron => nemotron_runtime_path(state)
                 .ok()
                 .and_then(|runtime| nemotron_runtime_version(&runtime))
@@ -1532,6 +1538,7 @@ impl VoiceEngine {
             Self::Parakeet => parakeet::is_compiled(),
             Self::Nemotron => nemotron::is_compiled(),
             Self::AppleSpeech => apple_speech::is_supported(),
+            Self::Cohere => cohere::is_compiled(),
             Self::Whisper | Self::Cloud => true,
         }
     }
@@ -1542,6 +1549,7 @@ impl VoiceEngine {
         }
         match self {
             Self::Parakeet | Self::Nemotron => Some("Requires Voxide's CUDA build"),
+            Self::Cohere => Some("Requires a build compiled with the `cohere` feature"),
             Self::AppleSpeech => Some("Available only on macOS"),
             Self::Whisper | Self::Cloud => None,
         }
@@ -2837,6 +2845,18 @@ fn complete_onboarding(state: State<'_, AppState>) -> Result<Settings, String> {
             let model_path = whisper_model_path(&settings, &state)?;
             if !valid_whisper_model_file(&model_path) {
                 return Err("Download the selected Whisper model before completing setup".into());
+            }
+        }
+        VoiceEngine::Cohere => {
+            if !cohere::is_compiled() {
+                return Err(
+                    "Cohere Transcribe is available in builds compiled with the `cohere` feature"
+                        .into(),
+                );
+            }
+            let model_path = cohere_model_path(&state)?;
+            if !cohere::model_is_installed(&model_path) {
+                return Err("Download the Cohere model before completing setup".into());
             }
         }
         VoiceEngine::Parakeet => {
@@ -6304,6 +6324,10 @@ fn parakeet_model_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(parakeet::model_directory(&state.models_directory()?))
 }
 
+fn cohere_model_path(state: &AppState) -> Result<PathBuf, String> {
+    Ok(cohere::model_directory(&state.models_directory()?))
+}
+
 fn nemotron_model_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(nemotron::model_directory(&state.models_directory()?))
 }
@@ -6440,6 +6464,24 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
                 runtime_installed: None,
             }),
         },
+        VoiceEngine::Cohere => {
+            let model = cohere_model_path(&state)?;
+            let missing = cohere::missing_files(&model);
+            Ok(VoiceModelStatus {
+                id: cohere::MODEL_ID.to_string(),
+                installed: missing.is_empty() && cohere::is_compiled(),
+                path: if !cohere::is_compiled() {
+                    "Requires a build compiled with the `cohere` feature".to_string()
+                } else if missing.is_empty() {
+                    model.display().to_string()
+                } else {
+                    // Name what is absent: the weights are external shards, so a
+                    // partial download looks installed if only the graph is checked.
+                    format!("Incomplete — missing {}", missing.join(", "))
+                },
+                runtime_installed: None,
+            })
+        }
         VoiceEngine::AppleSpeech => Ok(VoiceModelStatus {
             id: "apple-speech".into(),
             installed: apple_speech::is_supported(),
@@ -6490,6 +6532,16 @@ async fn verify_voice_engine_installation(
         .settings
         .clone();
     match settings.selected_voice_engine {
+        VoiceEngine::Cohere => {
+            let model = cohere_model_path(&state)?;
+            let missing = cohere::missing_files(&model);
+            if !missing.is_empty() {
+                return Err(format!(
+                    "The Cohere model is incomplete — missing {}. Download it again to repair it.",
+                    missing.join(", ")
+                ));
+            }
+        }
         VoiceEngine::Parakeet => {
             if !parakeet::is_compiled() {
                 return Err("Parakeet is available in Voxide's CUDA build".into());
@@ -6688,6 +6740,14 @@ fn open_voice_engine_storage(state: State<'_, AppState>) -> Result<(), String> {
                 runtime
             } else {
                 state.data_directory()?
+            }
+        }
+        VoiceEngine::Cohere => {
+            let model = cohere_model_path(&state)?;
+            if model.is_dir() {
+                model
+            } else {
+                state.models_directory()?
             }
         }
         VoiceEngine::Whisper | VoiceEngine::Cloud | VoiceEngine::AppleSpeech => {
@@ -10891,7 +10951,12 @@ pub fn run() {
                     // Cheap when nothing is warm, and it declines to evict while
                     // a decode holds the inference lock.
                     tauri::async_runtime::spawn_blocking(|| {
-                        speech::release_idle_models(speech::MODEL_IDLE_TIMEOUT)
+                        speech::release_idle_models(speech::MODEL_IDLE_TIMEOUT);
+                        // Cohere holds ~1.5 GB, so it gets the same treatment.
+                        #[cfg(feature = "cohere")]
+                        if cohere::release_warm_model() {
+                            debug_log::append("released the warm Cohere model while idle");
+                        }
                     });
                 }
             });
@@ -11469,6 +11534,37 @@ mod tests {
         normalize_database(&mut database);
 
         assert_eq!(database.settings.selected_model, "base");
+    }
+
+    #[test]
+    fn cohere_is_offered_as_a_selectable_engine() {
+        // The picker is built from these descriptors, so if Cohere is absent here
+        // it cannot be chosen no matter what the engine code does.
+        assert!(VoiceEngine::ALL.contains(&VoiceEngine::Cohere));
+        let descriptor = VoiceEngine::Cohere.descriptor();
+        assert_eq!(descriptor.id, "cohere");
+        assert!(!descriptor.label.trim().is_empty());
+        // A CPU engine is the entire reason for adding it; requiring CUDA would
+        // defeat the purpose.
+        assert!(!asr::COHERE.requires_cuda);
+    }
+
+    #[test]
+    fn cohere_readiness_tracks_the_feature_and_the_files() {
+        // `runtime_available` gates the picker entry, and an incomplete download
+        // must read as unavailable: the weights are external shards, so a present
+        // graph file alone does not mean a usable model.
+        assert_eq!(
+            VoiceEngine::Cohere.runtime_available(),
+            cfg!(feature = "cohere")
+        );
+        let empty =
+            std::env::temp_dir().join(format!("voxide-cohere-absent-{}", uuid::Uuid::new_v4()));
+        assert!(!cohere::model_is_installed(&empty));
+        assert_eq!(
+            cohere::missing_files(&empty).len(),
+            cohere::required_files().len()
+        );
     }
 
     #[test]

@@ -81,6 +81,26 @@ pub(crate) const PARAKEET: EngineCapabilities = EngineCapabilities {
     requires_cuda: true,
 };
 
+pub(crate) const COHERE: EngineCapabilities = EngineCapabilities {
+    id: "cohere",
+    label: "Cohere Transcribe",
+    description: "Local CPU transcription with punctuation and inverse text normalisation",
+    maturity: EngineMaturity::Experimental,
+    // Offline encoder/decoder, like Parakeet's final pass. Declared as a full
+    // snapshot because that is the shape, but the adapter does not spawn a live
+    // preview: re-decoding a growing buffer through a 48-layer encoder on CPU
+    // would cost more than the preview is worth.
+    preview_mode: PreviewMode::FullSnapshot,
+    final_mode: FinalMode::IndependentFullDecode,
+    supports_files: true,
+    supports_translation: false,
+    // The decoder prefix has a language token, but vocabulary biasing is not
+    // exposed by this export.
+    supports_vocabulary: false,
+    // Runs on the CPU — the whole point of adding it.
+    requires_cuda: false,
+};
+
 pub(crate) const NEMOTRON: EngineCapabilities = EngineCapabilities {
     id: "nemotron",
     label: "Nemotron Speech",

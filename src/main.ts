@@ -67,7 +67,7 @@ interface Settings {
   weekendsDontBreakStreak: boolean;
   audioHistoryEnabled: boolean;
   audioHistoryBudgetGb: number;
-  selectedVoiceEngine: "whisper" | "parakeet" | "nemotron" | "appleSpeech" | "cloud";
+  selectedVoiceEngine: "whisper" | "parakeet" | "nemotron" | "cohere" | "appleSpeech" | "cloud";
   selectedModel: string;
   whisperBeamSize: WhisperBeamSize;
   nemotronStreamingMode: NemotronStreamingMode;

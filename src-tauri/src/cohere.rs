@@ -1,432 +1,540 @@
-//! Cohere Transcribe: encoder and merged decoder.
+//! Cohere Transcribe: readiness helpers, plus the encoder and merged decoder.
 //!
 //! Front end is [`crate::cohere_fbank`]; the graph contract and the reasoning
-//! behind every constant here is in `docs/COHERE_ENGINE.md`.
+//! behind every constant is in `docs/COHERE_ENGINE.md`.
 //!
-//! ## The merged decoder
-//!
-//! One graph serves two different calls. The **prefix fill** passes all six
-//! prompt tokens with an empty past and gets back the encoder's projected K/V.
-//! Each **incremental step** passes a single token with the full past. Both use
-//! `num_logits_to_keep = 1`, since only the last position's distribution is ever
-//! needed for greedy decoding.
-//!
-//! The encoder K/V arrives as `present.N.encoder.*` on the first call and must be
-//! threaded back unchanged on every later one. Recomputing it per token is
-//! numerically fine and ruinously slow — it is a projection of a 48-layer
-//! encoder's output over the whole utterance.
-//!
-//! Mixed precision is not optional: `encoder_hidden_states` is f32 while the K/V
-//! cache and `logits` are f16 in the q4f16 export.
+//! Structured like [`crate::parakeet`]: the module is always compiled so the
+//! engine can be described and its readiness reported in any build, while
+//! everything that needs `ort` and `tokenizers` sits behind the `cohere` feature.
 
-#![allow(dead_code)]
+use std::path::{Path, PathBuf};
 
-use std::{path::Path, sync::Mutex};
+/// Directory name under the models directory, and the engine's model id.
+pub const MODEL_ID: &str = "cohere-transcribe-03-2026-q4f16";
 
-use half::f16;
-use ort::{session::Session, value::Tensor};
-use tokenizers::Tokenizer;
-
-use crate::cohere_fbank::{CohereFbank, MEL_BINS};
-
-/// Decoder layers, and the K/V geometry per layer.
-const LAYERS: usize = 8;
-const HEADS: usize = 8;
-const HEAD_DIM: usize = 128;
-/// Width the encoder graph emits, after its internal 1280-wide model is projected.
-const ENCODER_WIDTH: usize = 1024;
-
-/// English transcription, punctuation and inverse text normalisation on, no
-/// timestamps, no diarisation. Verified against the tokenizer's `added_tokens`
-/// rather than copied from another implementation.
-const PREFIX: [i64; 6] = [4, 62, 5, 8, 11, 13];
-/// `<|endoftext|>`.
-const EOS: i64 = 3;
-/// A hard stop so a degenerate loop cannot spin forever on bad audio.
-const MAX_NEW_TOKENS: usize = 440;
-
-pub struct CohereTranscriber {
-    encoder: Mutex<Session>,
-    decoder: Mutex<Session>,
-    tokenizer: Tokenizer,
-    fbank: CohereFbank,
+pub fn is_compiled() -> bool {
+    cfg!(feature = "cohere")
 }
 
-/// One layer's four cache tensors, kept as flat f16 with their sequence lengths.
-#[derive(Clone)]
-struct LayerCache {
-    decoder_key: Vec<f16>,
-    decoder_value: Vec<f16>,
-    encoder_key: Vec<f16>,
-    encoder_value: Vec<f16>,
-    decoder_len: usize,
-    encoder_len: usize,
+pub fn model_directory(models_directory: &Path) -> PathBuf {
+    models_directory.join(MODEL_ID)
 }
 
-impl LayerCache {
-    /// The first decoder call gets zero-length past on both sides; the graph then
-    /// projects the encoder K/V itself.
-    fn empty() -> Self {
-        Self {
-            decoder_key: Vec::new(),
-            decoder_value: Vec::new(),
-            encoder_key: Vec::new(),
-            encoder_value: Vec::new(),
-            decoder_len: 0,
-            encoder_len: 0,
-        }
+/// Every file the engine needs. The weights live in external `.onnx_data`
+/// shards, so a present graph file alone does not mean a usable model.
+pub fn required_files() -> [&'static str; 5] {
+    [
+        "onnx/encoder_model_q4f16.onnx",
+        "onnx/encoder_model_q4f16.onnx_data",
+        "onnx/decoder_model_merged_q4f16.onnx",
+        "onnx/decoder_model_merged_q4f16.onnx_data",
+        "tokenizer.json",
+    ]
+}
+
+pub fn model_is_installed(directory: &Path) -> bool {
+    required_files()
+        .iter()
+        .all(|name| directory.join(name).is_file())
+}
+
+/// Names whatever is missing, so the UI can say more than "not installed".
+pub fn missing_files(directory: &Path) -> Vec<String> {
+    required_files()
+        .iter()
+        .filter(|name| !directory.join(name).is_file())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+#[cfg(feature = "cohere")]
+mod engine {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
+
+    /// The loaded model, kept warm between dictations. Loading is ~1.5 GB off
+    /// disk, so paying it per utterance would make the engine unusable.
+    /// The warm model with the directory it came from, so a model switch is
+    /// detected by comparing paths rather than invalidating eagerly.
+    type WarmModel = Option<(PathBuf, std::sync::Arc<CohereTranscriber>)>;
+
+    static WARM: OnceLock<Mutex<WarmModel>> = OnceLock::new();
+
+    /// Points `ort` at an onnxruntime to dlopen, once per process.
+    ///
+    /// `ort` is built with `load-dynamic`, so it needs a library path. Rather than
+    /// require users to set `ORT_DYLIB_PATH`, reuse the copy the Parakeet runtime
+    /// already ships — which also means a process that loads both engines has one
+    /// onnxruntime rather than two, and cannot collide on symbols.
+    fn ensure_runtime_path() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+                return;
+            }
+            let candidate = directories::BaseDirs::new().map(|base| {
+                base.home_dir()
+                    .join(".local/share/voxide-parakeet/runtime/lib/libonnxruntime.so")
+            });
+            match candidate {
+                Some(path) if path.is_file() => {
+                    std::env::set_var("ORT_DYLIB_PATH", &path);
+                    crate::debug_log::append("Cohere: using the Parakeet runtime's onnxruntime");
+                }
+                _ => crate::debug_log::append(
+                    "Cohere: no bundled onnxruntime found; set ORT_DYLIB_PATH",
+                ),
+            }
+        });
     }
-}
 
-impl CohereTranscriber {
-    /// `model_directory` is the layout `scripts/fetch-cohere-model.sh` produces.
-    pub fn load(model_directory: &Path) -> Result<Self, String> {
-        let encoder_path = model_directory.join("onnx/encoder_model_q4f16.onnx");
-        let decoder_path = model_directory.join("onnx/decoder_model_merged_q4f16.onnx");
-        let tokenizer_path = model_directory.join("tokenizer.json");
-        for path in [&encoder_path, &decoder_path, &tokenizer_path] {
-            if !path.is_file() {
-                return Err(format!("Cohere model file is missing: {}", path.display()));
+    /// Loads the model, or returns the already-warm one for the same directory.
+    pub fn warm_transcriber(directory: &Path) -> Result<std::sync::Arc<CohereTranscriber>, String> {
+        ensure_runtime_path();
+        let cache = WARM.get_or_init(|| Mutex::new(None));
+        let mut slot = cache
+            .lock()
+            .map_err(|_| "The Cohere model cache lock was poisoned".to_string())?;
+        if let Some((path, transcriber)) = slot.as_ref() {
+            if path == directory {
+                return Ok(std::sync::Arc::clone(transcriber));
             }
         }
-        Ok(Self {
-            encoder: Mutex::new(session(&encoder_path)?),
-            decoder: Mutex::new(session(&decoder_path)?),
-            tokenizer: Tokenizer::from_file(&tokenizer_path)
-                .map_err(|error| format!("Could not load the Cohere tokenizer: {error}"))?,
-            fbank: CohereFbank::new(),
-        })
+        let started = Instant::now();
+        let transcriber = std::sync::Arc::new(CohereTranscriber::load(directory)?);
+        crate::debug_log::append(&format!(
+            "Cohere model loaded in {} ms",
+            started.elapsed().as_millis()
+        ));
+        *slot = Some((directory.to_path_buf(), std::sync::Arc::clone(&transcriber)));
+        Ok(transcriber)
     }
 
-    /// Transcribes 16 kHz mono audio. Chunks over 35 s are decoded separately and
-    /// joined, matching how the front end splits them.
-    pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
-        let mut pieces = Vec::new();
-        for frames in self.fbank.features(samples) {
-            if frames.is_empty() {
-                continue;
+    /// Drops the warm model. Mirrors the Whisper idle eviction so a long-idle app
+    /// does not hold 1.5 GB resident.
+    pub fn release_warm_model() -> bool {
+        WARM.get()
+            .and_then(|cache| cache.lock().ok().map(|mut slot| slot.take().is_some()))
+            .unwrap_or(false)
+    }
+
+    /// Transcribes 16 kHz mono audio using the warm model.
+    pub fn transcribe_samples(directory: &Path, samples: &[f32]) -> Result<String, String> {
+        warm_transcriber(directory)?.transcribe(samples)
+    }
+
+    use half::f16;
+    use ort::{session::Session, value::Tensor};
+    use tokenizers::Tokenizer;
+
+    use crate::cohere_fbank::{CohereFbank, MEL_BINS};
+
+    /// Decoder layers, and the K/V geometry per layer.
+    const LAYERS: usize = 8;
+    const HEADS: usize = 8;
+    const HEAD_DIM: usize = 128;
+    /// Width the encoder graph emits, after its internal 1280-wide model is projected.
+    const ENCODER_WIDTH: usize = 1024;
+
+    /// English transcription, punctuation and inverse text normalisation on, no
+    /// timestamps, no diarisation. Verified against the tokenizer's `added_tokens`
+    /// rather than copied from another implementation.
+    const PREFIX: [i64; 6] = [4, 62, 5, 8, 11, 13];
+    /// `<|endoftext|>`.
+    const EOS: i64 = 3;
+    /// A hard stop so a degenerate loop cannot spin forever on bad audio.
+    const MAX_NEW_TOKENS: usize = 440;
+
+    pub struct CohereTranscriber {
+        encoder: Mutex<Session>,
+        decoder: Mutex<Session>,
+        tokenizer: Tokenizer,
+        fbank: CohereFbank,
+    }
+
+    /// One layer's four cache tensors, kept as flat f16 with their sequence lengths.
+    #[derive(Clone)]
+    struct LayerCache {
+        decoder_key: Vec<f16>,
+        decoder_value: Vec<f16>,
+        encoder_key: Vec<f16>,
+        encoder_value: Vec<f16>,
+        decoder_len: usize,
+        encoder_len: usize,
+    }
+
+    impl LayerCache {
+        /// The first decoder call gets zero-length past on both sides; the graph then
+        /// projects the encoder K/V itself.
+        fn empty() -> Self {
+            Self {
+                decoder_key: Vec::new(),
+                decoder_value: Vec::new(),
+                encoder_key: Vec::new(),
+                encoder_value: Vec::new(),
+                decoder_len: 0,
+                encoder_len: 0,
             }
-            let hidden = self.encode(&frames)?;
-            pieces.push(self.decode(&hidden)?);
         }
-        Ok(pieces
-            .iter()
-            .map(|piece| piece.trim())
-            .filter(|piece| !piece.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "))
     }
 
-    /// Runs the encoder and returns `(frames, [1, T, 1024])` flattened.
-    fn encode(&self, frames: &[Vec<f32>]) -> Result<(usize, Vec<f32>), String> {
-        let flat: Vec<f32> = frames.iter().flatten().copied().collect();
-        let mut encoder = self
-            .encoder
-            .lock()
-            .map_err(|_| "The Cohere encoder lock was poisoned".to_string())?;
-        let outputs = encoder
-            .run(ort::inputs![
-                "input_features" => Tensor::from_array(([1usize, frames.len(), MEL_BINS], flat))
-                    .map_err(tensor_error)?,
-            ])
-            .map_err(|error| format!("Cohere encoder inference failed: {error}"))?;
-        let (shape, values) = outputs["last_hidden_state"]
-            .try_extract_tensor::<f32>()
-            .map_err(tensor_error)?;
-        let width = *shape.last().unwrap_or(&0) as usize;
-        if width != ENCODER_WIDTH {
-            return Err(format!(
-                "The Cohere encoder returned width {width}, expected {ENCODER_WIDTH}"
-            ));
-        }
-        Ok((values.len() / ENCODER_WIDTH, values.to_vec()))
-    }
-
-    /// Greedy decode against the encoder output.
-    fn decode(&self, hidden: &(usize, Vec<f32>)) -> Result<String, String> {
-        let (encoder_frames, encoder_values) = hidden;
-        let mut decoder = self
-            .decoder
-            .lock()
-            .map_err(|_| "The Cohere decoder lock was poisoned".to_string())?;
-
-        let mut caches = vec![LayerCache::empty(); LAYERS];
-        let mut tokens: Vec<i64> = PREFIX.to_vec();
-        let mut generated: Vec<u32> = Vec::new();
-        // First call submits the whole prefix; later calls submit one token.
-        let mut pending: Vec<i64> = PREFIX.to_vec();
-        let mut consumed = 0usize;
-
-        for _ in 0..MAX_NEW_TOKENS {
-            let step = pending.len();
-            let total = consumed + step;
-            let position_ids: Vec<i64> = (consumed..total).map(|p| p as i64).collect();
-            let attention_mask = vec![1i64; total];
-
-            let mut inputs = ort::inputs![
-                "input_ids" => Tensor::from_array(([1usize, step], pending.clone())).map_err(tensor_error)?,
-                "attention_mask" => Tensor::from_array(([1usize, total], attention_mask)).map_err(tensor_error)?,
-                "position_ids" => Tensor::from_array(([1usize, step], position_ids)).map_err(tensor_error)?,
-                "num_logits_to_keep" => Tensor::from_array(([0usize; 0], vec![1i64])).map_err(tensor_error)?,
-                "encoder_hidden_states" => Tensor::from_array((
-                    [1usize, *encoder_frames, ENCODER_WIDTH], encoder_values.clone()
-                )).map_err(tensor_error)?,
-            ];
-            for (layer, cache) in caches.iter().enumerate() {
-                for (suffix, values, length) in [
-                    ("decoder.key", &cache.decoder_key, cache.decoder_len),
-                    ("decoder.value", &cache.decoder_value, cache.decoder_len),
-                    ("encoder.key", &cache.encoder_key, cache.encoder_len),
-                    ("encoder.value", &cache.encoder_value, cache.encoder_len),
-                ] {
-                    inputs.push((
-                        format!("past_key_values.{layer}.{suffix}").into(),
-                        cache_tensor(values, length)?.into(),
-                    ));
+    impl CohereTranscriber {
+        /// `model_directory` is the layout `scripts/fetch-cohere-model.sh` produces.
+        pub fn load(model_directory: &Path) -> Result<Self, String> {
+            let encoder_path = model_directory.join("onnx/encoder_model_q4f16.onnx");
+            let decoder_path = model_directory.join("onnx/decoder_model_merged_q4f16.onnx");
+            let tokenizer_path = model_directory.join("tokenizer.json");
+            for path in [&encoder_path, &decoder_path, &tokenizer_path] {
+                if !path.is_file() {
+                    return Err(format!("Cohere model file is missing: {}", path.display()));
                 }
             }
+            Ok(Self {
+                encoder: Mutex::new(session(&encoder_path)?),
+                decoder: Mutex::new(session(&decoder_path)?),
+                tokenizer: Tokenizer::from_file(&tokenizer_path)
+                    .map_err(|error| format!("Could not load the Cohere tokenizer: {error}"))?,
+                fbank: CohereFbank::new(),
+            })
+        }
 
-            let outputs = decoder
-                .run(inputs)
-                .map_err(|error| format!("Cohere decoder inference failed: {error}"))?;
-
-            let (_, logits) = outputs["logits"]
-                .try_extract_tensor::<f16>()
-                .map_err(tensor_error)?;
-            // `num_logits_to_keep = 1`, so this is the last position's row.
-            let next = logits
+        /// Transcribes 16 kHz mono audio. Chunks over 35 s are decoded separately and
+        /// joined, matching how the front end splits them.
+        pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
+            let mut pieces = Vec::new();
+            for frames in self.fbank.features(samples) {
+                if frames.is_empty() {
+                    continue;
+                }
+                let hidden = self.encode(&frames)?;
+                pieces.push(self.decode(&hidden)?);
+            }
+            Ok(pieces
                 .iter()
-                .enumerate()
-                .max_by(|left, right| left.1.to_f32().total_cmp(&right.1.to_f32()))
-                .map(|(index, _)| index as i64)
-                .ok_or("The Cohere decoder returned no logits")?;
+                .map(|piece| piece.trim())
+                .filter(|piece| !piece.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
 
-            for (layer, cache) in caches.iter_mut().enumerate() {
-                for (suffix, slot, length) in [
-                    ("decoder.key", &mut cache.decoder_key, true),
-                    ("decoder.value", &mut cache.decoder_value, true),
-                    ("encoder.key", &mut cache.encoder_key, false),
-                    ("encoder.value", &mut cache.encoder_value, false),
-                ] {
-                    let (shape, values) = outputs[format!("present.{layer}.{suffix}").as_str()]
-                        .try_extract_tensor::<f16>()
-                        .map_err(tensor_error)?;
-                    *slot = values.to_vec();
-                    let sequence = shape.get(2).copied().unwrap_or(0) as usize;
-                    if length {
-                        cache.decoder_len = sequence;
-                    } else {
-                        cache.encoder_len = sequence;
+        /// Runs the encoder and returns `(frames, [1, T, 1024])` flattened.
+        fn encode(&self, frames: &[Vec<f32>]) -> Result<(usize, Vec<f32>), String> {
+            let flat: Vec<f32> = frames.iter().flatten().copied().collect();
+            let mut encoder = self
+                .encoder
+                .lock()
+                .map_err(|_| "The Cohere encoder lock was poisoned".to_string())?;
+            let outputs = encoder
+                .run(ort::inputs![
+                    "input_features" => Tensor::from_array(([1usize, frames.len(), MEL_BINS], flat))
+                        .map_err(tensor_error)?,
+                ])
+                .map_err(|error| format!("Cohere encoder inference failed: {error}"))?;
+            let (shape, values) = outputs["last_hidden_state"]
+                .try_extract_tensor::<f32>()
+                .map_err(tensor_error)?;
+            let width = *shape.last().unwrap_or(&0) as usize;
+            if width != ENCODER_WIDTH {
+                return Err(format!(
+                    "The Cohere encoder returned width {width}, expected {ENCODER_WIDTH}"
+                ));
+            }
+            Ok((values.len() / ENCODER_WIDTH, values.to_vec()))
+        }
+
+        /// Greedy decode against the encoder output.
+        fn decode(&self, hidden: &(usize, Vec<f32>)) -> Result<String, String> {
+            let (encoder_frames, encoder_values) = hidden;
+            let mut decoder = self
+                .decoder
+                .lock()
+                .map_err(|_| "The Cohere decoder lock was poisoned".to_string())?;
+
+            let mut caches = vec![LayerCache::empty(); LAYERS];
+            let mut tokens: Vec<i64> = PREFIX.to_vec();
+            let mut generated: Vec<u32> = Vec::new();
+            // First call submits the whole prefix; later calls submit one token.
+            let mut pending: Vec<i64> = PREFIX.to_vec();
+            let mut consumed = 0usize;
+
+            for _ in 0..MAX_NEW_TOKENS {
+                let step = pending.len();
+                let total = consumed + step;
+                let position_ids: Vec<i64> = (consumed..total).map(|p| p as i64).collect();
+                let attention_mask = vec![1i64; total];
+
+                let mut inputs = ort::inputs![
+                    "input_ids" => Tensor::from_array(([1usize, step], pending.clone())).map_err(tensor_error)?,
+                    "attention_mask" => Tensor::from_array(([1usize, total], attention_mask)).map_err(tensor_error)?,
+                    "position_ids" => Tensor::from_array(([1usize, step], position_ids)).map_err(tensor_error)?,
+                    "num_logits_to_keep" => Tensor::from_array(([0usize; 0], vec![1i64])).map_err(tensor_error)?,
+                    "encoder_hidden_states" => Tensor::from_array((
+                        [1usize, *encoder_frames, ENCODER_WIDTH], encoder_values.clone()
+                    )).map_err(tensor_error)?,
+                ];
+                for (layer, cache) in caches.iter().enumerate() {
+                    for (suffix, values, length) in [
+                        ("decoder.key", &cache.decoder_key, cache.decoder_len),
+                        ("decoder.value", &cache.decoder_value, cache.decoder_len),
+                        ("encoder.key", &cache.encoder_key, cache.encoder_len),
+                        ("encoder.value", &cache.encoder_value, cache.encoder_len),
+                    ] {
+                        inputs.push((
+                            format!("past_key_values.{layer}.{suffix}").into(),
+                            cache_tensor(values, length)?.into(),
+                        ));
                     }
                 }
-            }
-            drop(outputs);
 
-            consumed = total;
-            if next == EOS {
-                break;
+                let outputs = decoder
+                    .run(inputs)
+                    .map_err(|error| format!("Cohere decoder inference failed: {error}"))?;
+
+                let (_, logits) = outputs["logits"]
+                    .try_extract_tensor::<f16>()
+                    .map_err(tensor_error)?;
+                // `num_logits_to_keep = 1`, so this is the last position's row.
+                let next = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|left, right| left.1.to_f32().total_cmp(&right.1.to_f32()))
+                    .map(|(index, _)| index as i64)
+                    .ok_or("The Cohere decoder returned no logits")?;
+
+                for (layer, cache) in caches.iter_mut().enumerate() {
+                    for (suffix, slot, length) in [
+                        ("decoder.key", &mut cache.decoder_key, true),
+                        ("decoder.value", &mut cache.decoder_value, true),
+                        ("encoder.key", &mut cache.encoder_key, false),
+                        ("encoder.value", &mut cache.encoder_value, false),
+                    ] {
+                        let (shape, values) = outputs[format!("present.{layer}.{suffix}").as_str()]
+                            .try_extract_tensor::<f16>()
+                            .map_err(tensor_error)?;
+                        *slot = values.to_vec();
+                        let sequence = shape.get(2).copied().unwrap_or(0) as usize;
+                        if length {
+                            cache.decoder_len = sequence;
+                        } else {
+                            cache.encoder_len = sequence;
+                        }
+                    }
+                }
+                drop(outputs);
+
+                consumed = total;
+                if next == EOS {
+                    break;
+                }
+                generated.push(next as u32);
+                tokens.push(next);
+                pending = vec![next];
             }
-            generated.push(next as u32);
-            tokens.push(next);
-            pending = vec![next];
+
+            self.tokenizer
+                .decode(&generated, true)
+                .map_err(|error| format!("Could not decode Cohere tokens: {error}"))
+        }
+    }
+
+    fn session(path: &Path) -> Result<Session, String> {
+        Session::builder()
+            .map_err(|error| format!("Could not create an ONNX session builder: {error}"))?
+            .commit_from_file(path)
+            .map_err(|error| format!("Could not load {}: {error}", path.display()))
+    }
+
+    /// Builds a K/V cache tensor, including the zero-length case the first decoder
+    /// call needs.
+    ///
+    /// Goes through `ndarray` rather than `(shape, vec)`: ort's raw-data path rejects
+    /// any dimension below 1, but the empty past is exactly `[1, 8, 0, 128]`, and an
+    /// `ndarray` with a zero-length axis is perfectly legal.
+    fn cache_tensor(values: &[f16], length: usize) -> Result<Tensor<f16>, String> {
+        if length == 0 {
+            // `from_array`'s raw-data path rejects any dimension below 1, and ort's
+            // ndarray path has no f16 impl, so the empty past is allocated instead.
+            return Tensor::<f16>::new(
+                &ort::memory::Allocator::default(),
+                [1, HEADS as i64, 0, HEAD_DIM as i64],
+            )
+            .map_err(tensor_error);
+        }
+        Tensor::from_array(([1usize, HEADS, length, HEAD_DIM], values.to_vec()))
+            .map_err(tensor_error)
+    }
+
+    fn tensor_error<E: std::fmt::Display>(error: E) -> String {
+        format!("Cohere tensor error: {error}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn model_directory() -> std::path::PathBuf {
+            std::env::var("VOXIDE_COHERE_MODEL_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    directories::ProjectDirs::from("dev", "pmdcoutinho", "Voxide")
+                        .map(|d| {
+                            d.data_local_dir()
+                                .join("models")
+                                .join("cohere-transcribe-03-2026-q4f16")
+                        })
+                        .unwrap_or_default()
+                })
         }
 
-        self.tokenizer
-            .decode(&generated, true)
-            .map_err(|error| format!("Could not decode Cohere tokens: {error}"))
-    }
-}
-
-fn session(path: &Path) -> Result<Session, String> {
-    Session::builder()
-        .map_err(|error| format!("Could not create an ONNX session builder: {error}"))?
-        .commit_from_file(path)
-        .map_err(|error| format!("Could not load {}: {error}", path.display()))
-}
-
-/// Builds a K/V cache tensor, including the zero-length case the first decoder
-/// call needs.
-///
-/// Goes through `ndarray` rather than `(shape, vec)`: ort's raw-data path rejects
-/// any dimension below 1, but the empty past is exactly `[1, 8, 0, 128]`, and an
-/// `ndarray` with a zero-length axis is perfectly legal.
-fn cache_tensor(values: &[f16], length: usize) -> Result<Tensor<f16>, String> {
-    if length == 0 {
-        // `from_array`'s raw-data path rejects any dimension below 1, and ort's
-        // ndarray path has no f16 impl, so the empty past is allocated instead.
-        return Tensor::<f16>::new(
-            &ort::memory::Allocator::default(),
-            [1, HEADS as i64, 0, HEAD_DIM as i64],
-        )
-        .map_err(tensor_error);
-    }
-    Tensor::from_array(([1usize, HEADS, length, HEAD_DIM], values.to_vec())).map_err(tensor_error)
-}
-
-fn tensor_error<E: std::fmt::Display>(error: E) -> String {
-    format!("Cohere tensor error: {error}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model_directory() -> std::path::PathBuf {
-        std::env::var("VOXIDE_COHERE_MODEL_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                directories::ProjectDirs::from("dev", "pmdcoutinho", "Voxide")
-                    .map(|d| {
-                        d.data_local_dir()
-                            .join("models")
-                            .join("cohere-transcribe-03-2026-q4f16")
-                    })
-                    .unwrap_or_default()
-            })
-    }
-
-    #[test]
-    fn the_prefix_matches_the_tokenizer_special_tokens() {
-        // Guards against copying another implementation's prefix: each ID has to
-        // be the token this build's tokenizer actually assigns.
-        let directory = model_directory();
-        let path = directory.join("tokenizer.json");
-        if !path.is_file() {
-            return;
+        #[test]
+        fn the_prefix_matches_the_tokenizer_special_tokens() {
+            // Guards against copying another implementation's prefix: each ID has to
+            // be the token this build's tokenizer actually assigns.
+            let directory = model_directory();
+            let path = directory.join("tokenizer.json");
+            if !path.is_file() {
+                return;
+            }
+            let tokenizer = Tokenizer::from_file(&path).expect("tokenizer loads");
+            for (id, expected) in [
+                (4u32, "<|startoftranscript|>"),
+                (62, "<|en|>"),
+                (5, "<|pnc|>"),
+                (8, "<|itn|>"),
+                (11, "<|notimestamp|>"),
+                (13, "<|nodiarize|>"),
+                (3, "<|endoftext|>"),
+            ] {
+                assert_eq!(
+                    tokenizer.id_to_token(id).as_deref(),
+                    Some(expected),
+                    "token {id}"
+                );
+            }
+            assert_eq!(PREFIX.to_vec(), vec![4i64, 62, 5, 8, 11, 13]);
+            assert_eq!(EOS, 3);
         }
-        let tokenizer = Tokenizer::from_file(&path).expect("tokenizer loads");
-        for (id, expected) in [
-            (4u32, "<|startoftranscript|>"),
-            (62, "<|en|>"),
-            (5, "<|pnc|>"),
-            (8, "<|itn|>"),
-            (11, "<|notimestamp|>"),
-            (13, "<|nodiarize|>"),
-            (3, "<|endoftext|>"),
-        ] {
-            assert_eq!(
-                tokenizer.id_to_token(id).as_deref(),
-                Some(expected),
-                "token {id}"
+
+        /// Decodes the *whole* reference WAV, which is the check a half-second
+        /// fragment cannot substitute for: a subtly wrong front end or a
+        /// cache-threading error yields garbage or repetition over a full utterance
+        /// even when a fragment happens to look plausible.
+        #[test]
+        #[ignore = "needs the 1.5 GB q4f16 model and ORT_DYLIB_PATH"]
+        fn transcribes_a_full_utterance() {
+            let directory = model_directory();
+            if !directory.join("onnx/encoder_model_q4f16.onnx").is_file() {
+                eprintln!("skipping: no model");
+                return;
+            }
+            // The Parakeet reference WAV: a full sentence, and 24 kHz so it also
+            // exercises the resample the app does before any engine sees audio.
+            let source = std::env::var("VOXIDE_PARAKEET_MODEL_DIR")
+                .map(std::path::PathBuf::from)
+                .expect("set VOXIDE_PARAKEET_MODEL_DIR")
+                .join("test_wavs/en.wav");
+            let mut reader = hound::WavReader::open(&source).expect("wav opens");
+            let spec = reader.spec();
+            let raw: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+                hound::SampleFormat::Int => reader
+                    .samples::<i16>()
+                    .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+                    .collect(),
+            };
+            // Mono, then linear resample to 16 kHz. Crude but adequate: this test is
+            // asking whether the words come out right, not measuring resampler quality.
+            let channels = spec.channels as usize;
+            let mono: Vec<f32> = raw
+                .chunks(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                .collect();
+            let ratio = spec.sample_rate as f64 / 16_000.0;
+            let target = (mono.len() as f64 / ratio) as usize;
+            let samples: Vec<f32> = (0..target)
+                .map(|index| {
+                    let position = index as f64 * ratio;
+                    let left = position.floor() as usize;
+                    let fraction = (position - left as f64) as f32;
+                    let a = mono.get(left).copied().unwrap_or(0.0);
+                    let b = mono.get(left + 1).copied().unwrap_or(a);
+                    a + (b - a) * fraction
+                })
+                .collect();
+
+            let transcriber = CohereTranscriber::load(&directory).expect("model loads");
+            let started = std::time::Instant::now();
+            let text = transcriber
+                .transcribe(&samples)
+                .expect("transcription runs");
+            let elapsed = started.elapsed();
+            let seconds = samples.len() as f32 / 16_000.0;
+            println!(
+                "FULL TRANSCRIPT: {text:?}\n{seconds:.2} s audio in {:.2} s ({:.2}x realtime)",
+                elapsed.as_secs_f32(),
+                seconds / elapsed.as_secs_f32()
+            );
+            let words: Vec<&str> = text.split_whitespace().collect();
+            assert!(words.len() >= 5, "expected a sentence, got {text:?}");
+            // Repetition is the signature of a broken K/V cache: the decoder loses
+            // its context and emits the same token forever.
+            let unique: std::collections::HashSet<&&str> = words.iter().collect();
+            assert!(
+                unique.len() * 2 > words.len(),
+                "output looks like cache-loss repetition: {text:?}"
             );
         }
-        assert_eq!(PREFIX.to_vec(), vec![4i64, 62, 5, 8, 11, 13]);
-        assert_eq!(EOS, 3);
-    }
 
-    /// Decodes the *whole* reference WAV, which is the check a half-second
-    /// fragment cannot substitute for: a subtly wrong front end or a
-    /// cache-threading error yields garbage or repetition over a full utterance
-    /// even when a fragment happens to look plausible.
-    #[test]
-    #[ignore = "needs the 1.5 GB q4f16 model and ORT_DYLIB_PATH"]
-    fn transcribes_a_full_utterance() {
-        let directory = model_directory();
-        if !directory.join("onnx/encoder_model_q4f16.onnx").is_file() {
-            eprintln!("skipping: no model");
-            return;
+        /// The end-to-end oracle: real speech in, readable words out. This is what a
+        /// tolerance test on the front end cannot substitute for — a front end or a
+        /// cache-threading error that survives numeric checks still produces visibly
+        /// wrong words here.
+        #[test]
+        #[ignore = "needs the 1.5 GB q4f16 model and ORT_DYLIB_PATH"]
+        fn transcribes_real_speech() {
+            let directory = model_directory();
+            if !directory.join("onnx/encoder_model_q4f16.onnx").is_file() {
+                eprintln!("skipping: no model at {}", directory.display());
+                return;
+            }
+            let transcriber = CohereTranscriber::load(&directory).expect("model loads");
+
+            // The same real-speech samples the front end fixture carries.
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let raw = include_str!("../fixtures/cohere-fbank-speech-reference.json");
+            let parsed: serde_json::Value = serde_json::from_str(raw).expect("valid JSON");
+            let samples: Vec<f32> = STANDARD
+                .decode(parsed["samples_f32_le_base64"].as_str().expect("samples"))
+                .expect("decodes")
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+
+            let started = std::time::Instant::now();
+            let text = transcriber
+                .transcribe(&samples)
+                .expect("transcription runs");
+            let elapsed = started.elapsed();
+            let audio_seconds = samples.len() as f32 / 16_000.0;
+            println!(
+                "transcript: {text:?}\n{:.2} s audio in {:.2} s  ({:.2}x realtime)",
+                audio_seconds,
+                elapsed.as_secs_f32(),
+                audio_seconds / elapsed.as_secs_f32()
+            );
+            assert!(!text.trim().is_empty(), "produced no text");
+            // Loose: 0.5 s of speech, but a broken cache or front end yields either
+            // nothing or obvious garbage rather than a few plausible words.
+            assert!(
+                text.chars().any(|c| c.is_alphabetic()),
+                "no alphabetic output: {text:?}"
+            );
         }
-        // The Parakeet reference WAV: a full sentence, and 24 kHz so it also
-        // exercises the resample the app does before any engine sees audio.
-        let source = std::env::var("VOXIDE_PARAKEET_MODEL_DIR")
-            .map(std::path::PathBuf::from)
-            .expect("set VOXIDE_PARAKEET_MODEL_DIR")
-            .join("test_wavs/en.wav");
-        let mut reader = hound::WavReader::open(&source).expect("wav opens");
-        let spec = reader.spec();
-        let raw: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
-            hound::SampleFormat::Int => reader
-                .samples::<i16>()
-                .map(|s| s.unwrap() as f32 / i16::MAX as f32)
-                .collect(),
-        };
-        // Mono, then linear resample to 16 kHz. Crude but adequate: this test is
-        // asking whether the words come out right, not measuring resampler quality.
-        let channels = spec.channels as usize;
-        let mono: Vec<f32> = raw
-            .chunks(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect();
-        let ratio = spec.sample_rate as f64 / 16_000.0;
-        let target = (mono.len() as f64 / ratio) as usize;
-        let samples: Vec<f32> = (0..target)
-            .map(|index| {
-                let position = index as f64 * ratio;
-                let left = position.floor() as usize;
-                let fraction = (position - left as f64) as f32;
-                let a = mono.get(left).copied().unwrap_or(0.0);
-                let b = mono.get(left + 1).copied().unwrap_or(a);
-                a + (b - a) * fraction
-            })
-            .collect();
-
-        let transcriber = CohereTranscriber::load(&directory).expect("model loads");
-        let started = std::time::Instant::now();
-        let text = transcriber
-            .transcribe(&samples)
-            .expect("transcription runs");
-        let elapsed = started.elapsed();
-        let seconds = samples.len() as f32 / 16_000.0;
-        println!(
-            "FULL TRANSCRIPT: {text:?}\n{seconds:.2} s audio in {:.2} s ({:.2}x realtime)",
-            elapsed.as_secs_f32(),
-            seconds / elapsed.as_secs_f32()
-        );
-        let words: Vec<&str> = text.split_whitespace().collect();
-        assert!(words.len() >= 5, "expected a sentence, got {text:?}");
-        // Repetition is the signature of a broken K/V cache: the decoder loses
-        // its context and emits the same token forever.
-        let unique: std::collections::HashSet<&&str> = words.iter().collect();
-        assert!(
-            unique.len() * 2 > words.len(),
-            "output looks like cache-loss repetition: {text:?}"
-        );
-    }
-
-    /// The end-to-end oracle: real speech in, readable words out. This is what a
-    /// tolerance test on the front end cannot substitute for — a front end or a
-    /// cache-threading error that survives numeric checks still produces visibly
-    /// wrong words here.
-    #[test]
-    #[ignore = "needs the 1.5 GB q4f16 model and ORT_DYLIB_PATH"]
-    fn transcribes_real_speech() {
-        let directory = model_directory();
-        if !directory.join("onnx/encoder_model_q4f16.onnx").is_file() {
-            eprintln!("skipping: no model at {}", directory.display());
-            return;
-        }
-        let transcriber = CohereTranscriber::load(&directory).expect("model loads");
-
-        // The same real-speech samples the front end fixture carries.
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let raw = include_str!("../fixtures/cohere-fbank-speech-reference.json");
-        let parsed: serde_json::Value = serde_json::from_str(raw).expect("valid JSON");
-        let samples: Vec<f32> = STANDARD
-            .decode(parsed["samples_f32_le_base64"].as_str().expect("samples"))
-            .expect("decodes")
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-
-        let started = std::time::Instant::now();
-        let text = transcriber
-            .transcribe(&samples)
-            .expect("transcription runs");
-        let elapsed = started.elapsed();
-        let audio_seconds = samples.len() as f32 / 16_000.0;
-        println!(
-            "transcript: {text:?}\n{:.2} s audio in {:.2} s  ({:.2}x realtime)",
-            audio_seconds,
-            elapsed.as_secs_f32(),
-            audio_seconds / elapsed.as_secs_f32()
-        );
-        assert!(!text.trim().is_empty(), "produced no text");
-        // Loose: 0.5 s of speech, but a broken cache or front end yields either
-        // nothing or obvious garbage rather than a few plausible words.
-        assert!(
-            text.chars().any(|c| c.is_alphabetic()),
-            "no alphabetic output: {text:?}"
-        );
     }
 }
+
+#[cfg(feature = "cohere")]
+pub use engine::*;
