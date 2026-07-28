@@ -151,7 +151,9 @@ No single protocol can type into the focused window on every Wayland desktop, so
 | 2 | XTEST | X11, and Wayland sessions whose compositor forwards Xwayland's XTEST (Mutter, KWin) | Unavailable in a pure-Wayland session with Xwayland disabled. |
 | 3 | libei via `org.freedesktop.portal.RemoteDesktop` | GNOME, KDE | Needs one-time permission approval; used for the clipboard paste only (see below). |
 
-Each protocol is used exclusively. This matters because `enigo`, the input library Voxide uses for the first two, connects to every protocol it can and forwards each keystroke to all of them at once — on a Wayland session that also runs Xwayland that means the text is synthesized twice. Voxide pins the display name of the protocols a given attempt does not own so only one connection is ever live.
+The first attempt sends through **every** protocol `enigo` can reach, which is its default. That is deliberate: the protocols are complementary rather than duplicative — the virtual keyboard reaches Wayland surfaces while XTEST reaches Xwayland clients — so sending through both is what makes insertion work whichever kind of window has focus. The single-protocol attempts below it are fallbacks for when the combined one cannot connect at all.
+
+An earlier version pinned one protocol per attempt, on the theory that the fan-out synthesized text twice. That broke insertion into Xwayland windows, and the double-typing was never actually observed — if you ever do see doubled text in an X11 application, the pinned attempts are what to reach for.
 
 libei is restricted to sending Ctrl+V rather than typing the text. Unlike the virtual-keyboard protocol, libei hands the client the *compositor's* keymap instead of accepting one, so it can only reach keysyms your active layout already has — enough for the clipboard shortcuts, not enough for arbitrary dictation on a Dvorak or Cyrillic layout. The text itself travels through the clipboard, which carries any Unicode faithfully, and the previous clipboard contents are restored afterwards.
 

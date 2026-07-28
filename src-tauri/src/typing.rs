@@ -46,7 +46,19 @@ enum KeySynthesis {
     /// `CGEvent` on macOS. The only backend outside Linux.
     #[cfg(not(target_os = "linux"))]
     Native,
-    /// Wayland's `zwp_virtual_keyboard_v1`. Uploads its own keymap, so any
+    /// Every protocol `enigo` can reach, which is what it does by default.
+    ///
+    /// Kept as the *first* attempt because the protocols turn out to be
+    /// complementary rather than duplicative: the virtual keyboard reaches
+    /// Wayland surfaces and XTEST reaches Xwayland clients, so sending through
+    /// both is what makes insertion work for either kind of target. Pinning a
+    /// single protocol looked like a fix for double-typing but silently broke
+    /// insertion into Xwayland windows, and the double-typing it was meant to
+    /// prevent was inferred from enigo's source and never actually observed.
+    /// The pinned variants below remain available as fallbacks.
+    #[cfg(target_os = "linux")]
+    AllConnected,
+    /// Wayland's `zwp_virtual_keyboard_v1` alone. Uploads its own keymap, so any
     /// Unicode text can be typed regardless of the user's layout. Implemented
     /// by wlroots-based compositors (Sway, Niri, Hyprland, river).
     #[cfg(target_os = "linux")]
@@ -71,6 +83,8 @@ impl fmt::Display for KeySynthesis {
             #[cfg(not(target_os = "linux"))]
             Self::Native => "native",
             #[cfg(target_os = "linux")]
+            Self::AllConnected => "all-connected",
+            #[cfg(target_os = "linux")]
             Self::WaylandVirtualKeyboard => "wayland-virtual-keyboard",
             #[cfg(target_os = "linux")]
             Self::X11Xtest => "x11-xtest",
@@ -92,6 +106,8 @@ impl KeySynthesis {
         const UNREACHABLE_DISPLAY: &str = "";
         let defaults = Settings::default();
         match self {
+            // enigo's own default: connect to everything available.
+            Self::AllConnected => Some(defaults),
             Self::WaylandVirtualKeyboard => Some(Settings {
                 x11_display: Some(UNREACHABLE_DISPLAY.to_string()),
                 ..defaults
@@ -139,7 +155,9 @@ impl KeySynthesis {
 fn synthesis_chain() -> Vec<KeySynthesis> {
     #[cfg(target_os = "linux")]
     {
-        let mut chain = Vec::new();
+        // All protocols at once first, then each alone as a fallback: if the
+        // combined attempt fails to connect at all, a single one still might.
+        let mut chain = vec![KeySynthesis::AllConnected];
         if crate::portal_hotkeys::is_wayland_session() {
             chain.push(KeySynthesis::WaylandVirtualKeyboard);
         }
@@ -525,6 +543,29 @@ mod tests {
     #[test]
     fn empty_completed_dictations_do_not_require_clipboard_access() {
         assert!(super::copy_text_to_clipboard(" \n\t ").is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_combined_attempt_comes_first_and_pins_nothing() {
+        // Regression: pinning a single protocol as the primary path stopped
+        // insertion reaching Xwayland windows, because the protocols are
+        // complementary — the virtual keyboard serves Wayland surfaces and XTEST
+        // serves X11 clients. The default settings reach both.
+        let chain = super::synthesis_chain();
+        assert_eq!(
+            chain.first(),
+            Some(&KeySynthesis::AllConnected),
+            "{chain:?}"
+        );
+        let settings = KeySynthesis::AllConnected
+            .enigo_settings()
+            .expect("goes through enigo");
+        assert_eq!(
+            settings.wayland_display, None,
+            "must not pin the Wayland leg"
+        );
+        assert_eq!(settings.x11_display, None, "must not pin the X11 leg");
     }
 
     #[cfg(target_os = "linux")]
