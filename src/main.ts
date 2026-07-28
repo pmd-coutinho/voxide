@@ -836,6 +836,7 @@ function renderVoiceEngine(): void {
   const isWhisper = selectedEngine === "whisper";
   const isParakeet = selectedEngine === "parakeet";
   const isNemotron = selectedEngine === "nemotron";
+  const isCohere = selectedEngine === "cohere";
   const isCloud = selectedEngine === "cloud";
   const isAppleSpeech = selectedEngine === "appleSpeech";
   const status = modelStatus?.installed
@@ -880,6 +881,8 @@ function renderVoiceEngine(): void {
     ? `<button data-action="download-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download selected model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
     : isParakeet && selectedEngineAvailable
       ? `<button data-action="download-parakeet-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Parakeet model"}</button>${canDeleteDownloadedModel ? `<button data-action="delete-parakeet-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
+      : isCohere && selectedEngineAvailable
+        ? `${modelStatus?.installed ? "" : `<button data-action="download-cohere-model" ${downloading ? "disabled" : ""}>${downloading ? "Downloading…" : "Download Cohere model"}</button>`}${canDeleteDownloadedModel ? `<button data-action="delete-cohere-model" ${downloading ? "disabled" : ""}>Remove downloaded model</button>` : ""}`
       : isNemotron && selectedEngineAvailable
         ? (!nemotronRuntimeReady
           ? `<button data-action="install-nemotron-runtime" ${downloading ? "disabled" : ""}>${downloading ? "Installing…" : "Install CUDA runtime"}</button>`
@@ -2947,6 +2950,21 @@ async function handleAction(element: HTMLElement): Promise<void> {
       }
       break;
     }
+    case "download-cohere-model": {
+      showNotice("Downloading Cohere Transcribe. This is about 1.5 GB and may take a while — the encoder alone is 1.4 GB.");
+      modelDownloadProgress = { id: "cohere-transcribe-03-2026-q4f16", downloadedBytes: 0 };
+      render();
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("download_cohere_model");
+        showNotice("Cohere Transcribe is installed. It runs on the CPU, so no GPU is needed.");
+      } catch (error) {
+        showNotice(`Could not download Cohere: ${String(error)}`);
+      } finally {
+        modelDownloadProgress = undefined;
+        render();
+      }
+      break;
+    }
     case "download-parakeet-model": {
       showNotice("Downloading Parakeet TDT 0.6B. This is about 500 MB and may take a few minutes.");
       modelDownloadProgress = { id: "parakeet-tdt-0.6b-v2-int8", downloadedBytes: 0 };
@@ -2959,6 +2977,17 @@ async function handleAction(element: HTMLElement): Promise<void> {
       } finally {
         modelDownloadProgress = undefined;
         render();
+      }
+      break;
+    }
+    case "delete-cohere-model": {
+      if (!window.confirm("Remove the downloaded Cohere model? It is about 1.5 GB and can be downloaded again later.")) break;
+      try {
+        modelStatus = await invoke<VoiceModelStatus>("delete_cohere_model");
+        showNotice("Cohere Transcribe was removed.");
+        render();
+      } catch (error) {
+        showNotice(`Could not remove Cohere: ${String(error)}`);
       }
       break;
     }

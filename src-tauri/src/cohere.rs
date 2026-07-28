@@ -12,6 +12,62 @@ use std::path::{Path, PathBuf};
 /// Directory name under the models directory, and the engine's model id.
 pub const MODEL_ID: &str = "cohere-transcribe-03-2026-q4f16";
 
+/// HuggingFace repository and the exact commit the checksums below belong to.
+/// Pinned rather than tracking `main` so a re-published model cannot silently
+/// change what users get.
+pub const MODEL_REPO: &str = "onnx-community/cohere-transcribe-03-2026-ONNX";
+pub const MODEL_REVISION: &str = "31b1c6211c9000d76b077ddd23b74c9090badeba";
+
+/// SHA-256 for every file at [`MODEL_REVISION`], application-owned rather than
+/// trusting a response header or a byte count. The `.onnx_data` shards carry the
+/// weights, so verifying only the graphs would accept a truncated model.
+pub fn file_sha256(file: &str) -> Option<&'static str> {
+    Some(match file {
+        "onnx/encoder_model_q4f16.onnx" => {
+            "81c3369197348c87f28048fcd0cc3fa286b4f63cd950fa52c9756f2ea1c6eefa"
+        }
+        "onnx/encoder_model_q4f16.onnx_data" => {
+            "6b9972eaf442a13689096fe27722f493f279e71bd4c6ae15cb6b95364aa6b3d8"
+        }
+        "onnx/decoder_model_merged_q4f16.onnx" => {
+            "4c5c1a993dc715920fb3d46bfeb35350e6edf58ce474ecd6bb150ff58a8055c6"
+        }
+        "onnx/decoder_model_merged_q4f16.onnx_data" => {
+            "d00de89d2b34d61393a0a3460bee1bf418eed2ca0d11be43d3db237e1250358f"
+        }
+        "tokenizer.json" => "e263c0ba13be0f0803705b002756908f84efc6e75a4c273231a01c4371908a2b",
+        "tokenizer_config.json" => {
+            "4c8fec06c9e195180299db3baa370d0090be68ec611cadcf54c43217a306ca05"
+        }
+        "config.json" => "09cec8fb9a44e8c278b23efd2b8afbf29e560c2eb2b5c1a6b448d8b33a6632bf",
+        "generation_config.json" => {
+            "dd575639e03b2651c2ecad52c1a51e6126d2a516780cfe85e7b4517f05bd9754"
+        }
+        "preprocessor_config.json" => {
+            "25dee36a3a47950bbed2e8c7332e99a87f1b3244864db23f972ccd4121eb469d"
+        }
+        _ => return None,
+    })
+}
+
+/// Every file the download fetches: the four the engine loads, plus the small
+/// configs kept so the directory is a faithful copy of the pinned revision.
+pub const DOWNLOAD_FILES: [&str; 9] = [
+    "onnx/encoder_model_q4f16.onnx",
+    "onnx/encoder_model_q4f16.onnx_data",
+    "onnx/decoder_model_merged_q4f16.onnx",
+    "onnx/decoder_model_merged_q4f16.onnx_data",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+];
+
+pub fn file_url(file: &str) -> String {
+    format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{file}")
+}
+
 pub fn is_compiled() -> bool {
     cfg!(feature = "cohere")
 }

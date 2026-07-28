@@ -6464,24 +6464,7 @@ fn voice_model_status(state: State<'_, AppState>) -> Result<VoiceModelStatus, St
                 runtime_installed: None,
             }),
         },
-        VoiceEngine::Cohere => {
-            let model = cohere_model_path(&state)?;
-            let missing = cohere::missing_files(&model);
-            Ok(VoiceModelStatus {
-                id: cohere::MODEL_ID.to_string(),
-                installed: missing.is_empty() && cohere::is_compiled(),
-                path: if !cohere::is_compiled() {
-                    "Requires a build compiled with the `cohere` feature".to_string()
-                } else if missing.is_empty() {
-                    model.display().to_string()
-                } else {
-                    // Name what is absent: the weights are external shards, so a
-                    // partial download looks installed if only the graph is checked.
-                    format!("Incomplete — missing {}", missing.join(", "))
-                },
-                runtime_installed: None,
-            })
-        }
+        VoiceEngine::Cohere => cohere_status(&state),
         VoiceEngine::AppleSpeech => Ok(VoiceModelStatus {
             id: "apple-speech".into(),
             installed: apple_speech::is_supported(),
@@ -6629,6 +6612,25 @@ fn delete_whisper_model(
         path: path.display().to_string(),
         runtime_installed: None,
     })
+}
+
+#[tauri::command]
+fn delete_cohere_model(state: State<'_, AppState>) -> Result<VoiceModelStatus, String> {
+    let path = cohere_model_path(&state)?;
+    if !path.exists() {
+        return Err("The downloaded Cohere model is not installed".into());
+    }
+    if !path.is_dir() {
+        return Err("The Cohere model path is not a directory".into());
+    }
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Could not remove the Cohere model: {error}"))?;
+    // The warm copy would otherwise keep serving a model that is no longer on disk.
+    #[cfg(feature = "cohere")]
+    {
+        cohere::release_warm_model();
+    }
+    cohere_status(&state)
 }
 
 #[tauri::command]
@@ -7584,6 +7586,172 @@ fn cleanup_abandoned_component_directories(
         }
     }
     removed
+}
+
+const COHERE_MODEL_DOWNLOAD_ID: &str = "cohere-transcribe-03-2026-q4f16";
+
+/// Probes a file's size so the progress bar has a real total before the first
+/// byte arrives. A HEAD that fails is not fatal — the download still works, the
+/// bar just starts without a denominator.
+async fn cohere_download_size(client: &reqwest::Client, file: &str) -> Option<u64> {
+    client
+        .head(cohere::file_url(file))
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.content_length())
+}
+
+/// Downloads the pinned Cohere model into a staging directory, verifies every
+/// file against an application-owned checksum, then moves it into place.
+///
+/// Staged rather than written in place so an interrupted download cannot leave a
+/// half-installed model that `model_is_installed` would accept: the weights are
+/// external `.onnx_data` shards, so partial state is otherwise indistinguishable
+/// from a complete install.
+#[tauri::command]
+async fn download_cohere_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceModelStatus, String> {
+    if !cohere::is_compiled() {
+        return Err(
+            "Cohere Transcribe is available in builds compiled with the `cohere` feature".into(),
+        );
+    }
+    let models = state.models_directory()?;
+    let destination = cohere::model_directory(&models);
+    if cohere::model_is_installed(&destination) {
+        return cohere_status(&state);
+    }
+    let staging = models.join(format!(
+        ".{}-download-{}",
+        cohere::MODEL_ID,
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(staging.join("onnx"))
+        .await
+        .map_err(|error| format!("Could not prepare the Cohere model download: {error}"))?;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("Could not create the download client: {error}"))?;
+    let sizes = futures_util::future::join_all(
+        cohere::DOWNLOAD_FILES
+            .iter()
+            .map(|file| cohere_download_size(&client, file)),
+    )
+    .await;
+    // Only a total if every probe answered; a partial sum would make the bar lie.
+    let total_bytes = sizes
+        .iter()
+        .all(Option::is_some)
+        .then(|| sizes.iter().flatten().sum::<u64>());
+    let mut downloaded_bytes = 0_u64;
+
+    let download_result = async {
+        for file in cohere::DOWNLOAD_FILES {
+            let expected_digest = cohere::file_sha256(file)
+                .ok_or_else(|| format!("No checksum is registered for Cohere {file}"))?;
+            let response = client
+                .get(cohere::file_url(file))
+                .send()
+                .await
+                .map_err(|error| format!("Could not download Cohere {file}: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "Could not download Cohere {file}: HTTP {}",
+                    response.status()
+                ));
+            }
+            if model_content_type_is_markup(response.headers().get(reqwest::header::CONTENT_TYPE)) {
+                return Err(format!(
+                    "Could not download Cohere {file}: the server returned HTML or XML instead of model data."
+                ));
+            }
+            let output_path = staging.join(file);
+            let mut output = tokio::fs::File::create(&output_path)
+                .await
+                .map_err(|error| format!("Could not create the Cohere {file} download: {error}"))?;
+            use tokio::io::AsyncWriteExt;
+            let mut stream = response.bytes_stream();
+            let mut file_bytes = 0_u64;
+            let mut digest = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| {
+                    format!("The Cohere {file} download was interrupted: {error}")
+                })?;
+                output.write_all(&chunk).await.map_err(|error| {
+                    format!("Could not save the Cohere {file} download: {error}")
+                })?;
+                let count = chunk.len() as u64;
+                digest.update(&chunk);
+                downloaded_bytes += count;
+                file_bytes += count;
+                let _ = app.emit(
+                    "model-download-progress",
+                    ModelDownloadProgress {
+                        id: COHERE_MODEL_DOWNLOAD_ID.into(),
+                        downloaded_bytes,
+                        total_bytes,
+                    },
+                );
+            }
+            output.flush().await.map_err(|error| {
+                format!("Could not finalize the Cohere {file} download: {error}")
+            })?;
+            if file_bytes == 0 {
+                return Err(format!("The Cohere {file} download was empty"));
+            }
+            if format!("{:x}", digest.finalize()) != expected_digest {
+                return Err(format!(
+                    "The Cohere {file} checksum did not match the pinned model revision"
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = download_result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+    if !cohere::model_is_installed(&staging) {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err("The Cohere model download is incomplete".into());
+    }
+    // Replace any previous copy only once the new one is known good.
+    if destination.exists() {
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+    }
+    tokio::fs::rename(&staging, &destination)
+        .await
+        .map_err(|error| {
+            format!("Could not install the Cohere model into {destination:?}: {error}")
+        })?;
+    debug_log::append("Cohere model downloaded and verified");
+    cohere_status(&state)
+}
+
+/// Shared by the status command and the download so both describe the model the
+/// same way, including naming what is missing.
+fn cohere_status(state: &AppState) -> Result<VoiceModelStatus, String> {
+    let model = cohere::model_directory(&state.models_directory()?);
+    let missing = cohere::missing_files(&model);
+    Ok(VoiceModelStatus {
+        id: cohere::MODEL_ID.to_string(),
+        installed: missing.is_empty() && cohere::is_compiled(),
+        path: if !cohere::is_compiled() {
+            "Requires a build compiled with the `cohere` feature".to_string()
+        } else if missing.is_empty() {
+            model.display().to_string()
+        } else {
+            format!("Incomplete — missing {}", missing.join(", "))
+        },
+        runtime_installed: None,
+    })
 }
 
 #[tauri::command]
@@ -11159,6 +11327,7 @@ pub fn run() {
             verify_voice_engine_installation,
             voice_engine_availability,
             delete_whisper_model,
+            delete_cohere_model,
             delete_parakeet_model,
             delete_nemotron_model,
             audio_input_devices,
@@ -11178,6 +11347,7 @@ pub fn run() {
             finish_enroll_capture,
             delete_pronunciation_profile,
             open_voice_engine_storage,
+            download_cohere_model,
             download_nemotron_model,
             start_native_dictation,
             stop_native_dictation,
@@ -11534,6 +11704,59 @@ mod tests {
         normalize_database(&mut database);
 
         assert_eq!(database.settings.selected_model, "base");
+    }
+
+    #[test]
+    fn every_cohere_download_file_has_a_registered_checksum() {
+        // A missing entry would fail the download at the worst moment — after
+        // transferring 1.5 GB — so the gap is caught here instead.
+        for file in cohere::DOWNLOAD_FILES {
+            assert!(
+                cohere::file_sha256(file).is_some(),
+                "no checksum registered for {file}"
+            );
+        }
+        // Every file the engine loads must be among those downloaded, or a
+        // "successful" download would still leave the engine unusable.
+        for required in cohere::required_files() {
+            assert!(
+                cohere::DOWNLOAD_FILES.contains(&required),
+                "{required} is needed but never downloaded"
+            );
+        }
+        assert!(cohere::file_sha256("onnx/nonexistent.onnx").is_none());
+        // The revision is pinned so a re-published model cannot change silently.
+        assert_eq!(cohere::MODEL_REVISION.len(), 40);
+        assert!(cohere::file_url("tokenizer.json").contains(cohere::MODEL_REVISION));
+    }
+
+    /// Hashes the installed model and compares against the pinned digests. Proves
+    /// the constants describe the real artifacts rather than being transcribed
+    /// wrongly — which a download would only reveal after the full transfer.
+    #[test]
+    #[ignore = "hashes ~1.5 GB of installed model files"]
+    fn pinned_cohere_checksums_match_the_installed_model() {
+        let directory = match directories::ProjectDirs::from("dev", "pmdcoutinho", "Voxide") {
+            Some(dirs) => dirs.data_local_dir().join("models").join(cohere::MODEL_ID),
+            None => return,
+        };
+        if !cohere::model_is_installed(&directory) {
+            eprintln!("skipping: no model at {}", directory.display());
+            return;
+        }
+        for file in cohere::DOWNLOAD_FILES {
+            let path = directory.join(file);
+            if !path.is_file() {
+                continue;
+            }
+            let actual = sha256_file(&path).expect("hashes");
+            assert_eq!(
+                actual,
+                cohere::file_sha256(file).expect("registered"),
+                "checksum mismatch for {file}"
+            );
+            println!("  {file} ok");
+        }
     }
 
     #[test]

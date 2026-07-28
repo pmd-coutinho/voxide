@@ -285,5 +285,25 @@ explicitly, since cache loss is the failure mode that most resembles success.
 Real, and short of voxtype's reported 9–11× on a Zen 4 — different CPU, and worth
 re-measuring on longer audio before either figure goes in the README.
 
-Remaining: the in-app download (five precisions, external data shards, sha256 per
-file), engine registration and the settings UI. The engine itself is done.
+## Shipped
+
+Engine registration and the in-app download are both done. Voice Engine offers
+**Cohere Transcribe**, downloads it, verifies it, and can remove it.
+
+The download fetches the pinned revision `31b1c62` — pinned so a re-published
+model cannot silently change what users get — into a staging directory, checks
+every file against an application-owned SHA-256, and only then moves it into
+place. Staging matters here specifically: the weights are external `.onnx_data`
+shards, so an interrupted in-place download would leave a directory that looks
+installed. Progress totals come from HEAD probes, and are only reported when every
+probe answered, since a partial sum would make the bar lie.
+
+A test hashes the installed 1.5 GB and compares against all nine pinned digests,
+so the constants are known to describe the real artifacts rather than having been
+transcribed wrongly — a mistake a download would otherwise reveal only after
+transferring everything.
+
+Two deliberate gaps. Only **q4f16** is offered: the others range to 8.3 GB for no
+accuracy a dictation tool needs. And there is **no live preview** — the engine is
+an offline encoder/decoder, and re-decoding a growing buffer through a 48-layer
+encoder on CPU would cost more than the preview is worth.
