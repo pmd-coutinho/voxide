@@ -9113,15 +9113,30 @@ fn spawn_live_cohere_preview(
     preview_char_limit: usize,
 ) {
     tauri::async_runtime::spawn(async move {
-        const MINIMUM_PREVIEW_SAMPLES: usize = audio::WHISPER_SAMPLE_RATE as usize;
+        // 0.6 s rather than a full second: a two-second dictation otherwise spends
+        // its first tick below the threshold and never previews at all.
+        const MINIMUM_PREVIEW_SAMPLES: usize = (audio::WHISPER_SAMPLE_RATE as usize) * 3 / 5;
         /// Trailing window each preview decodes. Shorter than Parakeet's 20 s:
         /// at roughly 5x realtime on a CPU an 8 s window costs ~1.6 s, which is
         /// the most that can be spent and still feel live.
         const COHERE_PREVIEW_WINDOW: Duration = Duration::from_secs(8);
+
+        // Load before the first tick. If the model is cold this takes ~1.8 s, and
+        // paying it inside a tick meant the whole recording could finish before a
+        // preview ever ran.
+        {
+            let model = model_path.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = warm_cohere_model(&model) {
+                    debug_log::append(&format!("Live Cohere preview could not warm: {error}"));
+                }
+            })
+            .await;
+        }
         const TRAILING_SILENCE_WINDOW: Duration = Duration::from_millis(900);
         const TRAILING_SILENCE_RMS: f32 = 0.008;
 
-        let mut interval = Duration::from_millis(900);
+        let mut interval = Duration::from_millis(400);
         let mut stability = PreviewStability::default();
         let mut emitted_nonempty = false;
         let mut silent_since: Option<Instant> = None;
@@ -9150,6 +9165,10 @@ fn spawn_live_cohere_preview(
                 }
             };
             if samples.len() < MINIMUM_PREVIEW_SAMPLES {
+                debug_log::append(&format!(
+                    "Live Cohere preview waiting for audio ({} samples)",
+                    samples.len()
+                ));
                 continue;
             }
             let trailing_silent =
@@ -9160,12 +9179,14 @@ fn spawn_live_cohere_preview(
                 // the speaker has clearly paused; the CPU is better spent on the
                 // final decode that follows.
                 if emitted_nonempty && silent_for > interval {
+                    debug_log::append("Live Cohere preview idle on trailing silence");
                     continue;
                 }
             } else {
                 silent_since = None;
             }
             if !begin_preview(&capture_state, preview_generation) {
+                debug_log::append("Live Cohere preview yielded to another decode");
                 continue;
             }
             let sample_count = samples.len();
@@ -9195,6 +9216,9 @@ fn spawn_live_cohere_preview(
                     // Confirm across snapshots before showing, so a word already on
                     // the overlay is not rewritten when the window slides.
                     let Some(text) = stability.observe(text.trim()) else {
+                        debug_log::append(&format!(
+                            "Live Cohere preview is waiting for confirmation (audio_ms: {audio_ms})"
+                        ));
                         continue;
                     };
                     emitted_nonempty = true;
@@ -9217,6 +9241,16 @@ fn spawn_live_cohere_preview(
             }
         }
     });
+}
+
+#[cfg(feature = "cohere")]
+fn warm_cohere_model(model_directory: &Path) -> Result<(), String> {
+    cohere::warm_transcriber(model_directory).map(|_| ())
+}
+
+#[cfg(not(feature = "cohere"))]
+fn warm_cohere_model(_model_directory: &Path) -> Result<(), String> {
+    Err("Cohere Transcribe is not compiled into this build".into())
 }
 
 #[cfg(feature = "cohere")]
@@ -11252,7 +11286,7 @@ pub fn run() {
                         speech::release_idle_models(speech::MODEL_IDLE_TIMEOUT);
                         // Cohere holds ~1.5 GB, so it gets the same treatment.
                         #[cfg(feature = "cohere")]
-                        if cohere::release_warm_model() {
+                        if cohere::release_idle_model(speech::MODEL_IDLE_TIMEOUT) {
                             debug_log::append("released the warm Cohere model while idle");
                         }
                     });

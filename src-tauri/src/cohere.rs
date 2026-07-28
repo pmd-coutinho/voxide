@@ -119,6 +119,10 @@ mod engine {
 
     static WARM: OnceLock<Mutex<WarmModel>> = OnceLock::new();
 
+    /// When the warm model was last used, so eviction can respect an idle window
+    /// rather than dropping it on every sweep.
+    static LAST_USE: Mutex<Option<Instant>> = Mutex::new(None);
+
     /// Points `ort` at an onnxruntime to dlopen, once per process.
     ///
     /// `ort` is built with `load-dynamic`, so it needs a library path. Rather than
@@ -154,6 +158,7 @@ mod engine {
         let mut slot = cache
             .lock()
             .map_err(|_| "The Cohere model cache lock was poisoned".to_string())?;
+        mark_used();
         if let Some((path, transcriber)) = slot.as_ref() {
             if path == directory {
                 return Ok(std::sync::Arc::clone(transcriber));
@@ -161,6 +166,7 @@ mod engine {
         }
         let started = Instant::now();
         let transcriber = std::sync::Arc::new(CohereTranscriber::load(directory)?);
+        mark_used();
         crate::debug_log::append(&format!(
             "Cohere model loaded in {} ms",
             started.elapsed().as_millis()
@@ -169,9 +175,41 @@ mod engine {
         Ok(transcriber)
     }
 
-    /// Drops the warm model. Mirrors the Whisper idle eviction so a long-idle app
-    /// does not hold 1.5 GB resident.
+    fn mark_used() {
+        if let Ok(mut stamp) = LAST_USE.lock() {
+            *stamp = Some(Instant::now());
+        }
+    }
+
+    /// Drops the warm model once it has gone unused for `idle`.
+    ///
+    /// The idle check is the whole point: an unconditional release ran on every
+    /// sweep, so the model was evicted a minute after preloading and every
+    /// dictation then paid a ~1.8 s cold load — inside the preview path, which
+    /// meant short dictations never previewed at all.
+    pub fn release_idle_model(idle: std::time::Duration) -> bool {
+        match LAST_USE.lock().ok().and_then(|stamp| *stamp) {
+            Some(last) if last.elapsed() >= idle => {}
+            // Never used, or used recently: nothing to do.
+            _ => return false,
+        }
+        let released = WARM
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|mut slot| slot.take().is_some()))
+            .unwrap_or(false);
+        if released {
+            if let Ok(mut stamp) = LAST_USE.lock() {
+                *stamp = None;
+            }
+        }
+        released
+    }
+
+    /// Unconditional drop, for when the model is deleted from disk.
     pub fn release_warm_model() -> bool {
+        if let Ok(mut stamp) = LAST_USE.lock() {
+            *stamp = None;
+        }
         WARM.get()
             .and_then(|cache| cache.lock().ok().map(|mut slot| slot.take().is_some()))
             .unwrap_or(false)
